@@ -70,6 +70,19 @@ MindStudio Insight profiling 另证实:`test_SD.sh` 原配置(cudagraph_mode=NON
 
 **CPU 已验证**:尺寸派生、pad 选择、qsl 步长、eager 降级、捕获/运行时尺寸精确互配。
 
+### 事故 A-1(2026-08-17 服务器验证发现):接受率崩塌(>3 → 1.3)
+
+**现象**:方案 A 部署成功、正常出 token,但平均接受长度从 >3 掉到 1.3(≈每步只接受 1 个)——第 1 个之后的 draft token 全错。
+
+**根因**:FULL padding 分支的 `seq_lens` 抄了 eagle 分支的 `runner.seq_lens`,但语义不同:
+- eagle:`needs_extra_input_slots=False`,不经 extend,runner.seq_lens(verify 后)本就覆盖 step0 全部 KV → 直接用正确
+- draft_model:`set_inputs_first_pass` 走 extra-slots 分支,末尾 `extend_all_queries_by_N` **把 seq_lens 每行 +1**(覆盖 step0 写入的 extra seed KV);用未 +1 的 runner.seq_lens 覆盖 → **所有 q 的 causal attend 边界左移 1** → 全部 draft hidden 错位 → 草稿质量崩
+- **dflash 分支(同样走 extend)的先例正是用 `cad.seq_lens`——当时抄错了对象**
+
+**修复**(`33205ca2d`):seq_lens/seq_lens_cpu 改用 extend 后的 `common_attn_metadata` 值(CPU mirror 缺失时 fallback `optimistic + N`),对齐 dflash 与已验证的 eager 语义。qsl/max_query_len 的 K+2 步长经核对与 `extend_all_queries_by_N` 输出一致,无需改。
+
+**教训**:与 eager 路径做逐字段 diff(set_inputs_first_pass 的返回值是"语义基准"),跨方法抄分支时要检查该方法是否走了不同的 set_inputs 分支。
+
 ## 验证清单(服务器,方案 A)
 
 ```bash
@@ -79,7 +92,8 @@ git pull && export VLLM_ASCEND_DRAFT_MODEL_FULL_GRAPH=1
 #   1. 启动日志见 "draft_model drafter FULL graph enabled: target sizes [6,12] -> drafter sizes [7,14]"
 #   2. 部署完成、正常出 token;MindStudio/profiler: drafter 前向出现图 replay("Replaying aclgraph")
 #   3. 输出质量正常(R>1 时尤其注意 phantom 行不污染——与方案 C 对照生成结果)
-#   4. 崩溃/异常 → 贴日志,回退 export ...=0 即恢复方案 C
+#   4. **平均接受长度恢复 >3**(事故 A-1 修复后的关键指标;若仍 ~1.3 见下"事故 A-1")
+#   5. 崩溃/异常 → 贴日志,回退 export ...=0 即恢复方案 C
 ```
 
 ## 遗留
