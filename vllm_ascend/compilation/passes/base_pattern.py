@@ -15,6 +15,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
+import functools
 import hashlib
 import inspect
 from abc import ABC, abstractmethod
@@ -63,6 +64,57 @@ def _matched_main_input_has_expected_width(match: Match, main_argname: str, expe
     if not isinstance(val, torch.Tensor) or val.dim() < 2:
         return None
     return val.shape[-1] == expected_width
+
+
+def _wrap_search_fn_with_width_guard(
+    search_fn: Callable,
+    main_argname: str,
+    expected_width: int,
+    pattern_name: str,
+) -> Callable:
+    """Guard a pattern search function against cross-model application.
+
+    torch's pattern_matcher verifies a structurally matched pattern by
+    re-tracing search_fn with the real shapes from the matched graph (the
+    check_fn wrapper created by register_replacement). Shape mismatches
+    surface during that re-trace as tensor-op errors; e.g. split_with_sizes
+    raises "Split sizes add up to X but got the tensor's size of Y" as a
+    ValueError, which check_fn does NOT catch (it only catches RuntimeError),
+    so the error escapes and kills the whole compilation. This is exactly how
+    a target-sized fusion pattern crashes the spec-decode draft model's graph
+    in FULL (npugraph_ex) mode, where the pattern registry is process-global.
+
+    Raising RuntimeError ourselves when the main input's width provably
+    differs turns the crash into torch's designed graceful rejection path
+    (check_fn -> log_trace_failure -> return False): the pattern is skipped
+    for that graph and compilation proceeds. The guard only fires when the
+    width is a concrete int that definitely mismatches; symbolic or unknown
+    widths fall through to the original re-trace verification.
+    """
+    params = list(inspect.signature(search_fn).parameters)
+    if main_argname not in params:
+        return search_fn
+    main_idx = params.index(main_argname)
+
+    @functools.wraps(search_fn)
+    def guarded(*args, **kwargs):
+        if main_idx < len(args):
+            tensor = args[main_idx]
+            shape = getattr(tensor, "shape", None)
+            if shape is not None and len(shape) > 0:
+                try:
+                    width_matches = bool(shape[-1] == expected_width)
+                except Exception:
+                    width_matches = None
+                if width_matches is False:
+                    raise RuntimeError(
+                        f"{pattern_name}: main input '{main_argname}' has width {shape[-1]}, "
+                        f"but this pattern instance was registered for width {expected_width} "
+                        "(another model configuration); declining to apply"
+                    )
+        return search_fn(*args, **kwargs)
+
+    return guarded
 
 
 class BasePattern(ABC):
@@ -157,6 +209,15 @@ class BasePattern(ABC):
             return
 
         main_argname, main_width = self._get_main_input_info(example_inputs)
+
+        # Wrap the search function with a width guard BEFORE registration so
+        # that re-trace verification of a cross-model match raises RuntimeError
+        # (caught by pattern_matcher's check_fn) instead of letting tensor ops
+        # fail with e.g. ValueError, which escapes and crashes compilation.
+        if main_argname is not None and main_width is not None:
+            pattern_fn = _wrap_search_fn_with_width_guard(
+                pattern_fn, main_argname, main_width, self.__class__.__name__
+            )
 
         # Unique closure names per shape keep the target and draft variants
         # distinct in registries that key patterns by function name.
