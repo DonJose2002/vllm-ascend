@@ -41,7 +41,7 @@ MindStudio Insight profiling 另证实:`test_SD.sh` 原配置(cudagraph_mode=NON
 
 ## 修复方案
 
-### 方案 C(已实现,本次提交):drafter 对 draft_model 禁用图模式
+### 方案 C(✅ 已实现并经服务器验证 2026-08-17):drafter 对 draft_model 禁用图模式(默认行为)
 
 `llm_base_proposer.py` `use_cuda_graph` 追加 `and not speculative_config.uses_draft_model()`:
 - ACLGraphWrapper 不创建 → drafter eager(数值/行为 = 上游 drafter 的 PIECEWISE-only 语义,甚至更保守)
@@ -49,27 +49,42 @@ MindStudio Insight profiling 另证实:`test_SD.sh` 原配置(cudagraph_mode=NON
 - `_propose`/`dummy_run`/`_run_merged_draft` 的所有 `use_cuda_graph` 门槛点已逐一核验:全链路一致走 eager 路径
 - test_server.sh / API **零变化**(用户配置的 capture_sizes 仍约束 target 图)
 
-### 方案 A(待做):drafter 专属 FULL 图支持
+### 方案 A(已实现,实验性,门控 `VLLM_ASCEND_DRAFT_MODEL_FULL_GRAPH=1`,默认关=方案 C 行为)
 
-- drafter 捕获尺寸表:从用户配置 `[R×(K+1)]` 派生 **`[R×(K+2)]`**(如 [6,12] → [7,14])
-- drafter dispatch 绕开 FULL-uniform 断言:pad 到 ≥num_tokens 的最小 R×(K+2)
-- `dummy_run` 的 `batch_size = num_tokens // (K+1)` 需显式按 R 计算(R≥K+1 时 7//6 式的整除巧合失效)
-- 基础设施现成:`set_draft_graph_params` 已按 draft 单独建表(acl_graph.py:368),wrapper 已有 use_eagle per-method 分支先例
-- 价值:把 vllm-ascend 的 merged-draft 设计对 draft_model 补完,可向上游提 PR
+**上游调研结论(2026-08-17,实现前完成)**:
+- vllm 上游 drafter 仍 PIECEWISE-only;**#45258**(RFC,open,2026-06)实测 drafter 占 decode step 15-18%,外部原型 11 次迭代失败后撤回 RFC,地雷图:FULL keys+wrapper 可行、需预捕获 warmup、BatchDescriptor 全程透传、**KV-store 隔离(draft 垃圾写入 target KV page 0 的危险失效模式)**、未捕获 shape 优雅降级
+- **#34880**(Eagle drafter FULL 尝试,**closed 未合并**):首步与 target 共享 uniform_decode、后续步骤独立 keys
+- **#47460**(merged):draft_model PIECEWISE keys 初始化缺失已修(仍非 FULL)
+- 结论:无上游 FULL 先例可对齐,方案 A 为新 territory
 
-## 验证清单(服务器,方案 C)
+**实现(4 文件)**:
+1. `envs.py`:`VLLM_ASCEND_DRAFT_MODEL_FULL_GRAPH`(默认 0)
+2. `model_runner_v1.py _check_and_update_cudagraph_mode`:flag 开时派生 `drafter_sizes = {s + s//(K+1)}`(如 [6,12]→[7,14]),`set_draft_graph_params(drafter_sizes)`,存 `self._draft_model_graph_sizes`
+3. `model_runner_v1.py _dummy_run`:捕获循环(target 尺寸)内,drafter.dummy_run 调用翻译为 R×(K+2) tokens / R reqs / `BatchDescriptor(R*(K+2), R, uniform=True)`——drafter 图在 target 每个捕获尺寸对应翻译尺寸处惰性捕获
+4. `llm_base_proposer.py`:
+   - `__init__`:`use_draft_model_full_graph` flag;`use_cuda_graph` 对 draft_model 仅在 flag 开时为 True
+   - `dummy_run`:draft_model 时 query_start_loc 填 K+2 步长(不用 runner 的 K+1 步长 buffer)、`max_query_len=K+2`、batch_size 用显式 num_reqs(规避 R≥K+1 的整除陷阱)
+   - `_propose`:draft_model 专属 dispatch——真实 num_tokens=R×(K+2) pad 到捕获表内最小尺寸;无匹配(如超 max)→ eager 优雅降级;FULL 时 K+2 式 padding(qsl 步长 K+2、seq_lens/block_table 零填充,phantom 追加在真实请求后,FIA 跳过 len-0 请求);复用 eagle 的 `_adjust_tensor`/group buffers/`attn_update_stack_num_spec_norm` 机制
+
+**安全性设计**:phantom 输出行 [R',K] 由 `_copy_draft_token_ids_to_cpu` 按 shape[0] 拷贝(eagle 同款容忍);slot_mapping 尾部 -1;未捕获 shape 回 eager(对齐 RFC #45258 建议)。
+
+**CPU 已验证**:尺寸派生、pad 选择、qsl 步长、eager 降级、捕获/运行时尺寸精确互配。
+
+## 验证清单(服务器,方案 A)
 
 ```bash
-git pull   # research/main
+git pull && export VLLM_ASCEND_DRAFT_MODEL_FULL_GRAPH=1
 # 配置: cudagraph_mode FULL + cudagraph_capture_sizes=[6,12] + draft_model
 # 期望:
-#   1. 不再出现 expanded size (1)/(2) 错误
-#   2. 正常出 token(端到端跑通,顺带验证 bug1/2/3 修复链)
-#   3. MindStudio/profiler 或日志:target 走 FULL 图;drafter eager(无 "Wrapping draft model with ACLGraphWrapper")
+#   1. 启动日志见 "draft_model drafter FULL graph enabled: target sizes [6,12] -> drafter sizes [7,14]"
+#   2. 部署完成、正常出 token;MindStudio/profiler: drafter 前向出现图 replay("Replaying aclgraph")
+#   3. 输出质量正常(R>1 时尤其注意 phantom 行不污染——与方案 C 对照生成结果)
+#   4. 崩溃/异常 → 贴日志,回退 export ...=0 即恢复方案 C
 ```
 
 ## 遗留
 
-- [ ] 服务器验证方案 C
-- [ ] **方案 A 前置调研(用户要求):查上游 vllm 后续版本(release notes / issues / PRs)有没有给 draft_model 加 FULL 图模式**——若有,对齐其设计;若无,自行实现并考虑提 PR
-- [ ] 方案 A 实现与验证
+- [x] 方案 C 服务器验证(2026-08-17 用户确认通过)
+- [x] 方案 A 前置调研(上游无 FULL 先例;#45258 RFC 地雷图 + #34880 未合并设计为参考)
+- [ ] 方案 A 服务器验证(清单见上)
+- [ ] (远期)若方案 A 稳定,考虑向上游提 PR(可引用 #45258 的 KV 隔离担忧的解法)

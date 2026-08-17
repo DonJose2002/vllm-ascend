@@ -109,6 +109,7 @@ from vllm_ascend.attention.context_parallel.dsa_cp import AscendDSACPMetadataBui
 from vllm_ascend.attention.dsa_v1 import AscendDSAMetadataBuilder
 from vllm_ascend.attention.mla_v1 import AscendMLABackend
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata, using_paged_attention
+from vllm_ascend.envs import VLLM_ASCEND_DRAFT_MODEL_FULL_GRAPH
 
 # yapf conflicts with isort for this block
 # yapf: disable
@@ -3518,13 +3519,32 @@ class NPUModelRunner(GPUModelRunner):
             dummy_compute_logits(hidden_states)
 
             if self.drafter:
+                drafter_num_tokens = num_tokens_padded
+                drafter_num_reqs = num_reqs_padded
+                drafter_batch_desc = batch_desc
+                # draft_model drafter runs at R*(K+2) tokens (not the target's
+                # R*(K+1)); translate the capture-time shape so its FULL graph
+                # is captured at valid drafter sizes (see _draft_model_graph_sizes).
+                if (
+                    getattr(self, "_draft_model_graph_sizes", None)
+                    and cudagraph_runtime_mode == CUDAGraphMode.FULL
+                ):
+                    query_len = self.num_spec_tokens + 1
+                    drafter_reqs = num_tokens_padded // query_len
+                    drafter_num_tokens = drafter_reqs * (self.num_spec_tokens + 2)
+                    drafter_num_reqs = drafter_reqs
+                    drafter_batch_desc = BatchDescriptor(
+                        num_tokens=drafter_num_tokens,
+                        num_reqs=drafter_reqs,
+                        uniform=True,
+                    )
                 self.drafter.dummy_run(
-                    num_tokens=num_tokens_padded,
+                    num_tokens=drafter_num_tokens,
                     with_prefill=with_prefill,
-                    num_reqs=num_reqs_padded,
+                    num_reqs=drafter_num_reqs,
                     num_tokens_across_dp=num_tokens_across_dp,
                     aclgraph_runtime_mode=cudagraph_runtime_mode,
-                    batch_descriptor=batch_desc,
+                    batch_descriptor=drafter_batch_desc,
                     dummy_compute_logits=dummy_drafter_compute_logits,
                     in_graph_capturing=not force_attention,
                     is_profile=is_profile,
@@ -4827,7 +4847,22 @@ class NPUModelRunner(GPUModelRunner):
         if self.use_aclgraph:
             set_graph_params(capture_sizes)
             if self.speculative_config:
-                set_draft_graph_params(capture_sizes)
+                # draft_model drafter consumes R*(K+2) tokens per step
+                # (R*(K+1) verify + 1 extra seed slot per request). Derive a
+                # drafter-specific capture table from the target's (K+1)-based
+                # sizes so FULL graphs can be captured at valid drafter shapes.
+                self._draft_model_graph_sizes: list[int] | None = None
+                if self.speculative_config.uses_draft_model() and VLLM_ASCEND_DRAFT_MODEL_FULL_GRAPH:
+                    k = self.speculative_config.num_speculative_tokens
+                    self._draft_model_graph_sizes = sorted({s + s // (k + 1) for s in capture_sizes})
+                    logger.info(
+                        "draft_model drafter FULL graph enabled: target sizes %s -> drafter sizes %s",
+                        capture_sizes,
+                        self._draft_model_graph_sizes,
+                    )
+                    set_draft_graph_params(self._draft_model_graph_sizes)
+                else:
+                    set_draft_graph_params(capture_sizes)
 
     def profile_cudagraph_memory(self) -> int:
         parent_module_name = _get_gpu_model_runner_module_name(self)

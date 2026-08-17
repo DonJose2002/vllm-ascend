@@ -44,6 +44,7 @@ from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, set_ascend_forward_context
+from vllm_ascend.envs import VLLM_ASCEND_DRAFT_MODEL_FULL_GRAPH
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
@@ -197,20 +198,25 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         # draft_model method: the drafter consumes R*(K+2) tokens per step
         # (R*(K+1) verify tokens + 1 extra input slot per request, see
         # net_num_new_slots_per_request), which is never a multiple of
-        # (K+1). The FULL-uniform dispatch path assumes num_tokens is a
-        # multiple of uniform_decode_query_len (assert num_tokens_padded %
+        # (K+1). The shared FULL-uniform dispatch path assumes num_tokens is
+        # a multiple of uniform_decode_query_len (assert num_tokens_padded %
         # (K+1) == 0) and derives num_reqs = padded // (K+1), so it would
         # fabricate phantom requests and produce a [padded_reqs, K] draft
         # output that mismatches the [num_reqs, K] CPU buffer. Upstream vLLM
-        # keeps its drafter PIECEWISE-only for the same reason. Disable the
-        # drafter aclgraph for draft_model until a drafter-specific capture
-        # size table (R*(K+2)) and dispatch are implemented.
-        # TODO: implement drafter FULL-graph support (see
-        # research/bugfix-draft-model-full-graph.md, plan A).
+        # keeps its drafter PIECEWISE-only for the same reason.
+        # Two modes for draft_model:
+        #   - default (off): drafter runs eager (plan C, upstream-aligned).
+        #   - VLLM_ASCEND_DRAFT_MODEL_FULL_GRAPH=1 (plan A): the runner
+        #     derives a drafter-specific R*(K+2) capture table
+        #     (_draft_model_graph_sizes) and _propose dispatches on (K+2)
+        #     multiples; see _propose for the custom dispatch.
+        self.use_draft_model_full_graph = (
+            self.speculative_config.uses_draft_model() and VLLM_ASCEND_DRAFT_MODEL_FULL_GRAPH
+        )
         self.use_cuda_graph = (
             self.runner._use_aclgraph()
             and not self.speculative_config.enforce_eager
-            and not self.speculative_config.uses_draft_model()
+            and (not self.speculative_config.uses_draft_model() or self.use_draft_model_full_graph)
         )
 
         # TODO: Remove it when the bug of fx-graph is solved
@@ -551,7 +557,17 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             num_computed_tokens_cpu = self.runner.input_batch.num_computed_tokens_cpu_tensor[:num_reqs]
 
             # num_reqs is already the padded version
-            self.query_start_loc.cpu[: num_reqs + 1].copy_(self.runner.query_start_loc.cpu[: num_reqs + 1])
+            if self.use_draft_model_full_graph:
+                # draft_model drafter: query is (K+2) tokens per request
+                # (shifted verify sequence + seed slot), so query_start_loc
+                # must step by K+2 — the runner's (K+1)-stepped buffer does
+                # not apply.
+                drafter_query_len = self.num_speculative_tokens + 2
+                self.query_start_loc.cpu[: num_reqs + 1] = torch.arange(
+                    0, (num_reqs + 1) * drafter_query_len, drafter_query_len, dtype=torch.int32
+                )
+            else:
+                self.query_start_loc.cpu[: num_reqs + 1].copy_(self.runner.query_start_loc.cpu[: num_reqs + 1])
             self.query_start_loc.copy_to_gpu()
 
             common_attn_metadata = AscendCommonAttentionMetadata(
@@ -563,7 +579,11 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 num_reqs=num_reqs,
                 num_actual_tokens=num_tokens,
                 num_input_tokens=num_tokens,
-                max_query_len=self.num_speculative_tokens + 1,
+                max_query_len=(
+                    self.num_speculative_tokens + 2
+                    if self.use_draft_model_full_graph
+                    else self.num_speculative_tokens + 1
+                ),
                 num_computed_tokens_cpu=num_computed_tokens_cpu,
                 actual_seq_lengths_q=self.runner.actual_seq_lengths_q,
                 block_table_tensor=self.runner.input_batch.block_table[0].get_device_tensor()[:num_reqs],
@@ -602,7 +622,12 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
 
         model_positions = self._get_positions(num_tokens)
 
-        batch_size = max(num_tokens // (self.num_speculative_tokens + 1), 1)
+        if self.use_draft_model_full_graph and num_reqs > 0:
+            # num_tokens is R*(K+2); integer division by (K+1) only coincides
+            # with R when R < K+1, so trust the caller-provided request count.
+            batch_size = num_reqs
+        else:
+            batch_size = max(num_tokens // (self.num_speculative_tokens + 1), 1)
         # TODO: temporarily hack here, we should find out batch_size for profile_run
         if is_profile:
             batch_size = min(batch_size, self.runner.max_num_reqs)
@@ -715,7 +740,19 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         has_lora = len(self.runner.input_batch.lora_id_to_lora_request) > 0
         uniform_decode = target_model_batch_desc.uniform
 
-        if self.use_cuda_graph:
+        if self.use_draft_model_full_graph:
+            # draft_model drafter dispatch on (K+2) multiples: pad num_tokens
+            # (= R*(K+2)) up to the nearest captured drafter size
+            # (runner._draft_model_graph_sizes, derived from the target's
+            # capture sizes). Falls back to eager when no captured size fits
+            # (mirrors dispatcher's num_tokens > max_size semantics). The
+            # shared dispatcher cannot be used here: its FULL-uniform branch
+            # asserts num_tokens % (K+1) == 0, which R*(K+2) never satisfies.
+            drafter_query_len = self.num_speculative_tokens + 2
+            drafter_sizes = getattr(self.runner, "_draft_model_graph_sizes", None) or []
+            padded_size = next((s for s in drafter_sizes if s >= num_tokens), None)
+            num_input_tokens = padded_size if padded_size is not None else num_tokens
+        elif self.use_cuda_graph:
             _, batch_descriptor = self.runner.cudagraph_dispatcher.dispatch(
                 num_tokens=num_tokens, uniform_decode=uniform_decode, has_lora=has_lora
             )
@@ -729,7 +766,16 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             _,
         ) = self.runner._sync_metadata_across_dp(num_input_tokens, is_draft_model=True)
 
-        if self.use_cuda_graph:
+        if self.use_draft_model_full_graph:
+            if padded_size is not None:
+                aclgraph_runtime_mode = CUDAGraphMode.FULL
+                batch_descriptor = BatchDescriptor(
+                    num_tokens=padded_size, num_reqs=padded_size // drafter_query_len, uniform=True
+                )
+            else:
+                aclgraph_runtime_mode = CUDAGraphMode.NONE
+                batch_descriptor = None
+        elif self.use_cuda_graph:
             aclgraph_runtime_mode, batch_descriptor = self.runner.cudagraph_dispatcher.dispatch(
                 num_tokens=num_input_tokens, uniform_decode=uniform_decode, has_lora=has_lora
             )
@@ -738,7 +784,32 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             aclgraph_runtime_mode = CUDAGraphMode.NONE
             batch_descriptor = None
 
-        if aclgraph_runtime_mode == CUDAGraphMode.FULL:
+        if self.use_draft_model_full_graph and aclgraph_runtime_mode == CUDAGraphMode.FULL:
+            # K+2-based padding: phantom requests of query_len (K+2) tokens
+            # each, appended after the real ones (query_start_loc steps by
+            # K+2; seq_lens/block tables zero-padded so FIA skips them).
+            num_reqs_padded = batch_descriptor.num_reqs
+            common_attn_metadata.num_reqs = num_reqs_padded
+            self.query_start_loc.cpu[: num_reqs_padded + 1] = torch.arange(
+                0, (num_reqs_padded + 1) * drafter_query_len, drafter_query_len, dtype=torch.int32
+            )
+            self.query_start_loc.copy_to_gpu()
+            common_attn_metadata.query_start_loc = self.query_start_loc.gpu[: num_reqs_padded + 1]
+            common_attn_metadata.query_start_loc_cpu = self.query_start_loc.cpu[: num_reqs_padded + 1]
+            common_attn_metadata.block_table_tensor = self._adjust_tensor(
+                common_attn_metadata.block_table_tensor, num_reqs_padded
+            )
+            common_attn_metadata.seq_lens = self._adjust_tensor(self.runner.seq_lens, num_reqs_padded)
+            common_attn_metadata.seq_lens_cpu = self._adjust_tensor(
+                self.runner.optimistic_seq_lens_cpu, num_reqs_padded
+            )
+            if common_attn_metadata._seq_lens_cpu is not None:
+                common_attn_metadata._seq_lens_cpu = common_attn_metadata.seq_lens_cpu.clone()
+            if common_attn_metadata.num_computed_tokens_cpu is not None:
+                common_attn_metadata.num_computed_tokens_cpu = self._adjust_tensor(
+                    common_attn_metadata.num_computed_tokens_cpu, num_reqs_padded
+                )
+        elif aclgraph_runtime_mode == CUDAGraphMode.FULL:
             # TODO: Due to the inconsistency between the proposer `dispatcher` and model runner, this padding
             # should have been done in model runner but not. For example, at prefill stage, target model
             # is run in eager mode currently, which means `_pad_query_start_loc_for_fia` is not called,
