@@ -80,7 +80,14 @@ def snapshot(base_url: str) -> dict:
     return parse_metrics(http_get(base_url.rstrip("/") + "/metrics"))
 
 
-def run_one(base_url: str, model: str, prompt: str, max_tokens: int, temperature: float) -> dict:
+def run_one(
+    base_url: str,
+    model: str,
+    prompt: str,
+    max_tokens: int,
+    temperature: float,
+    poll_timeout: float = 10.0,
+) -> dict:
     body = json.dumps(
         {
             "model": model,
@@ -124,7 +131,15 @@ def run_one(base_url: str, model: str, prompt: str, max_tokens: int, temperature
                 prev = now
                 completion_tokens += 1
     total = time.perf_counter() - t0
+    # Spec-decode counters may advance on the engine's periodic stats
+    # interval rather than per-request: poll until the drafts counter moves
+    # (or timeout) so per-request attribution usually works; global totals
+    # computed by the caller remain exact either way.
     after = snapshot(base_url)
+    deadline = time.perf_counter() + poll_timeout
+    while after.get("drafts", 0.0) <= before.get("drafts", 0.0) and time.perf_counter() < deadline:
+        time.sleep(0.5)
+        after = snapshot(base_url)
     req_metrics = {
         k: after.get(k, 0.0) - before.get(k, 0.0) for k in set(before) | set(after)
     }
@@ -145,15 +160,12 @@ def pct(values: list[float], p: float) -> float | None:
     return s[min(len(s) - 1, int(len(s) * p))]
 
 
-def summarize(results: list[dict]) -> dict:
-    drafts = sum(r["metrics_delta"].get("drafts", 0.0) for r in results)
-    accepted = sum(r["metrics_delta"].get("accepted", 0.0) for r in results)
-    pos = {}
-    for r in results:
-        for k, v in r["metrics_delta"].items():
-            if k.startswith("pos_"):
-                pos[k] = pos.get(k, 0.0) + v
+def summarize(metrics_delta: dict, results: list[dict]) -> dict:
+    drafts = metrics_delta.get("drafts", 0.0)
+    accepted = metrics_delta.get("accepted", 0.0)
+    pos = {k: v for k, v in metrics_delta.items() if k.startswith("pos_")}
     all_itls = [x for r in results for x in r["itls"]]
+    ttfts = [r["ttft"] for r in results if r["ttft"]]
     accept_len = 1 + accepted / drafts if drafts else None
     return {
         "num_requests": len(results),
@@ -169,11 +181,7 @@ def summarize(results: list[dict]) -> dict:
             "p50": round(pct(all_itls, 0.50) * 1000, 2) if all_itls else None,
             "p90": round(pct(all_itls, 0.90) * 1000, 2) if all_itls else None,
         },
-        "ttft_ms_mean": round(
-            statistics.mean([r["ttft"] for r in results if r["ttft"]]) * 1000, 2
-        )
-        if any(r["ttft"] for r in results)
-        else None,
+        "ttft_ms_mean": round(statistics.mean(ttfts) * 1000, 2) if ttfts else None,
         "completion_tokens_total": sum(r["completion_tokens"] for r in results),
     }
 
@@ -183,21 +191,35 @@ def cmd_bench(args: argparse.Namespace) -> None:
     if args.prompts_file:
         prompts = [ln.strip() for ln in open(args.prompts_file) if ln.strip()]
     prompts = prompts * args.repeat
+    start_global = snapshot(args.base_url)
     results = []
     for i, prompt in enumerate(prompts):
-        r = run_one(args.base_url, args.model, prompt, args.max_tokens, args.temperature)
-        al = None
+        r = run_one(args.base_url, args.model, prompt, args.max_tokens, args.temperature, args.poll_timeout)
         d = r["metrics_delta"]
-        if d.get("drafts"):
-            al = 1 + d.get("accepted", 0.0) / d["drafts"]
+        al = 1 + d.get("accepted", 0.0) / d["drafts"] if d.get("drafts") else None
+        al_str = f"{al:.3f}" if al is not None else "n/a"
+        itl_mean = f"{statistics.mean(r['itls']) * 1000:.2f}" if r["itls"] else "n/a"
         print(
             f"[{i+1}/{len(prompts)}] tokens={r['completion_tokens']} "
-            f"steps={int(d.get('drafts', 0))} accept_len={al:.3f} "
-            f"tpot_ms={round(statistics.mean(r['itls'])*1000,2) if r['itls'] else None}",
+            f"steps={int(d.get('drafts', 0))} accept_len={al_str} tpot_ms={itl_mean}",
             flush=True,
         )
         results.append(r)
-    out = {"tag": args.tag, "created": time.strftime("%F %T"), "summary": summarize(results), "results": results}
+    end_global = snapshot(args.base_url)
+    # Summary from whole-run first/last snapshots: immune to per-request
+    # attribution jitter of periodically-updated counters.
+    global_delta = {
+        k: end_global.get(k, 0.0) - start_global.get(k, 0.0) for k in set(start_global) | set(end_global)
+    }
+    if not global_delta.get("drafts"):
+        print(
+            "WARNING: vllm:spec_decode_num_drafts_total did not advance during the run; "
+            "accept-length stats unavailable. Check that /metrics exposes spec-decode "
+            "counters (no --disable-log-stats / prometheus disabled).",
+            file=sys.stderr,
+        )
+    summary = summarize(global_delta, results)
+    out = {"tag": args.tag, "created": time.strftime("%F %T"), "summary": summary, "results": results}
     with open(args.out, "w") as f:
         json.dump(out, f, indent=2)
     print(json.dumps(out["summary"], indent=2))
@@ -247,6 +269,12 @@ def main() -> None:
     b.add_argument("--temperature", type=float, default=0.0)
     b.add_argument("--repeat", type=int, default=3, help="repeat the prompt set N times")
     b.add_argument("--prompts-file", default=None, help="one prompt per line; default built-in set")
+    b.add_argument(
+        "--poll-timeout",
+        type=float,
+        default=10.0,
+        help="seconds to wait per-request for spec-decode counters to advance (they tick on the periodic stats interval)",
+    )
     b.set_defaults(func=cmd_bench)
     c = sub.add_parser("compare")
     c.add_argument("a")
