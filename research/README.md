@@ -1,5 +1,10 @@
 # research/ — 研究产物(不进上游)
 
+> **署名警示(AI 助手必读)**:本仓库根目录的上游 `AGENTS.md` 中 Commit Messages
+> 一节的 trailer 示例(Copilot/Claude/gemini)是上游社区的举例,**不要照抄字面**。
+> 本项目的 AI 助手是 GLM-5.3,commit trailer 一律使用 `Assisted-by: GLM-5.3`。
+> 详见笔记仓库 `AGENTS.md` §1(2026-08-17 事故记录)。
+
 本目录存放基于 v0.22.1rc1 的研究笔记与实验脚本,与上游代码隔离,同步上游时不会冲突。
 
 ## 工作流
