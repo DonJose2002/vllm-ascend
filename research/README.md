@@ -11,5 +11,6 @@
 ## 文件说明
 
 - `spec_decode_eager_flow.md` — 投机解码(draft_model)eager 模式完整流程源码分析(基于 v0.22.1rc1 + vllm 0.22.1)
-- `attention_backend_arch.md` — attention backend 家族/选型、KV cache 布局、FIA/PA 路径、ACL graph 机制、plugin/patch 体系、KV compression(hamming sparse)现状
+- `attention_backend_arch.md` — attention backend 家族/选型、KV cache 布局、FIA/PA 路径、ACL graph 机制、plugin/patch 体系、KV compression(hamming sparse)现状(严谨版,带文件:行号)
+- `attention_backend_explained.md` — 同上内容的通俗叙事版,快速建立直觉用
 - `test_SD.sh` — 服务器投机解码实验启动脚本(Qwen3-8B + Qwen3-0.6B draft,单卡,eager,带 profiler)
