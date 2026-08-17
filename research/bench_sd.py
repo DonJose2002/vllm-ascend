@@ -1,0 +1,260 @@
+#!/usr/bin/env python3
+"""Benchmark speculative decoding (accept length + latency) for plan A/C.
+
+Standalone test script; does not modify any vllm/vllm-ascend code.
+
+Modes:
+  bench   Send a fixed prompt set to an OpenAI-compatible server (streaming),
+          snapshot /metrics spec-decode counters around each request, and
+          report accept length (incl. bonus), per-position acceptance rates,
+          and decode latency (ITL/TPOT percentiles).
+  compare Summarize two bench JSON outputs side by side.
+
+Usage (server side, run once per mode):
+  # plan C:  VLLM_ASCEND_DRAFT_MODEL_FULL_GRAPH=0 vllm serve ...
+  # plan A:  VLLM_ASCEND_DRAFT_MODEL_FULL_GRAPH=1 vllm serve ...
+  python3 research/bench_sd.py bench  --base-url http://127.0.0.1:8007 \
+      --model /nfs-share/hf_weights/Qwen3-8B --tag A --out bench_A.json
+  python3 research/bench_sd.py compare bench_C.json bench_A.json
+
+Metrics source: vllm:spec_decode_num_drafts_total,
+vllm:spec_decode_num_accepted_tokens_total and
+vllm:spec_decode_num_accepted_tokens_per_pos_total (vllm 0.22.1,
+vllm/v1/spec_decode/metrics.py). Mean accept length = 1 + accepted/drafts.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import statistics
+import sys
+import time
+import urllib.request
+
+DEFAULT_PROMPTS = [
+    "Explain the difference between throughput and latency in LLM serving.",
+    "Write a Python function that merges two sorted lists in linear time.",
+    "Summarize the causes of the 1929 economic crisis in five bullet points.",
+    "Translate into French: The quick brown fox jumps over the lazy dog.",
+    "Describe how speculative decoding speeds up LLM inference.",
+    "List six practical ways to reduce KV cache memory usage.",
+    "Explain why attention scales quadratically with sequence length.",
+    "Write a haiku about debugging race conditions at midnight.",
+    "Compare INT8 and INT4 quantization trade-offs for edge devices.",
+    "What are the main components of the Ascend CANN software stack?",
+]
+
+
+def http_get(url: str, timeout: float = 30.0) -> str:
+    with urllib.request.urlopen(url, timeout=timeout) as resp:
+        return resp.read().decode()
+
+
+def parse_metrics(text: str) -> dict:
+    """Parse the few spec-decode counters from a Prometheus exposition."""
+    out: dict[str, float] = {}
+    for line in text.splitlines():
+        if line.startswith("#") or not line.startswith("vllm:"):
+            continue
+        try:
+            name_val = line.split()
+            name, value = name_val[0], float(name_val[1])
+        except (IndexError, ValueError):
+            continue
+        if name.startswith("vllm:spec_decode_num_accepted_tokens_per_pos_total"):
+            m = re.search(r'position="(\d+)"', name)
+            if m:
+                out[f"pos_{m.group(1)}"] = value
+        elif name.startswith("vllm:spec_decode_num_drafts_total"):
+            out["drafts"] = value
+        elif name.startswith("vllm:spec_decode_num_accepted_tokens_total"):
+            out["accepted"] = value
+        elif name.startswith("vllm:spec_decode_num_draft_tokens_total"):
+            out["draft_tokens"] = value
+    return out
+
+
+def snapshot(base_url: str) -> dict:
+    return parse_metrics(http_get(base_url.rstrip("/") + "/metrics"))
+
+
+def run_one(base_url: str, model: str, prompt: str, max_tokens: int, temperature: float) -> dict:
+    body = json.dumps(
+        {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "stream": True,
+        }
+    ).encode()
+    req = urllib.request.Request(
+        base_url.rstrip("/") + "/v1/chat/completions",
+        data=body,
+        headers={"Content-Type": "application/json"},
+    )
+    before = snapshot(base_url)
+    t0 = time.perf_counter()
+    first_token_ts = None
+    itls: list[float] = []
+    completion_tokens = 0
+    with urllib.request.urlopen(req, timeout=600) as resp:
+        prev = t0
+        for raw in resp:
+            line = raw.decode().strip()
+            if not line.startswith("data:"):
+                continue
+            data = line[len("data:") :].strip()
+            if data == "[DONE]":
+                break
+            try:
+                chunk = json.loads(data)
+            except json.JSONDecodeError:
+                continue
+            delta = chunk.get("choices", [{}])[0].get("delta", {})
+            content = delta.get("content")
+            if content:
+                now = time.perf_counter()
+                if first_token_ts is None:
+                    first_token_ts = now
+                else:
+                    itls.append(now - prev)
+                prev = now
+                completion_tokens += 1
+    total = time.perf_counter() - t0
+    after = snapshot(base_url)
+    req_metrics = {
+        k: after.get(k, 0.0) - before.get(k, 0.0) for k in set(before) | set(after)
+    }
+    return {
+        "prompt": prompt,
+        "completion_tokens": completion_tokens,
+        "ttft": (first_token_ts - t0) if first_token_ts else None,
+        "total_s": total,
+        "itls": itls,
+        "metrics_delta": req_metrics,
+    }
+
+
+def pct(values: list[float], p: float) -> float | None:
+    if not values:
+        return None
+    s = sorted(values)
+    return s[min(len(s) - 1, int(len(s) * p))]
+
+
+def summarize(results: list[dict]) -> dict:
+    drafts = sum(r["metrics_delta"].get("drafts", 0.0) for r in results)
+    accepted = sum(r["metrics_delta"].get("accepted", 0.0) for r in results)
+    pos = {}
+    for r in results:
+        for k, v in r["metrics_delta"].items():
+            if k.startswith("pos_"):
+                pos[k] = pos.get(k, 0.0) + v
+    all_itls = [x for r in results for x in r["itls"]]
+    accept_len = 1 + accepted / drafts if drafts else None
+    return {
+        "num_requests": len(results),
+        "total_drafts": drafts,
+        "total_accepted": accepted,
+        "mean_accept_length_incl_bonus": accept_len,
+        "per_position_accepted": {k: round(v, 1) for k, v in sorted(pos.items())},
+        "per_position_rate_vs_drafts": (
+            {k: round(v / drafts, 4) for k, v in sorted(pos.items())} if drafts else None
+        ),
+        "decode_itl_ms": {
+            "mean": round(statistics.mean(all_itls) * 1000, 2) if all_itls else None,
+            "p50": round(pct(all_itls, 0.50) * 1000, 2) if all_itls else None,
+            "p90": round(pct(all_itls, 0.90) * 1000, 2) if all_itls else None,
+        },
+        "ttft_ms_mean": round(
+            statistics.mean([r["ttft"] for r in results if r["ttft"]]) * 1000, 2
+        )
+        if any(r["ttft"] for r in results)
+        else None,
+        "completion_tokens_total": sum(r["completion_tokens"] for r in results),
+    }
+
+
+def cmd_bench(args: argparse.Namespace) -> None:
+    prompts = DEFAULT_PROMPTS
+    if args.prompts_file:
+        prompts = [ln.strip() for ln in open(args.prompts_file) if ln.strip()]
+    prompts = prompts * args.repeat
+    results = []
+    for i, prompt in enumerate(prompts):
+        r = run_one(args.base_url, args.model, prompt, args.max_tokens, args.temperature)
+        al = None
+        d = r["metrics_delta"]
+        if d.get("drafts"):
+            al = 1 + d.get("accepted", 0.0) / d["drafts"]
+        print(
+            f"[{i+1}/{len(prompts)}] tokens={r['completion_tokens']} "
+            f"steps={int(d.get('drafts', 0))} accept_len={al:.3f} "
+            f"tpot_ms={round(statistics.mean(r['itls'])*1000,2) if r['itls'] else None}",
+            flush=True,
+        )
+        results.append(r)
+    out = {"tag": args.tag, "created": time.strftime("%F %T"), "summary": summarize(results), "results": results}
+    with open(args.out, "w") as f:
+        json.dump(out, f, indent=2)
+    print(json.dumps(out["summary"], indent=2))
+
+
+def cmd_compare(args: argparse.Namespace) -> None:
+    with open(args.a) as f:
+        ja = json.load(f)
+    with open(args.b) as f:
+        jb = json.load(f)
+        sa, sb = ja["summary"], jb["summary"]
+
+    def row(name, va, vb, fmt="{:.3f}"):
+        try:
+            da, db = fmt.format(va), fmt.format(vb)
+        except (ValueError, TypeError):
+            da, db = str(va), str(vb)
+        print(f"{name:<36}{da:>14}{db:>14}")
+
+    print(f"{'':<36}{ja['tag'] + ' (' + ja.get('created','') + ')':>28}"
+          f"{jb['tag'] + ' (' + jb.get('created','') + ')':>28}")
+    row("requests", sa["num_requests"], jb["summary"]["num_requests"], "{:d}")
+    row("draft steps", sa["total_drafts"], sb["total_drafts"], "{:.0f}")
+    row("mean accept len (incl bonus)", sa["mean_accept_length_incl_bonus"], sb["mean_accept_length_incl_bonus"])
+    row("ITL mean (ms)", sa["decode_itl_ms"]["mean"], sb["decode_itl_ms"]["mean"])
+    row("ITL p50 (ms)", sa["decode_itl_ms"]["p50"], sb["decode_itl_ms"]["p50"])
+    row("ITL p90 (ms)", sa["decode_itl_ms"]["p90"], sb["decode_itl_ms"]["p90"])
+    row("TTFT mean (ms)", sa["ttft_ms_mean"], sb["ttft_ms_mean"], "{:.1f}")
+    pa, pb = sa.get("per_position_rate_vs_drafts") or {}, sb.get("per_position_rate_vs_drafts") or {}
+    for k in sorted(set(pa) | set(pb)):
+        row(f"accept rate {k.replace('pos_', 'pos ')}", pa.get(k), pb.get(k), "{:.4f}")
+    al_a = sa["mean_accept_length_incl_bonus"]
+    al_b = sb["mean_accept_length_incl_bonus"]
+    if al_a and al_b:
+        print(f"\naccept-len delta (B - A): {al_b - al_a:+.3f}")
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    b = sub.add_parser("bench")
+    b.add_argument("--base-url", required=True)
+    b.add_argument("--model", required=True)
+    b.add_argument("--tag", default="run", help="label stored in the output json")
+    b.add_argument("--out", default="bench_out.json")
+    b.add_argument("--max-tokens", type=int, default=256)
+    b.add_argument("--temperature", type=float, default=0.0)
+    b.add_argument("--repeat", type=int, default=3, help="repeat the prompt set N times")
+    b.add_argument("--prompts-file", default=None, help="one prompt per line; default built-in set")
+    b.set_defaults(func=cmd_bench)
+    c = sub.add_parser("compare")
+    c.add_argument("a")
+    c.add_argument("b")
+    c.set_defaults(func=cmd_compare)
+    args = ap.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
