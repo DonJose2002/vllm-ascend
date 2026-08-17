@@ -80,6 +80,25 @@ def snapshot(base_url: str) -> dict:
     return parse_metrics(http_get(base_url.rstrip("/") + "/metrics"))
 
 
+def estimate_steps_from_timestamps(token_ts: list[float], min_gap_s: float = 0.002) -> int:
+    """Estimate engine decode steps from streamed-token arrival timestamps.
+
+    With speculative decoding each engine step releases (1 + accepted) tokens
+    back-to-back, so inter-token gaps are bimodal: intra-burst gaps are
+    network/serialization noise (sub-ms on localhost) while inter-step gaps
+    are one decode step (tens of ms). Count gaps above an adaptive threshold
+    (relative to the median gap) to recover the step count. For pooled
+    accept length, tokens/steps equals the conventional 1 + accepted/drafts.
+    Truncation by max_tokens can clip the final burst (slight underestimate).
+    """
+    if len(token_ts) < 2:
+        return max(1, len(token_ts))
+    gaps = [b - a for a, b in zip(token_ts, token_ts[1:])]
+    median_gap = statistics.median(gaps)
+    threshold = max(min_gap_s, 0.3 * median_gap)
+    return 1 + sum(g > threshold for g in gaps)
+
+
 def run_one(
     base_url: str,
     model: str,
@@ -105,6 +124,7 @@ def run_one(
     before = snapshot(base_url)
     t0 = time.perf_counter()
     first_token_ts = None
+    token_ts: list[float] = []
     itls: list[float] = []
     completion_tokens = 0
     with urllib.request.urlopen(req, timeout=600) as resp:
@@ -124,6 +144,7 @@ def run_one(
             content = delta.get("content")
             if content:
                 now = time.perf_counter()
+                token_ts.append(now)
                 if first_token_ts is None:
                     first_token_ts = now
                 else:
@@ -149,6 +170,7 @@ def run_one(
         "ttft": (first_token_ts - t0) if first_token_ts else None,
         "total_s": total,
         "itls": itls,
+        "est_steps": estimate_steps_from_timestamps(token_ts),
         "metrics_delta": req_metrics,
     }
 
@@ -167,11 +189,16 @@ def summarize(metrics_delta: dict, results: list[dict]) -> dict:
     all_itls = [x for r in results for x in r["itls"]]
     ttfts = [r["ttft"] for r in results if r["ttft"]]
     accept_len = 1 + accepted / drafts if drafts else None
+    total_tokens = sum(r["completion_tokens"] for r in results)
+    total_steps = sum(r.get("est_steps", 0) for r in results)
+    accept_len_est = total_tokens / total_steps if total_steps else None
     return {
         "num_requests": len(results),
         "total_drafts": drafts,
         "total_accepted": accepted,
         "mean_accept_length_incl_bonus": accept_len,
+        "mean_accept_length_burst_est": round(accept_len_est, 4) if accept_len_est else None,
+        "est_steps_total": total_steps,
         "per_position_accepted": {k: round(v, 1) for k, v in sorted(pos.items())},
         "per_position_rate_vs_drafts": (
             {k: round(v / drafts, 4) for k, v in sorted(pos.items())} if drafts else None
@@ -197,11 +224,13 @@ def cmd_bench(args: argparse.Namespace) -> None:
         r = run_one(args.base_url, args.model, prompt, args.max_tokens, args.temperature, args.poll_timeout)
         d = r["metrics_delta"]
         al = 1 + d.get("accepted", 0.0) / d["drafts"] if d.get("drafts") else None
-        al_str = f"{al:.3f}" if al is not None else "n/a"
+        al_m = f"{al:.3f}" if al is not None else "n/a"
+        al_e = r["completion_tokens"] / r["est_steps"] if r["est_steps"] else None
+        al_est = f"{al_e:.3f}" if al_e is not None else "n/a"
         itl_mean = f"{statistics.mean(r['itls']) * 1000:.2f}" if r["itls"] else "n/a"
         print(
             f"[{i+1}/{len(prompts)}] tokens={r['completion_tokens']} "
-            f"steps={int(d.get('drafts', 0))} accept_len={al_str} tpot_ms={itl_mean}",
+            f"steps~={r['est_steps']} accept_len(metrics)={al_m} accept_len(est)={al_est} tpot_ms={itl_mean}",
             flush=True,
         )
         results.append(r)
@@ -244,6 +273,7 @@ def cmd_compare(args: argparse.Namespace) -> None:
     row("requests", sa["num_requests"], jb["summary"]["num_requests"], "{:d}")
     row("draft steps", sa["total_drafts"], sb["total_drafts"], "{:.0f}")
     row("mean accept len (incl bonus)", sa["mean_accept_length_incl_bonus"], sb["mean_accept_length_incl_bonus"])
+    row("mean accept len (burst est)", sa.get("mean_accept_length_burst_est"), sb.get("mean_accept_length_burst_est"))
     row("ITL mean (ms)", sa["decode_itl_ms"]["mean"], sb["decode_itl_ms"]["mean"])
     row("ITL p50 (ms)", sa["decode_itl_ms"]["p50"], sb["decode_itl_ms"]["p50"])
     row("ITL p90 (ms)", sa["decode_itl_ms"]["p90"], sb["decode_itl_ms"]["p90"])
@@ -255,6 +285,25 @@ def cmd_compare(args: argparse.Namespace) -> None:
     al_b = sb["mean_accept_length_incl_bonus"]
     if al_a and al_b:
         print(f"\naccept-len delta (B - A): {al_b - al_a:+.3f}")
+
+
+def cmd_check(args: argparse.Namespace) -> None:
+    """Dump spec-decode related /metrics lines to diagnose missing counters."""
+    text = http_get(args.base_url.rstrip("/") + "/metrics")
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    spec = [ln for ln in lines if "spec" in ln.lower()]
+    print(f"total metric lines: {len(lines)}, containing 'spec': {len(spec)}")
+    if spec:
+        print("--- spec-decode lines ---")
+        for ln in spec:
+            print(ln)
+    else:
+        print("NO spec-decode metrics exposed. Sample of available vllm: lines:")
+        vllm_lines = [ln for ln in lines if ln.startswith("vllm:")]
+        for ln in vllm_lines[:60]:
+            print(ln)
+        if not vllm_lines:
+            print("(no vllm: prefixed lines at all — /metrics may be disabled or proxied)")
 
 
 def main() -> None:
@@ -280,6 +329,9 @@ def main() -> None:
     c.add_argument("a")
     c.add_argument("b")
     c.set_defaults(func=cmd_compare)
+    k = sub.add_parser("check", help="inspect /metrics for spec-decode counters")
+    k.add_argument("--base-url", required=True)
+    k.set_defaults(func=cmd_check)
     args = ap.parse_args()
     args.func(args)
 
