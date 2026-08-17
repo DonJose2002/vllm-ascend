@@ -1,7 +1,8 @@
 # Debug 笔记:bug3 — draft_model + FULL 图:drafter token 数失配导致输出形状错误
 
-> 日期:2026-08-17 | 基线:vllm-ascend v0.22.1rc1 + vllm 0.22.1 | 状态:**方案 C(降级)已提交待服务器验证;方案 A(正解)待做**
-> 前序:bug1 update_stream MRO(`bugfix-draft-model-update-stream.md`)、bug2 模式跨模型污染(`bugfix-qknorm-pattern-cross-model.md`)。
+> 日期:2026-08-17 | 基线:vllm-ascend v0.22.1rc1 + vllm 0.22.1
+> 状态:**✅ 已解决(2026-08-17 深夜服务器验证通过)**——方案 C(默认)+ 方案 A(`VLLM_ASCEND_DRAFT_MODEL_FULL_GRAPH=1`,接受长度恢复、双向波动经复检为正常)
+> 完整历程(含 bug1/bug2 前序)见姊妹篇:`draft-model-full-graph-journey.md`(自然语言复盘)
 
 ## 现象
 
@@ -96,28 +97,14 @@ git pull && export VLLM_ASCEND_DRAFT_MODEL_FULL_GRAPH=1
 #   5. 崩溃/异常 → 贴日志,回退 export ...=0 即恢复方案 C
 ```
 
-### 事故 A-1 后续:接受长度在 3 附近波动(2026-08-17 观测,待定量)
+### 事故 A-1 后续:接受长度在 3 附近波动(✅ 2026-08-17 深夜复检通过,结案)
 
-现象:修复后接受长度回到 ~3 但围绕原值双向波动。判据与定位方法:
-- **双向波动 + 均值差小** → 判定为图编译(static kernel tiling/累加顺序)的 BF16 数值噪声,经 greedy argmax 放大,属良性
-- **均值显著偏低(>0.1)或单边** → 系统性问题,用 per-position 接受率定位:
-  - pos 0 就低 → step0 元数据(extend 相关)
-  - pos 0 正常、pos 1+ 逐位衰减过快 → chain 步 replay 元数据(attn_update_stack_num_spec_norm)
-- 定量工具:`research/bench_sd.py`(独立脚本,不改代码主体),从 /metrics 取
-  `vllm:spec_decode_num_drafts/accepted/per_pos` counters,输出每请求接受长度、
-  per-position 接受率、ITL/TTFT 分位;A/C 两模式各跑一次后 compare
-
-```bash
-# 服务器,两模式各起一次服务后:
-python3 research/bench_sd.py bench  --base-url http://127.0.0.1:8007 \
-    --model /nfs-share/hf_weights/Qwen3-8B --tag A --out bench_A.json
-python3 research/bench_sd.py compare bench_C.json bench_A.json
-# 判定:mean accept len 差 <0.1 → 噪声结案;ITL 应见 A 显著优于 C(方案 A 的目的)
-```
+现象:修复后接受长度回到 ~3 但围绕原值双向波动。用户逐项复检后确认无系统性偏差——双向波动符合图编译(static kernel tiling/累加顺序差异)在 BF16 + greedy argmax 下的数值噪声特征,属良性,结案。定量工具保留(`research/bench_sd.py`,双口径接受长度 + ITL/TTFT + per-position 接受率),后续回归验证可复用。
 
 ## 遗留
 
 - [x] 方案 C 服务器验证(2026-08-17 用户确认通过)
 - [x] 方案 A 前置调研(上游无 FULL 先例;#45258 RFC 地雷图 + #34880 未合并设计为参考)
-- [ ] 方案 A 服务器验证(清单见上)
-- [ ] (远期)若方案 A 稳定,考虑向上游提 PR(可引用 #45258 的 KV 隔离担忧的解法)
+- [x] 方案 A 实现与服务器验证(含事故 A-1 修复;2026-08-17 深夜用户确认通过)
+- [ ] **pull request**(计划 2026-08-18):bug1/2/3 系列修复整理成 draft_model+FULL 模式支持 PR;env 开关建议转为 `--additional-config` 项(消除 validate_environ warning,对齐 vllm-ascend 配置惯例);可引用本目录三篇笔记
+- [ ] (可选,后续)A/C 的 ITL 收益定量对比(bench_sd.py 就绪,跑一轮即可出数)
