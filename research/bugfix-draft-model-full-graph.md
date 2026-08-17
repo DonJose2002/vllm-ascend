@@ -96,6 +96,25 @@ git pull && export VLLM_ASCEND_DRAFT_MODEL_FULL_GRAPH=1
 #   5. 崩溃/异常 → 贴日志,回退 export ...=0 即恢复方案 C
 ```
 
+### 事故 A-1 后续:接受长度在 3 附近波动(2026-08-17 观测,待定量)
+
+现象:修复后接受长度回到 ~3 但围绕原值双向波动。判据与定位方法:
+- **双向波动 + 均值差小** → 判定为图编译(static kernel tiling/累加顺序)的 BF16 数值噪声,经 greedy argmax 放大,属良性
+- **均值显著偏低(>0.1)或单边** → 系统性问题,用 per-position 接受率定位:
+  - pos 0 就低 → step0 元数据(extend 相关)
+  - pos 0 正常、pos 1+ 逐位衰减过快 → chain 步 replay 元数据(attn_update_stack_num_spec_norm)
+- 定量工具:`research/bench_sd.py`(独立脚本,不改代码主体),从 /metrics 取
+  `vllm:spec_decode_num_drafts/accepted/per_pos` counters,输出每请求接受长度、
+  per-position 接受率、ITL/TTFT 分位;A/C 两模式各跑一次后 compare
+
+```bash
+# 服务器,两模式各起一次服务后:
+python3 research/bench_sd.py bench  --base-url http://127.0.0.1:8007 \
+    --model /nfs-share/hf_weights/Qwen3-8B --tag A --out bench_A.json
+python3 research/bench_sd.py compare bench_C.json bench_A.json
+# 判定:mean accept len 差 <0.1 → 噪声结案;ITL 应见 A 显著优于 C(方案 A 的目的)
+```
+
 ## 遗留
 
 - [x] 方案 C 服务器验证(2026-08-17 用户确认通过)
