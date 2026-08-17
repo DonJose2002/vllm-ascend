@@ -799,9 +799,27 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             common_attn_metadata.block_table_tensor = self._adjust_tensor(
                 common_attn_metadata.block_table_tensor, num_reqs_padded
             )
-            common_attn_metadata.seq_lens = self._adjust_tensor(self.runner.seq_lens, num_reqs_padded)
+            # seq_lens MUST come from the post-extend common_attn_metadata
+            # (set_inputs_first_pass -> extend_all_queries_by_N already added
+            # net_num_new_slots_per_request per row to cover the extra seed
+            # KV written during step0). Using runner.seq_lens here (as the
+            # eagle branch does) would under-count by one: eagle never
+            # extends (needs_extra_input_slots=False), draft_model does —
+            # same reason the dflash branch below uses cad.seq_lens. An
+            # off-by-one attend range shifts every query's causal boundary
+            # and corrupts all draft tokens (accept length collapses to ~1).
+            common_attn_metadata.seq_lens = self._adjust_tensor(
+                common_attn_metadata.seq_lens, num_reqs_padded
+            )
+            extended_seq_lens_cpu = common_attn_metadata.seq_lens_cpu
+            if extended_seq_lens_cpu is None and common_attn_metadata._seq_lens_cpu is not None:
+                extended_seq_lens_cpu = common_attn_metadata._seq_lens_cpu
+            if extended_seq_lens_cpu is None:
+                extended_seq_lens_cpu = (
+                    self.runner.optimistic_seq_lens_cpu + self.net_num_new_slots_per_request
+                )
             common_attn_metadata.seq_lens_cpu = self._adjust_tensor(
-                self.runner.optimistic_seq_lens_cpu, num_reqs_padded
+                extended_seq_lens_cpu, num_reqs_padded
             )
             if common_attn_metadata._seq_lens_cpu is not None:
                 common_attn_metadata._seq_lens_cpu = common_attn_metadata.seq_lens_cpu.clone()
