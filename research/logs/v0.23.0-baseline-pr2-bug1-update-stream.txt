@@ -1,0 +1,85 @@
+Capturing CUDA graphs (mixed prefill-decode, FULL):   0%|                                                                                                                                                            | 0/2 [00:12<?, ?it/s]
+(EngineCore pid=25307) ERROR 08-18 11:18:22 [core.py:1195] EngineCore failed to start.
+(EngineCore pid=25307) ERROR 08-18 11:18:22 [core.py:1195] Traceback (most recent call last):
+(EngineCore pid=25307) ERROR 08-18 11:18:22 [core.py:1195]   File "/vllm-workspace/vllm-ascend/vllm_ascend/worker/model_runner_v1.py", line 5232, in _replace_gpu_model_runner_function_wrapper
+(EngineCore pid=25307) ERROR 08-18 11:18:22 [core.py:1195]     yield
+(EngineCore pid=25307) ERROR 08-18 11:18:22 [core.py:1195]   File "/vllm-workspace/vllm-ascend/vllm_ascend/worker/model_runner_v1.py", line 5103, in capture_model
+(EngineCore pid=25307) ERROR 08-18 11:18:22 [core.py:1195]     cuda_graph_size = GPUModelRunner.capture_model(self)
+(EngineCore pid=25307) ERROR 08-18 11:18:22 [core.py:1195]                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=25307) ERROR 08-18 11:18:22 [core.py:1195]   File "/vllm-workspace/vllm/vllm/tracing/otel.py", line 178, in sync_wrapper
+(EngineCore pid=25307) ERROR 08-18 11:18:22 [core.py:1195]     return func(*args, **kwargs)
+(EngineCore pid=25307) ERROR 08-18 11:18:22 [core.py:1195]            ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=25307) ERROR 08-18 11:18:22 [core.py:1195]   File "/vllm-workspace/vllm/vllm/v1/worker/gpu_model_runner.py", line 6553, in capture_model
+(EngineCore pid=25307) ERROR 08-18 11:18:22 [core.py:1195]     self._capture_cudagraphs(
+(EngineCore pid=25307) ERROR 08-18 11:18:22 [core.py:1195]   File "/vllm-workspace/vllm/vllm/v1/worker/gpu_model_runner.py", line 6669, in _capture_cudagraphs
+(EngineCore pid=25307) ERROR 08-18 11:18:22 [core.py:1195]     self._warmup_and_capture(
+(EngineCore pid=25307) ERROR 08-18 11:18:22 [core.py:1195]   File "/vllm-workspace/vllm/vllm/v1/worker/gpu_model_runner.py", line 6615, in _warmup_and_capture
+(EngineCore pid=25307) ERROR 08-18 11:18:22 [core.py:1195]     self._dummy_run(
+(EngineCore pid=25307) ERROR 08-18 11:18:22 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch/utils/_contextlib.py", line 124, in decorate_context
+(EngineCore pid=25307) ERROR 08-18 11:18:22 [core.py:1195]     return func(*args, **kwargs)
+(EngineCore pid=25307) ERROR 08-18 11:18:22 [core.py:1195]            ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=25307) ERROR 08-18 11:18:22 [core.py:1195]   File "/vllm-workspace/vllm-ascend/vllm_ascend/worker/model_runner_v1.py", line 3642, in _dummy_run
+(EngineCore pid=25307) ERROR 08-18 11:18:22 [core.py:1195]     self.drafter.dummy_run(
+(EngineCore pid=25307) ERROR 08-18 11:18:22 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch/utils/_contextlib.py", line 124, in decorate_context
+(EngineCore pid=25307) ERROR 08-18 11:18:22 [core.py:1195]     return func(*args, **kwargs)
+(EngineCore pid=25307) ERROR 08-18 11:18:22 [core.py:1195]            ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=25307) ERROR 08-18 11:18:22 [core.py:1195]   File "/vllm-workspace/vllm-ascend/vllm_ascend/spec_decode/llm_base_proposer.py", line 717, in dummy_run
+(EngineCore pid=25307) ERROR 08-18 11:18:22 [core.py:1195]     self._update_full_graph_params(forward_context, num_tokens, multi_steps_attn_metadata)
+(EngineCore pid=25307) ERROR 08-18 11:18:22 [core.py:1195]   File "/vllm-workspace/vllm-ascend/vllm_ascend/spec_decode/llm_base_proposer.py", line 1992, in _update_full_graph_params
+(EngineCore pid=25307) ERROR 08-18 11:18:22 [core.py:1195]     self.update_stream,
+(EngineCore pid=25307) ERROR 08-18 11:18:22 [core.py:1195]     ^^^^^^^^^^^^^^^^^^
+(EngineCore pid=25307) ERROR 08-18 11:18:22 [core.py:1195] AttributeError: 'AscendDraftModelProposer' object has no attribute 'update_stream'
+(EngineCore pid=25307) ERROR 08-18 11:18:22 [core.py:1195] 
+(EngineCore pid=25307) ERROR 08-18 11:18:22 [core.py:1195] During handling of the above exception, another exception occurred:
+(EngineCore pid=25307) ERROR 08-18 11:18:22 [core.py:1195] 
+(EngineCore pid=25307) ERROR 08-18 11:18:22 [core.py:1195] Traceback (most recent call last):
+(EngineCore pid=25307) ERROR 08-18 11:18:22 [core.py:1195]   File "/vllm-workspace/vllm-ascend/vllm_ascend/worker/model_runner_v1.py", line 5198, in _torch_cuda_wrapper
+(EngineCore pid=25307) ERROR 08-18 11:18:22 [core.py:1195]     yield
+(EngineCore pid=25307) ERROR 08-18 11:18:22 [core.py:1195]   File "/vllm-workspace/vllm-ascend/vllm_ascend/worker/model_runner_v1.py", line 5102, in capture_model
+(EngineCore pid=25307) ERROR 08-18 11:18:22 [core.py:1195]     with _torch_cuda_wrapper(), _replace_gpu_model_runner_function_wrapper(parent_module_name):
+(EngineCore pid=25307) ERROR 08-18 11:18:22 [core.py:1195]                                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=25307) ERROR 08-18 11:18:22 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/contextlib.py", line 158, in __exit__
+(EngineCore pid=25307) ERROR 08-18 11:18:22 [core.py:1195]     self.gen.throw(value)
+(EngineCore pid=25307) ERROR 08-18 11:18:22 [core.py:1195]   File "/vllm-workspace/vllm-ascend/vllm_ascend/worker/model_runner_v1.py", line 5234, in _replace_gpu_model_runner_function_wrapper
+(EngineCore pid=25307) ERROR 08-18 11:18:22 [core.py:1195]     raise RuntimeError(f"NPUModelRunner failed, error is {e}")
+(EngineCore pid=25307) ERROR 08-18 11:18:22 [core.py:1195] RuntimeError: NPUModelRunner failed, error is 'AscendDraftModelProposer' object has no attribute 'update_stream'
+(EngineCore pid=25307) ERROR 08-18 11:18:22 [core.py:1195] 
+(EngineCore pid=25307) ERROR 08-18 11:18:22 [core.py:1195] During handling of the above exception, another exception occurred:
+(EngineCore pid=25307) ERROR 08-18 11:18:22 [core.py:1195] 
+(EngineCore pid=25307) ERROR 08-18 11:18:22 [core.py:1195] Traceback (most recent call last):
+(EngineCore pid=25307) ERROR 08-18 11:18:22 [core.py:1195]   File "/vllm-workspace/vllm/vllm/v1/engine/core.py", line 1164, in run_engine_core
+(EngineCore pid=25307) ERROR 08-18 11:18:22 [core.py:1195]     engine_core = EngineCoreProc(*args, engine_index=dp_rank, **kwargs)
+(EngineCore pid=25307) ERROR 08-18 11:18:22 [core.py:1195]                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=25307) ERROR 08-18 11:18:22 [core.py:1195]   File "/vllm-workspace/vllm/vllm/tracing/otel.py", line 178, in sync_wrapper
+(EngineCore pid=25307) ERROR 08-18 11:18:22 [core.py:1195]     return func(*args, **kwargs)
+(EngineCore pid=25307) ERROR 08-18 11:18:22 [core.py:1195]            ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=25307) ERROR 08-18 11:18:22 [core.py:1195]   File "/vllm-workspace/vllm/vllm/v1/engine/core.py", line 930, in __init__
+(EngineCore pid=25307) ERROR 08-18 11:18:22 [core.py:1195]     super().__init__(
+(EngineCore pid=25307) ERROR 08-18 11:18:22 [core.py:1195]   File "/vllm-workspace/vllm/vllm/v1/engine/core.py", line 132, in __init__
+(EngineCore pid=25307) ERROR 08-18 11:18:22 [core.py:1195]     kv_cache_config = self._initialize_kv_caches(vllm_config)
+(EngineCore pid=25307) ERROR 08-18 11:18:22 [core.py:1195]                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=25307) ERROR 08-18 11:18:22 [core.py:1195]   File "/vllm-workspace/vllm/vllm/tracing/otel.py", line 178, in sync_wrapper
+(EngineCore pid=25307) ERROR 08-18 11:18:22 [core.py:1195]     return func(*args, **kwargs)
+(EngineCore pid=25307) ERROR 08-18 11:18:22 [core.py:1195]            ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=25307) ERROR 08-18 11:18:22 [core.py:1195]   File "/vllm-workspace/vllm/vllm/v1/engine/core.py", line 290, in _initialize_kv_caches
+(EngineCore pid=25307) ERROR 08-18 11:18:22 [core.py:1195]     self.model_executor.initialize_from_config(kv_cache_configs)
+(EngineCore pid=25307) ERROR 08-18 11:18:22 [core.py:1195]   File "/vllm-workspace/vllm/vllm/v1/executor/abstract.py", line 124, in initialize_from_config
+(EngineCore pid=25307) ERROR 08-18 11:18:22 [core.py:1195]     compilation_times: list[CompilationTimes] = self.collective_rpc(
+(EngineCore pid=25307) ERROR 08-18 11:18:22 [core.py:1195]                                                 ^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=25307) ERROR 08-18 11:18:22 [core.py:1195]   File "/vllm-workspace/vllm/vllm/v1/executor/uniproc_executor.py", line 92, in collective_rpc
+(EngineCore pid=25307) ERROR 08-18 11:18:22 [core.py:1195]     result = run_method(self.driver_worker, method, args, kwargs)
+(EngineCore pid=25307) ERROR 08-18 11:18:22 [core.py:1195]              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=25307) ERROR 08-18 11:18:22 [core.py:1195]   File "/vllm-workspace/vllm/vllm/v1/serial_utils.py", line 510, in run_method
+(EngineCore pid=25307) ERROR 08-18 11:18:22 [core.py:1195]     return func(*args, **kwargs)
+(EngineCore pid=25307) ERROR 08-18 11:18:22 [core.py:1195]            ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=25307) ERROR 08-18 11:18:22 [core.py:1195]   File "/vllm-workspace/vllm-ascend/vllm_ascend/worker/worker.py", line 732, in compile_or_warm_up_model
+(EngineCore pid=25307) ERROR 08-18 11:18:22 [core.py:1195]     npugraph_memory_bytes = self.model_runner.capture_model()
+(EngineCore pid=25307) ERROR 08-18 11:18:22 [core.py:1195]                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=25307) ERROR 08-18 11:18:22 [core.py:1195]   File "/vllm-workspace/vllm-ascend/vllm_ascend/worker/model_runner_v1.py", line 5102, in capture_model
+(EngineCore pid=25307) ERROR 08-18 11:18:22 [core.py:1195]     with _torch_cuda_wrapper(), _replace_gpu_model_runner_function_wrapper(parent_module_name):
+(EngineCore pid=25307) ERROR 08-18 11:18:22 [core.py:1195]          ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=25307) ERROR 08-18 11:18:22 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/contextlib.py", line 158, in __exit__
+(EngineCore pid=25307) ERROR 08-18 11:18:22 [core.py:1195]     self.gen.throw(value)
+(EngineCore pid=25307) ERROR 08-18 11:18:22 [core.py:1195]   File "/vllm-workspace/vllm-ascend/vllm_ascend/worker/model_runner_v1.py", line 5207, in _torch_cuda_wrapper
+(EngineCore pid=25307) ERROR 08-18 11:18:22 [core.py:1195]     raise RuntimeError(f"NPUModelRunner init failed, error is {e}")
+(EngineCore pid=25307) ERROR 08-18 11:18:22 [core.py:1195] RuntimeError: NPUModelRunner init failed, error is NPUModelRunner failed, error is 'AscendDraftModelProposer' object has no attribute 'update_stream'

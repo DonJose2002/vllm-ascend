@@ -1,0 +1,393 @@
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195] EngineCore failed to start.
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195] Traceback (most recent call last):
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch_npu/dynamo/npugraph_ex/_utils/error_code.py", line 43, in wapper
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     return func(*args, **kwargs)
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]            ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch_npu/dynamo/npugraph_ex/npu_fx_compiler.py", line 578, in __call__
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     return self._get_compiled_gm(gm, example_inputs)
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/vllm-workspace/vllm-ascend/vllm_ascend/compilation/compiler_interface.py", line 180, in patched_get_compiled_gm
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     compiled_gm = _original_get_compiled_gm(self, graph, example_inputs)
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch_npu/dynamo/npugraph_ex/npu_fx_compiler.py", line 602, in _get_compiled_gm
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     return _CompiledFxGraph(self._gen_compiled_gm(gm, example_inputs, observer), self.config)
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch_npu/dynamo/npugraph_ex/npu_fx_compiler.py", line 638, in _gen_compiled_gm
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     optimized_gm = _optimize_fx(mutable_gm, self.config, observer)
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch_npu/dynamo/npugraph_ex/npu_fx_compiler.py", line 323, in _optimize_fx
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     observer.apply_gm_pass(_apply_pattern_passes, "apply_pattern_passes")
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch_npu/dynamo/npugraph_ex/_utils/graph_transform_observer.py", line 41, in apply_gm_pass
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     res = pass_fn(self.gm, self.example_inputs, self.config)
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch_npu/dynamo/npugraph_ex/_utils/graph_utils.py", line 230, in wrapper
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     return func(*args, **kwargs)
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]            ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch_npu/dynamo/npugraph_ex/patterns/pattern_util.py", line 35, in _apply_pattern_passes
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     pattern_pass_manager.apply_pass(graph_module)
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch_npu/dynamo/npugraph_ex/patterns/pattern_pass_manager.py", line 125, in apply_pass
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     self.pass_dict.apply(fx_graph)
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch/_inductor/pattern_matcher.py", line 2051, in apply
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     if is_match(m) and guard_or_false(entry.extra_check(m)):
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]                                       ^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch/_inductor/pattern_matcher.py", line 1517, in check_fn
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     specific_graph = trace_fn(search_fn_new, sym_args + args)
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch/utils/_contextlib.py", line 124, in decorate_context
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     return func(*args, **kwargs)
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]            ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch/_inductor/pattern_matcher.py", line 2190, in fwd_only
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     gm = make_fx(fn, decompositions, tracing_mode="real")(*args)
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch/fx/experimental/proxy_tensor.py", line 2701, in wrapped
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     return make_fx_tracer.trace(f, *args)
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch/fx/experimental/proxy_tensor.py", line 2626, in trace
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     return self._trace_inner(f, *args)
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch/fx/experimental/proxy_tensor.py", line 2588, in _trace_inner
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     t = dispatch_trace(
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]         ^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch/_compile.py", line 54, in inner
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     return disable_fn(*args, **kwargs)
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch/_dynamo/eval_frame.py", line 1181, in _fn
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     return fn(*args, **kwargs)
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]            ^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch/fx/experimental/proxy_tensor.py", line 1460, in dispatch_trace
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     graph = tracer.trace(root, concrete_args)  # type: ignore[arg-type]
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch/_dynamo/eval_frame.py", line 1181, in _fn
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     return fn(*args, **kwargs)
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]            ^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch/fx/_symbolic_trace.py", line 879, in trace
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     (self.create_arg(fn(*args)),),
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]                      ^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch/fx/experimental/proxy_tensor.py", line 1526, in wrapped
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     out = f(*tensors)  # type:ignore[call-arg]
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]           ^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "<string>", line 1, in <lambda>
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch/_inductor/pattern_matcher.py", line 1513, in search_fn_new
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     return search_fn(*args_new[len(args_new) - len(args) :])
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/vllm-workspace/vllm-ascend/vllm_ascend/compilation/passes/qknorm_rope_fusion_pass.py", line 60, in pattern
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch/_tensor.py", line 1054, in split
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     return handle_torch_function(
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]            ^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch/overrides.py", line 1740, in handle_torch_function
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     result = mode.__torch_function__(public_api, types, args, kwargs)
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch/fx/experimental/proxy_tensor.py", line 1577, in __torch_function__
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     return func(*args, **kwargs)
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]            ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch/_tensor.py", line 1066, in split
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     return torch._VF.split_with_sizes(
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch/utils/_stats.py", line 29, in wrapper
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     return fn(*args, **kwargs)
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]            ^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch/fx/experimental/proxy_tensor.py", line 1703, in __torch_dispatch__
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     return proxy_call(self, func, self.pre_dispatch, args, kwargs)
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch/fx/experimental/proxy_tensor.py", line 1145, in proxy_call
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     out = func(*args, **kwargs)
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]           ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch/_ops.py", line 819, in __call__
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     return self._op(*args, **kwargs)
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]            ^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch/utils/_stats.py", line 29, in wrapper
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     return fn(*args, **kwargs)
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]            ^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch/_subclasses/fake_tensor.py", line 1397, in __torch_dispatch__
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     return self.dispatch(func, types, args, kwargs)
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch/_subclasses/fake_tensor.py", line 2155, in dispatch
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     return self._cached_dispatch_impl(func, types, args, kwargs)
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch/_subclasses/fake_tensor.py", line 1544, in _cached_dispatch_impl
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     output = self._dispatch_impl(func, types, args, kwargs)
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch/_subclasses/fake_tensor.py", line 2707, in _dispatch_impl
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     decomposition_table[func](*args, **kwargs)
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch/_refs/__init__.py", line 4359, in split_with_sizes
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     torch._check_with(
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch/__init__.py", line 1714, in _check_with
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     raise error_type(message_evaluated)
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195] ValueError: Split sizes add up to 6144 but got the tensor's size of 4096
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195] 
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195] During handling of the above exception, another exception occurred:
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195] 
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195] Traceback (most recent call last):
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/vllm-workspace/vllm/vllm/v1/engine/core.py", line 1164, in run_engine_core
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     engine_core = EngineCoreProc(*args, engine_index=dp_rank, **kwargs)
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/vllm-workspace/vllm/vllm/tracing/otel.py", line 178, in sync_wrapper
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     return func(*args, **kwargs)
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]            ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/vllm-workspace/vllm/vllm/v1/engine/core.py", line 930, in __init__
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     super().__init__(
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/vllm-workspace/vllm/vllm/v1/engine/core.py", line 132, in __init__
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     kv_cache_config = self._initialize_kv_caches(vllm_config)
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/vllm-workspace/vllm/vllm/tracing/otel.py", line 178, in sync_wrapper
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     return func(*args, **kwargs)
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]            ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/vllm-workspace/vllm/vllm/v1/engine/core.py", line 257, in _initialize_kv_caches
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     available_gpu_memory = self.model_executor.determine_available_memory()
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/vllm-workspace/vllm/vllm/v1/executor/abstract.py", line 147, in determine_available_memory
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     return self.collective_rpc("determine_available_memory")
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/vllm-workspace/vllm/vllm/v1/executor/uniproc_executor.py", line 92, in collective_rpc
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     result = run_method(self.driver_worker, method, args, kwargs)
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/vllm-workspace/vllm/vllm/v1/serial_utils.py", line 510, in run_method
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     return func(*args, **kwargs)
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]            ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch/utils/_contextlib.py", line 124, in decorate_context
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     return func(*args, **kwargs)
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]            ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/vllm-workspace/vllm-ascend/vllm_ascend/worker/worker.py", line 561, in determine_available_memory
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     self.model_runner.profile_run()
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/vllm-workspace/vllm-ascend/vllm_ascend/worker/model_runner_v1.py", line 3694, in profile_run
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     super().profile_run()
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/vllm-workspace/vllm/vllm/v1/worker/gpu_model_runner.py", line 6228, in profile_run
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     hidden_states, last_hidden_states = self._dummy_run(
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]                                         ^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch/utils/_contextlib.py", line 124, in decorate_context
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     return func(*args, **kwargs)
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]            ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/vllm-workspace/vllm-ascend/vllm_ascend/worker/model_runner_v1.py", line 3642, in _dummy_run
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     self.drafter.dummy_run(
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch/utils/_contextlib.py", line 124, in decorate_context
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     return func(*args, **kwargs)
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]            ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/vllm-workspace/vllm-ascend/vllm_ascend/spec_decode/llm_base_proposer.py", line 705, in dummy_run
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     self._runnable(
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/vllm-workspace/vllm-ascend/vllm_ascend/spec_decode/llm_base_proposer.py", line 1092, in _run_merged_draft
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     ret_hidden_states = self.model(**model_kwargs)
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]                         ^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1776, in _wrapped_call_impl
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     return self._call_impl(*args, **kwargs)
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1787, in _call_impl
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     return forward_call(*args, **kwargs)
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/vllm-workspace/vllm/vllm/model_executor/models/qwen3.py", line 323, in forward
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     hidden_states = self.model(
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]                     ^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/vllm-workspace/vllm/vllm/compilation/decorators.py", line 663, in __call__
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     self.aot_compiled_fn = self.aot_compile(*args, **kwargs)
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/vllm-workspace/vllm/vllm/compilation/wrapper.py", line 167, in aot_compile
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     return self._compiled_callable.aot_compile((args, kwargs))
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch/_dynamo/eval_frame.py", line 832, in aot_compile
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     return aot_compile_fullgraph(
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]            ^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch/_dynamo/aot_compile.py", line 239, in aot_compile_fullgraph
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     compiled_fn = backend(
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]                   ^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch/__init__.py", line 2509, in __call__
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     return self.compiler_fn(model_, inputs_, **self.kwargs)
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/contextlib.py", line 81, in inner
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     return func(*args, **kwds)
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]            ^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/vllm-workspace/vllm/vllm/compilation/backends.py", line 1214, in __call__
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     PiecewiseCompileInterpreter(
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/vllm-workspace/vllm/vllm/tracing/otel.py", line 178, in sync_wrapper
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     return func(*args, **kwargs)
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]            ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/vllm-workspace/vllm/vllm/compilation/backends.py", line 723, in run
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     return super().run(*args)
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]            ^^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch/fx/interpreter.py", line 200, in run
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     self.env[node] = self.run_node(node)
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]                      ^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch/fx/interpreter.py", line 295, in run_node
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     return getattr(self, n.op)(n.target, args, kwargs)
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/vllm-workspace/vllm/vllm/compilation/backends.py", line 750, in call_module
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     piecewise_backend = PiecewiseBackend(
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]                         ^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/vllm-workspace/vllm/vllm/compilation/piecewise_backend.py", line 190, in __init__
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     self.compile_all_ranges()
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/vllm-workspace/vllm/vllm/compilation/piecewise_backend.py", line 266, in compile_all_ranges
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     range_entry.runnable = self.vllm_backend.compiler_manager.compile(
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/vllm-workspace/vllm/vllm/tracing/otel.py", line 178, in sync_wrapper
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     return func(*args, **kwargs)
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]            ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/vllm-workspace/vllm/vllm/compilation/backends.py", line 353, in compile
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     compiled_graph, handle = self.compiler.compile(
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]                              ^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/vllm-workspace/vllm-ascend/vllm_ascend/compilation/compiler_interface.py", line 290, in compile
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     return npugraph_ex_compile(
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]            ^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/vllm-workspace/vllm-ascend/vllm_ascend/compilation/compiler_interface.py", line 206, in npugraph_ex_compile
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     compiled_fn = make_graph_return_tuple(graph, example_inputs, backend)
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch/_inductor/compile_fx.py", line 2861, in make_graph_return_tuple
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     compiled_fn = compile_gm(gm, inputs)
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]                   ^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch_npu/dynamo/npugraph_ex/npu_fx_compiler.py", line 820, in _npu_backend
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     return _compile_graph_with_aot(gm, compiler, example_inputs, compiler_config, decompositions, is_cache=False)
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch_npu/dynamo/npugraph_ex/npu_fx_compiler.py", line 921, in _compile_graph_with_aot
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     return aot_module_simplified(gm, example_inputs, **aot_kwargs)
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch/_functorch/aot_autograd.py", line 1115, in aot_module_simplified
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     compiled_fn, _ = aot_stage2_compile(
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]                      ^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/graph_compile.py", line 357, in aot_stage2_compile
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     return aot_stage2_inference(aot_state, aot_graph_capture)
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/graph_compile.py", line 431, in aot_stage2_inference
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     compiled_fw = _aot_stage2b_inference_compile(
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/graph_compile.py", line 400, in _aot_stage2b_inference_compile
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     return _aot_stage2b_compile_forward_or_inference(
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/graph_compile.py", line 2300, in _aot_stage2b_compile_forward_or_inference
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     compiled_fw_func = compiler(fw_module, adjusted_flat_args)
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch_npu/dynamo/npugraph_ex/_utils/graph_transform_observer.py", line 121, in wrapped
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     with DebugContext(phase):
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]          ^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch_npu/dynamo/npugraph_ex/_utils/graph_transform_observer.py", line 91, in __exit__
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     raise exc_val.with_traceback(exc_tb)
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch_npu/dynamo/npugraph_ex/_utils/graph_transform_observer.py", line 122, in wrapped
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     return compiler(*args, **kwargs)
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]            ^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch_npu/dynamo/npugraph_ex/npu_fx_compiler.py", line 772, in _wrap_custom_attr_compiler
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     return compiler(gm, example_inputs)
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch_npu/dynamo/npugraph_ex/npu_fx_compiler.py", line 727, in wrapped_compiler
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     return compiler(gm, example_inputs)
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch_npu/dynamo/npugraph_ex/_utils/error_code.py", line 46, in wapper
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     raise type(e)("\n".join(msg))
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195] ValueError: Split sizes add up to 6144 but got the tensor's size of 4096
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195] Traceback (most recent call last):
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch_npu/dynamo/npugraph_ex/_utils/error_code.py", line 43, in wapper
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     return func(*args, **kwargs)
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]            ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch_npu/dynamo/npugraph_ex/npu_fx_compiler.py", line 578, in __call__
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     return self._get_compiled_gm(gm, example_inputs)
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/vllm-workspace/vllm-ascend/vllm_ascend/compilation/compiler_interface.py", line 180, in patched_get_compiled_gm
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     compiled_gm = _original_get_compiled_gm(self, graph, example_inputs)
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch_npu/dynamo/npugraph_ex/npu_fx_compiler.py", line 602, in _get_compiled_gm
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     return _CompiledFxGraph(self._gen_compiled_gm(gm, example_inputs, observer), self.config)
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch_npu/dynamo/npugraph_ex/npu_fx_compiler.py", line 638, in _gen_compiled_gm
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     optimized_gm = _optimize_fx(mutable_gm, self.config, observer)
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch_npu/dynamo/npugraph_ex/npu_fx_compiler.py", line 323, in _optimize_fx
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     observer.apply_gm_pass(_apply_pattern_passes, "apply_pattern_passes")
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch_npu/dynamo/npugraph_ex/_utils/graph_transform_observer.py", line 41, in apply_gm_pass
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     res = pass_fn(self.gm, self.example_inputs, self.config)
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch_npu/dynamo/npugraph_ex/_utils/graph_utils.py", line 230, in wrapper
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     return func(*args, **kwargs)
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]            ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch_npu/dynamo/npugraph_ex/patterns/pattern_util.py", line 35, in _apply_pattern_passes
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     pattern_pass_manager.apply_pass(graph_module)
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch_npu/dynamo/npugraph_ex/patterns/pattern_pass_manager.py", line 125, in apply_pass
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     self.pass_dict.apply(fx_graph)
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch/_inductor/pattern_matcher.py", line 2051, in apply
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     if is_match(m) and guard_or_false(entry.extra_check(m)):
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]                                       ^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch/_inductor/pattern_matcher.py", line 1517, in check_fn
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     specific_graph = trace_fn(search_fn_new, sym_args + args)
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch/utils/_contextlib.py", line 124, in decorate_context
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     return func(*args, **kwargs)
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]            ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch/_inductor/pattern_matcher.py", line 2190, in fwd_only
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     gm = make_fx(fn, decompositions, tracing_mode="real")(*args)
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch/fx/experimental/proxy_tensor.py", line 2701, in wrapped
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     return make_fx_tracer.trace(f, *args)
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch/fx/experimental/proxy_tensor.py", line 2626, in trace
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     return self._trace_inner(f, *args)
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch/fx/experimental/proxy_tensor.py", line 2588, in _trace_inner
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     t = dispatch_trace(
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]         ^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch/_compile.py", line 54, in inner
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     return disable_fn(*args, **kwargs)
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch/_dynamo/eval_frame.py", line 1181, in _fn
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     return fn(*args, **kwargs)
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]            ^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch/fx/experimental/proxy_tensor.py", line 1460, in dispatch_trace
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     graph = tracer.trace(root, concrete_args)  # type: ignore[arg-type]
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch/_dynamo/eval_frame.py", line 1181, in _fn
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     return fn(*args, **kwargs)
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]            ^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch/fx/_symbolic_trace.py", line 879, in trace
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     (self.create_arg(fn(*args)),),
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]                      ^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch/fx/experimental/proxy_tensor.py", line 1526, in wrapped
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     out = f(*tensors)  # type:ignore[call-arg]
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]           ^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "<string>", line 1, in <lambda>
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch/_inductor/pattern_matcher.py", line 1513, in search_fn_new
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     return search_fn(*args_new[len(args_new) - len(args) :])
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/vllm-workspace/vllm-ascend/vllm_ascend/compilation/passes/qknorm_rope_fusion_pass.py", line 60, in pattern
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch/_tensor.py", line 1054, in split
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     return handle_torch_function(
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]            ^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch/overrides.py", line 1740, in handle_torch_function
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     result = mode.__torch_function__(public_api, types, args, kwargs)
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch/fx/experimental/proxy_tensor.py", line 1577, in __torch_function__
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     return func(*args, **kwargs)
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]            ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch/_tensor.py", line 1066, in split
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     return torch._VF.split_with_sizes(
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch/utils/_stats.py", line 29, in wrapper
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     return fn(*args, **kwargs)
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]            ^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch/fx/experimental/proxy_tensor.py", line 1703, in __torch_dispatch__
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     return proxy_call(self, func, self.pre_dispatch, args, kwargs)
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch/fx/experimental/proxy_tensor.py", line 1145, in proxy_call
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     out = func(*args, **kwargs)
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]           ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch/_ops.py", line 819, in __call__
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     return self._op(*args, **kwargs)
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]            ^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch/utils/_stats.py", line 29, in wrapper
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     return fn(*args, **kwargs)
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]            ^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch/_subclasses/fake_tensor.py", line 1397, in __torch_dispatch__
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     return self.dispatch(func, types, args, kwargs)
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch/_subclasses/fake_tensor.py", line 2155, in dispatch
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     return self._cached_dispatch_impl(func, types, args, kwargs)
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch/_subclasses/fake_tensor.py", line 1544, in _cached_dispatch_impl
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     output = self._dispatch_impl(func, types, args, kwargs)
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch/_subclasses/fake_tensor.py", line 2707, in _dispatch_impl
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     decomposition_table[func](*args, **kwargs)
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch/_refs/__init__.py", line 4359, in split_with_sizes
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     torch._check_with(
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch/__init__.py", line 1714, in _check_with
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195]     raise error_type(message_evaluated)
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195] ValueError: Split sizes add up to 6144 but got the tensor's size of 4096
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195] 
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195] 
+(EngineCore pid=24971) ERROR 08-18 11:07:45 [core.py:1195] [ERROR] 2026-08-18-11:07:45 (PID:24971, Device:0, RankID:0) ERR03001 GRAPH invalid parameter

@@ -64,6 +64,6 @@ git pull   # research/main
 
 ## 遗留 / 下一阶段
 
-- [ ] 服务器实际验证(部署 + 跑通 generate)
-- [ ] 用户提到"问题的第一部分"——部署过了之后若有运行期错误,另开条目
-- [ ] 考虑给上游提 issue(PR 可引用本修复)
+- [x] 服务器实际验证(部署 + 跑通 generate,0.22.1rc1)
+- [x] **v0.23.0 复现证据(2026-08-18)**:`logs/v0.23.0-baseline-pr2-bug1-update-stream.txt`——官方 tag + PR2 的分支上,编译越过 bug2 后在图捕获阶段崩于 `_update_full_graph_params → self.update_stream → AttributeError`,与 0.22.1rc1 同一 bug(触发顺序不同:0.23.0 上 bug2 先挡路,需先修 bug2 才暴露 bug1)
+- [ ] 上游 PR 提交(文案就绪,待验证链完成后回填)

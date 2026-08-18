@@ -63,6 +63,7 @@ git pull   # research/main
 
 ## 遗留 / 下一阶段
 
-- [ ] 服务器验证(上述清单)
-- [ ] 用户预告:修掉本 bug 后还有后续问题——届时另开条目
-- [ ] 可考虑向上游报 issue(与 bug 1 合并成 draft_model+FULL 模式系列修复)
+- [x] 服务器验证(上述清单,0.22.1rc1)
+- [x] **v0.23.0 复现证据(2026-08-18)**:`logs/v0.23.0-baseline-bug2-split-crash.txt`——官方 tag 基线,traceback 与 0.22.1rc1 逐帧同构(nge apply_pass → check_fn:1517 re-trace → qknorm_rope_fusion_pass.py:60 split → ValueError 逃逸)
+- [x] **v0.23.0 PR2 生效证据(2026-08-18)**:`logs/v0.23.0-baseline-pr2-bug1-update-stream.txt`——baseline+PR2 后编译越过 split 崩溃点,推进到图捕获阶段(说明 pattern 守卫生效)
+- [ ] 上游 PR 提交(文案就绪,待 5b/5c/5d 完成后回填验证结果)
