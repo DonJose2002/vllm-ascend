@@ -106,5 +106,13 @@ git pull && export VLLM_ASCEND_DRAFT_MODEL_FULL_GRAPH=1
 - [x] 方案 C 服务器验证(2026-08-17 用户确认通过)
 - [x] 方案 A 前置调研(上游无 FULL 先例;#45258 RFC 地雷图 + #34880 未合并设计为参考)
 - [x] 方案 A 实现与服务器验证(含事故 A-1 修复;2026-08-17 深夜用户确认通过)
-- [ ] **pull request**(计划 2026-08-18):bug1/2/3 系列修复整理成 draft_model+FULL 模式支持 PR;env 开关建议转为 `--additional-config` 项(消除 validate_environ warning,对齐 vllm-ascend 配置惯例);可引用本目录三篇笔记
+- [x] **pull request**(2026-08-18):三个 PR 分支已就绪(main 基线):`pr/bugfix-draft-model-mro`、`pr/bugfix-pattern-shape-scoping`、`pr/draft-model-full-graph`(plan C + plan A,env 已转 `--additional-config '{"draft_model_full_graph": true}'`,env 变量保留为弃用回退);文案在会话记录 / `/tmp/opencode/pr-descriptions.md`
 - [ ] (可选,后续)A/C 的 ITL 收益定量对比(bench_sd.py 就绪,跑一轮即可出数)
+
+## v0.23.0 服务器验证(2026-08-18 部署)
+
+D5 PR 提交前在官方 v0.23.0 基线复现 + 验证(经 Docker `quay.io/ascend/vllm-ascend:v0.23.0`,CANN 9.1.0):
+- `myfork/server/v0.23.0-baseline`(= tag v0.23.0):三 bug 均在(bug1 部署崩可直录 traceback;bug2/bug3 被 bug1 挡在后面,traceback 已有 0.22.1rc1 版本)
+- `myfork/server/v0.23.0-fixes`(baseline + PR1/PR2 cherry-pick + PR3 适配移植,4 commits):PR3 移植差异——v0.23.0 的 dummy_run 用 `copy_snapshot_to_gpu`、`_propose` FULL 分支带 `_pad_query_start_loc_for_fia`(与 main 同构),K+2 分支作为独立 if 插在共享分支前
+- 验证流程:baseline 复现 bug1 → fixes 默认配置(方案 C)serve 正常 → `--additional-config '{"draft_model_full_graph": true}'`(方案 A)看 "target sizes [6, 12] -> drafter sizes [7, 14]" 日志 + 接受长度 ~3 → bench_sd.py A/C 对照 ITL
+- 结果回填三个 PR 描述("validated on 0.22.1rc1 & 0.23.0")后提交
