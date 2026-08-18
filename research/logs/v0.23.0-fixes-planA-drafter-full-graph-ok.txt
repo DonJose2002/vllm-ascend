@@ -1,0 +1,6 @@
+root@DevServer-BMS-f4a6b24d:/tmp# grep -E "drafter FULL graph enabled|Wrapping draft model|Capturing CUDA graphs|Started server process|Application startup complete|Uvicorn running" /tmp/serve_planA.log | tail -20
+(EngineCore pid=27467) INFO 08-18 12:20:43 [llm_base_proposer.py:532] [spec_decode/base] Wrapping draft model with ACLGraphWrapper: runtime_mode=FULL, use_eagle=False, enable_enpu=False
+(EngineCore pid=27467) INFO 08-18 12:20:57 [model_runner_v1.py:5136] draft_model drafter FULL graph enabled: target sizes [6, 12] -> drafter sizes [7, 14]
+Capturing CUDA graphs (mixed prefill-decode, FULL): 100%|██████████| 2/2 [00:02<00:00,  1.07s/it]
+(APIServer pid=27437) INFO:     Started server process [27437]
+(APIServer pid=27437) INFO:     Application startup complete.

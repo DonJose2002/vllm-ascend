@@ -107,12 +107,23 @@ git pull && export VLLM_ASCEND_DRAFT_MODEL_FULL_GRAPH=1
 - [x] 方案 A 前置调研(上游无 FULL 先例;#45258 RFC 地雷图 + #34880 未合并设计为参考)
 - [x] 方案 A 实现与服务器验证(含事故 A-1 修复;2026-08-17 深夜用户确认通过)
 - [x] **pull request**(2026-08-18):三个 PR 分支已就绪(main 基线):`pr/bugfix-draft-model-mro`、`pr/bugfix-pattern-shape-scoping`、`pr/draft-model-full-graph`(plan C + plan A,env 已转 `--additional-config '{"draft_model_full_graph": true}'`,env 变量保留为弃用回退);文案在会话记录 / `/tmp/opencode/pr-descriptions.md`
-- [ ] (可选,后续)A/C 的 ITL 收益定量对比(bench_sd.py 就绪,跑一轮即可出数)
+- [x] **v0.23.0 验证**(2026-08-18,见上节:5a/5a'/5b/5c/5d 全通过,方案 A 接受长度零损失 + ITL 5.7×)
+- [ ] A/C 的 ITL 收益定量对比已出数(v0.23.0 单请求 5.7×);多 batch 场景可后续补充
 
 ## v0.23.0 服务器验证(2026-08-18 部署)
 
 D5 PR 提交前在官方 v0.23.0 基线复现 + 验证(经 Docker `quay.io/ascend/vllm-ascend:v0.23.0`,CANN 9.1.0):
-- `myfork/server/v0.23.0-baseline`(= tag v0.23.0):三 bug 均在(bug1 部署崩可直录 traceback;bug2/bug3 被 bug1 挡在后面,traceback 已有 0.22.1rc1 版本)
+- `myfork/server/v0.23.0-baseline`(= tag v0.23.0):三 bug 均在——**但触发顺序反转**:bug2 先挡路(split ValueError),需先修 bug2 才暴露 bug1(0.22.1rc1 上 bug1 先崩)。证据 `logs/v0.23.0-baseline-bug2-split-crash.txt` + `logs/v0.23.0-baseline-pr2-bug1-update-stream.txt`(tag+PR2 后编译越过 split 点,图捕获阶段崩 update_stream——一石二鸟:PR2 生效 + bug1 复现)
 - `myfork/server/v0.23.0-fixes`(baseline + PR1/PR2 cherry-pick + PR3 适配移植,4 commits):PR3 移植差异——v0.23.0 的 dummy_run 用 `copy_snapshot_to_gpu`、`_propose` FULL 分支带 `_pad_query_start_loc_for_fia`(与 main 同构),K+2 分支作为独立 if 插在共享分支前
-- 验证流程:baseline 复现 bug1 → fixes 默认配置(方案 C)serve 正常 → `--additional-config '{"draft_model_full_graph": true}'`(方案 A)看 "target sizes [6, 12] -> drafter sizes [7, 14]" 日志 + 接受长度 ~3 → bench_sd.py A/C 对照 ITL
-- 结果回填三个 PR 描述("validated on 0.22.1rc1 & 0.23.0")后提交
+
+### 验证结果(✅ 全部通过,2026-08-18)
+
+| 步骤 | 结果 | 证据 |
+|---|---|---|
+| 5b 方案 C(默认) | 捕获 2/2 + startup complete;无 "Wrapping draft model" 行(drafter eager,符合方案 C 语义) | `logs/v0.23.0-fixes-planC-serve-ok.txt` |
+| 5c 方案 A | **"Wrapping draft model with ACLGraphWrapper: runtime_mode=FULL"** + **"target sizes [6, 12] -> drafter sizes [7, 14]"** + 捕获 2/2 + startup complete | `logs/v0.23.0-fixes-planA-drafter-full-graph-ok.txt` |
+| 5d bench(30 req × 2670 draft steps) | **接受长度完全一致**(2.876 vs 2.876,per-position 5 个位置全部相同,greedy 确定性下零漂移);**ITL mean 281.8 → 49.7 ms(5.7×)**,p50/p90 同幅,TTFT 持平 | `logs/v0.23.0-fixes-planA-vs-planC-bench.txt` |
+
+注:bench "burst est" 口径显示 1.000/1.000 属单请求负载(max_num_seqs=1)下突发估计退化的已知伪影,主口径(counters)2.876 两模式一致且与 0.22.1rc1 基线(~3)吻合。
+
+**结论**:方案 A 在 v0.23.0 上正确性零损失(接受长度逐位一致 = A-1 修复在新基线同样有效),单请求 ITL 收益 5.7×。结果回填三个 PR 描述("validated on 0.22.1rc1 & 0.23.0")后提交。

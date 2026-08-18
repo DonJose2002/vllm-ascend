@@ -1,0 +1,17 @@
+root@DevServer-BMS-f4a6b24d:/vllm-workspace/vllm-ascend/research# python bench_sd.py compare /home/liuzilin/scripts/planC.json /home/liuzilin/scripts/planA.json
+                                     planC (2026-08-18 12:10:03) planA (2026-08-18 12:29:59)
+requests                                        30            30
+draft steps                                   2670          2670
+mean accept len (incl bonus)                 2.876         2.876
+mean accept len (burst est)                  1.000         1.000
+ITL mean (ms)                              281.800        49.680
+ITL p50 (ms)                               278.800        49.310
+ITL p90 (ms)                               297.080        51.560
+TTFT mean (ms)                               334.8         336.3
+accept rate pos 0                           0.6865        0.6865
+accept rate pos 1                           0.4607        0.4607
+accept rate pos 2                           0.3236        0.3236
+accept rate pos 3                           0.2315        0.2315
+accept rate pos 4                           0.1742        0.1742
+
+accept-len delta (B - A): +0.000

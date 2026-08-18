@@ -1,0 +1,4 @@
+root@DevServer-BMS-f4a6b24d:/tmp# grep -E "drafter FULL graph enabled|Wrapping draft model|Capturing CUDA graphs|Started server process|Application startup complete|Uvicorn running" /tmp/serve_planC.log | tail -20
+Capturing CUDA graphs (mixed prefill-decode, FULL): 100%|██████████| 2/2 [00:01<00:00,  1.55it/s]
+(APIServer pid=26484) INFO:     Started server process [26484]
+(APIServer pid=26484) INFO:     Application startup complete.
