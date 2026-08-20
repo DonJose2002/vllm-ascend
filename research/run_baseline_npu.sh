@@ -158,9 +158,19 @@ if [ "$MODE" = "sd" ] || [ "$MODE" = "sda" ]; then
     # Plan A: drafter-side FULL aclgraph behind the additional_config gate
     # (same flag as upstream PR #14510). No spaces in the JSON so unquoted
     # $SPEC_ARGS expansion stays intact.
+    # Capture table is bounded explicitly: the default table (~48 sizes)
+    # doubles under plan A (target + drafter) and exhausts the NPU driver
+    # stream limit during capture (EE1023 "Too many streams are created";
+    # D5 5c only ever validated plan A with 2 graphs). The bench workload
+    # has R<=8 concurrent requests -> target needs [6..48]; prefill steps
+    # never used FULL graphs under the default table either (cap 498 is far
+    # below chunked-prefill sizes), so FULL-graph applicability for this
+    # bench is identical to the unbounded plan C run. 30 is included so R=5
+    # hits its bucket exactly instead of padding.
     SPEC_ARGS="$SPEC_ARGS --additional-config {\"draft_model_full_graph\":true}"
+    SPEC_ARGS="$SPEC_ARGS --compilation-config {\"cudagraph_capture_sizes\":[6,12,18,24,30,36,42,48]}"
     TAG="npu-bf16-sd-k5-planA"
-    NOTE="$NOTE -> OVERRIDDEN to plan A (draft_model_full_graph=true)"
+    NOTE="$NOTE -> OVERRIDDEN to plan A (draft_model_full_graph=true, capture table bounded to [6..48] for R<=8)"
   fi
 fi
 
@@ -181,7 +191,7 @@ on_exit() {
   echo "tiers=$TIERS concs=$CONCS nprompts=$NUM_PROMPTS maxtok=$MAX_TOKENS"
   SERVE_LOG="$OUTDIR/serve-$TAG.log"
   if [ -s "$SERVE_LOG" ]; then
-    grep -E "Available KV cache memory|GPU KV cache size|Maximum concurrency|Wrapping draft model" \
+    grep -E "Available KV cache memory|GPU KV cache size|Maximum concurrency|Wrapping draft model|drafter FULL graph enabled|Capturing CUDA graphs" \
       "$SERVE_LOG" | tail -4 | strip_log | sed 's/^/cfg: /'
   else
     echo "cfg: (serve log empty or missing at $SERVE_LOG)"
