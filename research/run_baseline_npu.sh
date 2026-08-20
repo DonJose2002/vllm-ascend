@@ -189,8 +189,11 @@ on_exit() {
   if [ -f "$OUTDIR/baseline-npu-qwen3-8b-$TAG.json" ]; then
     python3 research/bench_baseline.py summary "$OUTDIR/baseline-npu-qwen3-8b-$TAG.json"
   elif [ -s "$SERVE_LOG" ]; then
-    echo "# bench json missing; serve log tail (last 25 lines):"
-    tail -25 "$SERVE_LOG" | strip_log | sed 's/^/  /'
+    echo "# bench json missing; EngineCore fatal block (if any):"
+    grep -B2 -A45 "EngineCore encountered a fatal error" "$SERVE_LOG" \
+      | tail -50 | strip_log | sed 's/^/  /'
+    echo "# serve log tail (last 10 lines):"
+    tail -10 "$SERVE_LOG" | strip_log | sed 's/^/  /'
   else
     echo "# bench json missing AND serve log empty/missing at $SERVE_LOG"
   fi
