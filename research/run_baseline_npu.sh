@@ -17,7 +17,7 @@
 #   bash research/run_baseline_npu.sh sd    8002
 set -euo pipefail
 
-MODE="${1:?usage: run_baseline_npu.sh dense|sd PORT}"
+MODE="${1:?usage: run_baseline_npu.sh dense|sd|sda PORT}"
 PORT="${2:-8001}"
 MODEL="${NPU_MODEL:-/nfs-share/hf_weights/Qwen3-8B}"
 DRAFT="${NPU_DRAFT:-/nfs-share/hf_weights/Qwen3-0.6B}"
@@ -149,9 +149,19 @@ echo "PREFLIGHT: ASCEND_RT_VISIBLE_DEVICES=$ASCEND_RT_VISIBLE_DEVICES"
 
 SPEC_ARGS=""
 TAG="npu-bf16-dense"
-if [ "$MODE" = "sd" ]; then
+NOTE="910B3 x1, v0.23.0 docker, bf16, block_size=128; 32K tier NPU-only (model max_pos=40960)"
+if [ "$MODE" = "sd" ] || [ "$MODE" = "sda" ]; then
   SPEC_ARGS="--speculative-config {\"method\":\"draft_model\",\"model\":\"$DRAFT\",\"num_speculative_tokens\":5}"
   TAG="npu-bf16-sd-k5"
+  NOTE="$NOTE; plan C (drafter eager, default)"
+  if [ "$MODE" = "sda" ]; then
+    # Plan A: drafter-side FULL aclgraph behind the additional_config gate
+    # (same flag as upstream PR #14510). No spaces in the JSON so unquoted
+    # $SPEC_ARGS expansion stays intact.
+    SPEC_ARGS="$SPEC_ARGS --additional-config {\"draft_model_full_graph\":true}"
+    TAG="npu-bf16-sd-k5-planA"
+    NOTE="$NOTE -> OVERRIDDEN to plan A (draft_model_full_graph=true)"
+  fi
 fi
 
 strip_log() {
@@ -171,7 +181,7 @@ on_exit() {
   echo "tiers=$TIERS concs=$CONCS nprompts=$NUM_PROMPTS maxtok=$MAX_TOKENS"
   SERVE_LOG="$OUTDIR/serve-$TAG.log"
   if [ -s "$SERVE_LOG" ]; then
-    grep -E "Available KV cache memory|GPU KV cache size|Maximum concurrency" \
+    grep -E "Available KV cache memory|GPU KV cache size|Maximum concurrency|Wrapping draft model" \
       "$SERVE_LOG" | tail -4 | strip_log | sed 's/^/cfg: /'
   else
     echo "cfg: (serve log empty or missing at $SERVE_LOG)"
@@ -225,7 +235,7 @@ if curl -s -o /dev/null "http://127.0.0.1:$PORT/v1/models"; then
     --num-prompts "$NUM_PROMPTS" \
     --max-tokens "$MAX_TOKENS" \
     --out "$OUTDIR/baseline-npu-qwen3-8b-$TAG.json" \
-    --note "910B3 x1, v0.23.0 docker, bf16, block_size=128; 32K tier NPU-only (model max_pos=40960)" \
+    --note "$NOTE" \
     || echo "# bench exited non-zero (partial summary follows)"
 else
   echo ">>> server not up; skipping bench"
