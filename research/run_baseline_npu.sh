@@ -28,36 +28,58 @@ MAX_TOKENS="${MAX_TOKENS:-256}"
 OUTDIR="${OUTDIR:-experiments/out}"
 mkdir -p "$OUTDIR"
 
-# --- pre-flight: guard against version drift (D5 leftover editable installs
-# could silently swap vllm_ascend to 0.22.1rc1 source inside this checkout,
-# mixing with the image's 0.23.0 vllm). Must be 0.23.x AND resolved outside
-# this repo dir; override expected version via EXPECT_VLLM_ASCEND if needed.
+# --- pre-flight: guard against version drift. What matters is the pip-
+# installed vllm-ascend distribution (that's what `vllm serve` imports via
+# its console script; CWD does NOT affect it). The probe therefore runs
+# from a neutral temp dir so the repo checkout under our feet cannot
+# shadow the import (a `python3 -` heredoc run from the repo root always
+# saw the raw source tree and false-positived).
+# Rules: dist version must match EXPECT_VLLM_ASCEND (default 0.23.); if
+# the import resolves inside this repo checkout (editable install), the
+# served code follows the checked-out branch - fail unless
+# ALLOW_REPO_INSTALL=1 (for intentional offline rebuilds from a tag).
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-if ! python3 - "$REPO_DIR" "${EXPECT_VLLM_ASCEND:-0.23.}" <<'PYEOF'
-import os, sys
-repo_dir, want_prefix = sys.argv[1], sys.argv[2]
+PROBE_DIR="${PROBE_DIR:-$(mktemp -d)}"
+if ! (cd "$PROBE_DIR" && python3 - "$REPO_DIR" "${EXPECT_VLLM_ASCEND:-0.23.}" <<'PYEOF'
+import importlib.metadata, os, sys
+
+repo_dir = os.path.realpath(sys.argv[1])
+want_prefix = sys.argv[2]
+try:
+    dist_ver = importlib.metadata.version("vllm-ascend")
+except importlib.metadata.PackageNotFoundError:
+    print("PREFLIGHT-FAIL: no vllm-ascend distribution installed (run inside the v0.23.0 docker)")
+    sys.exit(1)
 try:
     import vllm_ascend
-except ImportError:
-    print(f"PREFLIGHT-FAIL: cannot import vllm_ascend (run inside the v0.23.0 docker)")
+except Exception as e:
+    print(f"PREFLIGHT-FAIL: vllm_ascend not importable from neutral cwd: {e!r}")
     sys.exit(1)
-ver = getattr(vllm_ascend, "__version__", "?")
 path = os.path.realpath(os.path.dirname(vllm_ascend.__file__))
-print(f"PREFLIGHT: vllm_ascend {ver} @ {path}")
+print(f"PREFLIGHT: vllm-ascend dist {dist_ver}, import @ {path}")
 ok = True
-if not ver.startswith(want_prefix):
-    print(f"PREFLIGHT-FAIL: vllm_ascend version {ver} does not start with '{want_prefix}'")
+if not dist_ver.startswith(want_prefix):
+    print(f"PREFLIGHT-FAIL: installed vllm-ascend dist version '{dist_ver}' does not start with '{want_prefix}'")
     ok = False
-if path.startswith(os.path.realpath(repo_dir) + os.sep):
-    print(f"PREFLIGHT-FAIL: vllm_ascend resolves INSIDE this repo checkout (leftover "
-          f"'pip install -e .'?). Use a fresh container or a clean checkout at another path.")
+in_repo = path.startswith(repo_dir + os.sep)
+if in_repo and os.environ.get("ALLOW_REPO_INSTALL") != "1":
+    print("PREFLIGHT-FAIL: import resolves INSIDE this repo checkout (editable install).")
+    print("  The served code follows the checked-out branch, not the installed version.")
+    print("  Fix A (preferred): pip uninstall -y vllm-ascend  -> falls back to the image's")
+    print("    site-packages install if it is still intact (verify with the probe again).")
+    print("  Fix B (offline rebuild): git checkout v0.23.0 && rm -rf csrc/build &&")
+    print("    pip install -e . --no-build-isolation  (D5-proven, 20-60min), then re-run")
+    print("    this script with ALLOW_REPO_INSTALL=1 and keep the tag checked out.")
     ok = False
 sys.exit(0 if ok else 1)
 PYEOF
+)
 then
   echo "Pre-flight failed; aborting before serve. (see messages above)"
   exit 1
 fi
+DIST_VER="$(cd "$PROBE_DIR" && python3 -c 'import importlib.metadata as m; print(m.version("vllm-ascend"))' 2>/dev/null || echo '?')"
+rm -rf "$PROBE_DIR"
 
 # --- pre-flight 2: NPU selection (shared server).
 # Explicit: NPUS=3 (or NPUS=4,5) -> export ASCEND_RT_VISIBLE_DEVICES.
@@ -167,7 +189,7 @@ on_exit() {
   echo "mode=$TAG port=$PORT model=$MODEL"
   echo "visible_devices=${ASCEND_RT_VISIBLE_DEVICES:-unset} hbm_used_mb=${HBM_USED:-?}"
   echo "repo_commit=$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
-  echo "vllm_ascend_ver=$(python3 -c 'import vllm_ascend,sys; sys.stdout.write(getattr(vllm_ascend,"__version__","?"))' 2>/dev/null || echo '?')"
+  echo "vllm_ascend_dist=$DIST_VER"
   echo "tiers=$TIERS concs=$CONCS nprompts=$NUM_PROMPTS maxtok=$MAX_TOKENS"
   grep -E "Available KV cache memory|GPU KV cache size|Maximum concurrency" \
     "$OUTDIR/serve-$TAG.log" 2>/dev/null | tail -4 | strip_log | sed 's/^/cfg: /'
