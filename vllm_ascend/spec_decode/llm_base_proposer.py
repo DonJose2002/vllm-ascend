@@ -1576,32 +1576,31 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             assert len(self.draft_attn_groups) > 0
             block_size = self.draft_attn_groups[0].kv_cache_spec.block_size
 
-            # [research instrumentation 2026-08-21] compute_new_slot_mapping
-            # crashed with "repeats must have the same size as input along dim"
-            # when a spec-decode batch shrank mid-cell (5 of 8 running, FULL
-            # graph, plan C). Log the offending shapes right before the crash
-            # so the serve log carries the evidence. Remove once diagnosed.
-            try:
-                _qsl = cad.query_start_loc
-                _bt = cad.block_table_tensor
-                if _qsl is not None and _bt is not None and (_qsl.numel() - 1) != _bt.shape[0]:
-                    logger.warning(
-                        "[SD-debug] cad self-inconsistent: qsl numel=%d (naive len=%d) "
-                        "vs block_table rows=%d; total_num_output_tokens=%d "
-                        "net_num_new_slots=%d; qsl head=%s; bt shape=%s",
-                        _qsl.numel(),
-                        _qsl.numel() - 1,
-                        _bt.shape[0],
-                        total_num_output_tokens,
-                        self.net_num_new_slots_per_request,
-                        _qsl[:16].tolist(),
-                        tuple(_bt.shape),
-                    )
-            except Exception:  # noqa: S110
-                pass
+            # [fix 2026-08-21] compute_new_slot_mapping derives batch_size
+            # from cad.block_table_tensor rows, but the cad handed to the
+            # drafter comes from AscendCommonAttentionMetadata.unpadded(),
+            # which slices query_start_loc to the real request count while
+            # intentionally keeping the FULL-graph-padded block_table (extra
+            # phantom rows; slicing it there breaks reshape_and_cache). When
+            # a shrinking batch falls between FULL-graph buckets (e.g. 5 reqs
+            # x (K+1)=6 tokens = 30, no bucket 30 -> padded to 36 with a
+            # phantom request row), arange(bt_rows) vs naive_query_lens()
+            # lengths disagree and repeat_interleave crashes with
+            # "repeats must have the same size as input along dim".
+            # Slice the block table to the qsl request count for THIS
+            # computation only; the metadata returned downstream keeps the
+            # padded block table for graph replay.
+            qsl_num_reqs = cad.query_start_loc.numel() - 1
+            bt_num_rows = cad.block_table_tensor.shape[0]
+            if bt_num_rows > qsl_num_reqs:
+                slot_cad = cad.replace(
+                    block_table_tensor=cad.block_table_tensor[:qsl_num_reqs]
+                )
+            else:
+                slot_cad = cad
 
             new_slot_mapping = compute_new_slot_mapping(
-                cad=cad,
+                cad=slot_cad,
                 new_positions=self.positions[:total_num_output_tokens],
                 is_rejected_token_mask=self.is_rejected_token_mask[:total_num_output_tokens],
                 block_size=block_size,
