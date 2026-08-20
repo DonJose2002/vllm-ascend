@@ -1576,6 +1576,30 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             assert len(self.draft_attn_groups) > 0
             block_size = self.draft_attn_groups[0].kv_cache_spec.block_size
 
+            # [research instrumentation 2026-08-21] compute_new_slot_mapping
+            # crashed with "repeats must have the same size as input along dim"
+            # when a spec-decode batch shrank mid-cell (5 of 8 running, FULL
+            # graph, plan C). Log the offending shapes right before the crash
+            # so the serve log carries the evidence. Remove once diagnosed.
+            try:
+                _qsl = cad.query_start_loc
+                _bt = cad.block_table_tensor
+                if _qsl is not None and _bt is not None and (_qsl.numel() - 1) != _bt.shape[0]:
+                    logger.warning(
+                        "[SD-debug] cad self-inconsistent: qsl numel=%d (naive len=%d) "
+                        "vs block_table rows=%d; total_num_output_tokens=%d "
+                        "net_num_new_slots=%d; qsl head=%s; bt shape=%s",
+                        _qsl.numel(),
+                        _qsl.numel() - 1,
+                        _bt.shape[0],
+                        total_num_output_tokens,
+                        self.net_num_new_slots_per_request,
+                        _qsl[:16].tolist(),
+                        tuple(_bt.shape),
+                    )
+            except Exception:  # noqa: S110
+                pass
+
             new_slot_mapping = compute_new_slot_mapping(
                 cad=cad,
                 new_positions=self.positions[:total_num_output_tokens],

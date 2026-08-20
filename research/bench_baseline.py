@@ -98,7 +98,7 @@ SSE_DATA_RE = re.compile(r"^data:\s*(\{.*\})$", re.MULTILINE)
 
 
 class ReqResult:
-    __slots__ = ("ok", "prompt_tokens", "completion_tokens", "ttft", "token_ts", "err")
+    __slots__ = ("ok", "prompt_tokens", "completion_tokens", "ttft", "token_ts", "err", "saw_done")
 
     def __init__(self):
         self.ok = False
@@ -107,6 +107,7 @@ class ReqResult:
         self.ttft = None  # seconds to first content token
         self.token_ts: list[float] = []
         self.err = None
+        self.saw_done = False
 
 
 def stream_one(base_url: str, model: str, prompt: str, max_tokens: int, timeout: float) -> ReqResult:
@@ -139,6 +140,7 @@ def stream_one(base_url: str, model: str, prompt: str, max_tokens: int, timeout:
                         continue
                     data = sline[5:].strip()
                     if data == "[DONE]":
+                        res.saw_done = True
                         continue
                     try:
                         obj = json.loads(data)
@@ -156,10 +158,14 @@ def stream_one(base_url: str, model: str, prompt: str, max_tokens: int, timeout:
                             if res.ttft is None:
                                 res.ttft = now - t_send
                             res.token_ts.append(now)
-        res.ok = bool(res.token_ts) or res.completion_tokens > 0
-        if not res.token_ts and res.completion_tokens > 0:
-            # non-streamed fallback edge: fabricate from usage only
-            res.token_ts = [t_send]
+        # A stream is only successful if the server terminated it properly
+        # ([DONE] seen). Otherwise the engine may have died mid-stream and
+        # we would count a truncated generation as ok (seen for real when
+        # the SD engine crashed mid-cell and 5 truncated streams were
+        # counted ok=8).
+        res.ok = res.saw_done and (bool(res.token_ts) or res.completion_tokens > 0)
+        if not res.ok and res.err is None and (res.token_ts or res.completion_tokens):
+            res.err = f"stream truncated (saw_done={res.saw_done}, got {max(res.completion_tokens, len(res.token_ts))} tokens)"
     except Exception as e:  # noqa: BLE001
         res.err = repr(e)
     return res
