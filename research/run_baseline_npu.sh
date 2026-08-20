@@ -225,7 +225,7 @@ if curl -s -o /dev/null "http://127.0.0.1:$PORT/v1/models"; then
     --num-prompts "$NUM_PROMPTS" \
     --max-tokens "$MAX_TOKENS" \
     --out "$OUTDIR/baseline-npu-qwen3-8b-$TAG.json" \
-    --note "910B3 x1, v0.23.0 docker, bf16, block_size=128; 64K tier NPU-only" \
+    --note "910B3 x1, v0.23.0 docker, bf16, block_size=128; 32K tier NPU-only (model max_pos=40960)" \
     || echo "# bench exited non-zero (partial summary follows)"
 else
   echo ">>> server not up; skipping bench"
