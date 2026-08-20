@@ -169,13 +169,20 @@ on_exit() {
   echo "repo_commit=$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
   echo "vllm_ascend_dist=$DIST_VER"
   echo "tiers=$TIERS concs=$CONCS nprompts=$NUM_PROMPTS maxtok=$MAX_TOKENS"
-  grep -E "Available KV cache memory|GPU KV cache size|Maximum concurrency" \
-    "$OUTDIR/serve-$TAG.log" 2>/dev/null | tail -4 | strip_log | sed 's/^/cfg: /'
+  SERVE_LOG="$OUTDIR/serve-$TAG.log"
+  if [ -s "$SERVE_LOG" ]; then
+    grep -E "Available KV cache memory|GPU KV cache size|Maximum concurrency" \
+      "$SERVE_LOG" | tail -4 | strip_log | sed 's/^/cfg: /'
+  else
+    echo "cfg: (serve log empty or missing at $SERVE_LOG)"
+  fi
   if [ -f "$OUTDIR/baseline-npu-qwen3-8b-$TAG.json" ]; then
     python3 research/bench_baseline.py summary "$OUTDIR/baseline-npu-qwen3-8b-$TAG.json"
+  elif [ -s "$SERVE_LOG" ]; then
+    echo "# bench json missing; serve log tail (last 25 lines):"
+    tail -25 "$SERVE_LOG" | strip_log | sed 's/^/  /'
   else
-    echo "# bench json missing; serve log tail:"
-    tail -15 "$OUTDIR/serve-$TAG.log" 2>/dev/null | strip_log | sed 's/^/  /'
+    echo "# bench json missing AND serve log empty/missing at $SERVE_LOG"
   fi
   echo "===NPU_BASELINE_END==="
   echo "==================== COPY ABOVE ===================="
