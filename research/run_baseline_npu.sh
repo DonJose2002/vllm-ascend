@@ -84,84 +84,62 @@ rm -rf "$PROBE_DIR"
 # --- pre-flight 2: NPU selection (shared server).
 # Explicit: NPUS=3 (or NPUS=4,5) -> export ASCEND_RT_VISIBLE_DEVICES.
 # Unset: auto-pick the device with the lowest HBM usage from npu-smi info.
-# Either way: refuse to start if picked devices already hold >1GB (someone
-# else's job), and record the choice in the summary block.
-if [ -z "${NPUS:-}" ]; then
-  PICK=$(python3 - <<'PYEOF'
+# Parser matches the real 25.3.rc1 layout: device header row "| <id> <name> |"
+# followed by a Bus-Id row whose LAST "a / b" pair is HBM-Usage(MB). Free-card
+# driver noise is ~3.4GB, real jobs show >=28GB, so selected devices must stay
+# under HBM_MAX_USED_MB (default 6144) or we refuse to run on someone's card.
+npu_hbm_list() {
+  python3 - <<'PYEOF'
 import re, subprocess
 try:
     out = subprocess.run(["npu-smi", "info"], capture_output=True, text=True, timeout=15).stdout
 except Exception as e:
-    print(f"AUTO-PICK-FAIL: npu-smi info failed: {e}")
+    print(f"PARSE-FAIL: npu-smi info failed: {e}")
     raise SystemExit(0)
-# Blocks: "NPU 0 | 910B3 ..." then "HBM: 1234 / 65536 (MB)"
-best_id, best_used = None, None
-cur_id = None
+cur, found = None, False
 for line in out.splitlines():
-    m = re.match(r"\s*NPU\s+(\d+)\s*\|", line)
+    m = re.match(r"^\|\s*(\d+)\s+\S+\s+\|\s*(OK|Warning|Alarm|Crit\w*|Unknown|Bad)", line)  # device header (NPU names like 910B3 start with a digit; health cell disambiguates from process rows)
     if m:
-        cur_id = int(m.group(1))
+        cur = int(m.group(1))
         continue
-    h = re.search(r"HBM:\s*(\d+)\s*/\s*(\d+)\s*\(MB\)", line)
-    if h and cur_id is not None:
-        used = int(h.group(1))
-        if best_used is None or used < best_used:
-            best_id, best_used = cur_id, used
-        cur_id = None
-if best_id is None:
-    print("AUTO-PICK-FAIL: could not parse any 'NPU n | ... HBM: x / y (MB)' block")
-else:
-    print(f"{best_id} {best_used}")
+    if cur is not None and re.search(r"[0-9A-Fa-f]{4}:[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}\.[0-9A-Fa-f]", line):
+        pairs = re.findall(r"(\d+)\s*/\s*(\d+)", line)
+        if pairs:
+            used, _total = pairs[-1]  # last "a / b" on the Bus-Id row = HBM usage
+            print(f"{cur} {used}")
+            found = True
+if not found:
+    print("PARSE-FAIL: no device blocks parsed (unexpected npu-smi output format)")
 PYEOF
-)
-  case "$PICK" in
-    AUTO-PICK-FAIL*)
-      echo "$PICK"
-      echo "Cannot auto-pick a free NPU. Run 'npu-smi info', then re-run with NPUS=<id>."
-      exit 1
-      ;;
-  esac
-  NPUS="${PICK%% *}"
-  HBM_USED="${PICK##* }"
-  echo "PREFLIGHT: auto-picked NPU $NPUS (HBM used ${HBM_USED}/65536 MB)"
+}
+
+DEV_LIST="$(npu_hbm_list)"
+case "$DEV_LIST" in
+  PARSE-FAIL*)
+    echo "$DEV_LIST"
+    echo "Cannot read NPU occupancy. Run 'npu-smi info', then re-run with NPUS=<id>."
+    exit 1
+    ;;
+esac
+HBM_MAX="${HBM_MAX_USED_MB:-6144}"
+
+if [ -z "${NPUS:-}" ]; then
+  PICK=$(echo "$DEV_LIST" | awk '{if(!($1 in mx)||$2>mx[$1])mx[$1]=$2} END{best="";for(id in mx){if(best==""||mx[id]<bestv){best=id;bestv=mx[id]}}print best,bestv}')
+  NPUS="${PICK%% *}"; HBM_USED="${PICK##* }"
+  echo "PREFLIGHT: auto-picked NPU $NPUS (HBM used ${HBM_USED}/65536 MB; threshold ${HBM_MAX})"
 else
-  HBM_USED=$(python3 - "$NPUS" <<'PYEOF'
-import re, subprocess, sys
-wanted = {x.strip() for x in sys.argv[1].split(",") if x.strip()}
-try:
-    out = subprocess.run(["npu-smi", "info"], capture_output=True, text=True, timeout=15).stdout
-except Exception as e:
-    print(f"CHECK-FAIL: npu-smi info failed: {e}")
-    raise SystemExit(0)
-cur_id = None
-usages = {}
-for line in out.splitlines():
-    m = re.match(r"\s*NPU\s+(\d+)\s*\|", line)
-    if m:
-        cur_id = int(m.group(1))
-        continue
-    h = re.search(r"HBM:\s*(\d+)\s*/\s*(\d+)\s*\(MB\)", line)
-    if h and cur_id is not None:
-        usages[cur_id] = int(h.group(1))
-        cur_id = None
-missing = [d for d in wanted if int(d) not in usages]
-if missing:
-    print(f"CHECK-FAIL: device(s) {','.join(missing)} not found in npu-smi info")
-elif len(usages) < len(wanted):
-    print("CHECK-FAIL: could not parse all HBM lines")
-else:
-    print(max(usages[int(d)] for d in wanted))
-PYEOF
-)
-  case "$HBM_USED" in
-    CHECK-FAIL*)
-      echo "$HBM_USED"
+  HBM_USED=0
+  for d in $(echo "$NPUS" | tr ',' ' '); do
+    u=$(echo "$DEV_LIST" | awk -v id="$d" '$1==id{if($2>m)m=$2}END{if(m==""){print "MISSING"}else{print m}}')
+    if [ "$u" = "MISSING" ]; then
+      echo "PREFLIGHT-FAIL: device $d not found in npu-smi info"
       exit 1
-      ;;
-  esac
-  echo "PREFLIGHT: using NPU(s) $NPUS (max HBM used ${HBM_USED}/65536 MB)"
+    fi
+    [ "$u" -gt "$HBM_USED" ] 2>/dev/null && HBM_USED="$u"
+  done
+  echo "PREFLIGHT: using NPU(s) $NPUS (max HBM used ${HBM_USED}/65536 MB; threshold ${HBM_MAX})"
 fi
-if [ "${HBM_USED:-0}" -gt 1024 ]; then
+if [ "${HBM_USED:-0}" -gt "$HBM_MAX" ]; then
   echo "PREFLIGHT-FAIL: selected NPU(s) already hold ${HBM_USED} MB HBM (another job?)."
   echo "Pick a free one: NPUS=<id> bash research/run_baseline_npu.sh $MODE $PORT"
   exit 1
