@@ -21,7 +21,7 @@ MODE="${1:?usage: run_baseline_npu.sh dense|sd PORT}"
 PORT="${2:-8001}"
 MODEL="${NPU_MODEL:-/nfs-share/hf_weights/Qwen3-8B}"
 DRAFT="${NPU_DRAFT:-/nfs-share/hf_weights/Qwen3-0.6B}"
-TIERS="${NPU_TIERS:-4096,16384,65536}"
+TIERS="${NPU_TIERS:-4096,16384,32768}"
 CONCS="${CONCS:-1,4,16}"
 NUM_PROMPTS="${NUM_PROMPTS:-8}"
 MAX_TOKENS="${MAX_TOKENS:-256}"
@@ -190,9 +190,14 @@ on_exit() {
 trap on_exit EXIT
 
 echo ">>> serving $TAG on :$PORT (model=$MODEL)"
+# NOTE: the server's Qwen3-8B checkpoint has max_position_embeddings=40960
+# (no yarn in its config.json), so 40960 is the hard ceiling. Do NOT set
+# VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 to force more - RoPE beyond the derived
+# max produces NaNs, and silent corruption is unacceptable for a baseline.
+# Long tier is therefore 32K (NPU-only), not 64K.
 vllm serve "$MODEL" \
   --served-model-name qwen3-8b \
-  --max-model-len 66048 \
+  --max-model-len 40960 \
   --block-size 128 \
   --gpu-memory-utilization 0.9 \
   --port "$PORT" \
