@@ -59,6 +59,94 @@ then
   exit 1
 fi
 
+# --- pre-flight 2: NPU selection (shared server).
+# Explicit: NPUS=3 (or NPUS=4,5) -> export ASCEND_RT_VISIBLE_DEVICES.
+# Unset: auto-pick the device with the lowest HBM usage from npu-smi info.
+# Either way: refuse to start if picked devices already hold >1GB (someone
+# else's job), and record the choice in the summary block.
+if [ -z "${NPUS:-}" ]; then
+  PICK=$(python3 - <<'PYEOF'
+import re, subprocess
+try:
+    out = subprocess.run(["npu-smi", "info"], capture_output=True, text=True, timeout=15).stdout
+except Exception as e:
+    print(f"AUTO-PICK-FAIL: npu-smi info failed: {e}")
+    raise SystemExit(0)
+# Blocks: "NPU 0 | 910B3 ..." then "HBM: 1234 / 65536 (MB)"
+best_id, best_used = None, None
+cur_id = None
+for line in out.splitlines():
+    m = re.match(r"\s*NPU\s+(\d+)\s*\|", line)
+    if m:
+        cur_id = int(m.group(1))
+        continue
+    h = re.search(r"HBM:\s*(\d+)\s*/\s*(\d+)\s*\(MB\)", line)
+    if h and cur_id is not None:
+        used = int(h.group(1))
+        if best_used is None or used < best_used:
+            best_id, best_used = cur_id, used
+        cur_id = None
+if best_id is None:
+    print("AUTO-PICK-FAIL: could not parse any 'NPU n | ... HBM: x / y (MB)' block")
+else:
+    print(f"{best_id} {best_used}")
+PYEOF
+)
+  case "$PICK" in
+    AUTO-PICK-FAIL*)
+      echo "$PICK"
+      echo "Cannot auto-pick a free NPU. Run 'npu-smi info', then re-run with NPUS=<id>."
+      exit 1
+      ;;
+  esac
+  NPUS="${PICK%% *}"
+  HBM_USED="${PICK##* }"
+  echo "PREFLIGHT: auto-picked NPU $NPUS (HBM used ${HBM_USED}/65536 MB)"
+else
+  HBM_USED=$(python3 - "$NPUS" <<'PYEOF'
+import re, subprocess, sys
+wanted = {x.strip() for x in sys.argv[1].split(",") if x.strip()}
+try:
+    out = subprocess.run(["npu-smi", "info"], capture_output=True, text=True, timeout=15).stdout
+except Exception as e:
+    print(f"CHECK-FAIL: npu-smi info failed: {e}")
+    raise SystemExit(0)
+cur_id = None
+usages = {}
+for line in out.splitlines():
+    m = re.match(r"\s*NPU\s+(\d+)\s*\|", line)
+    if m:
+        cur_id = int(m.group(1))
+        continue
+    h = re.search(r"HBM:\s*(\d+)\s*/\s*(\d+)\s*\(MB\)", line)
+    if h and cur_id is not None:
+        usages[cur_id] = int(h.group(1))
+        cur_id = None
+missing = [d for d in wanted if int(d) not in usages]
+if missing:
+    print(f"CHECK-FAIL: device(s) {','.join(missing)} not found in npu-smi info")
+elif len(usages) < len(wanted):
+    print("CHECK-FAIL: could not parse all HBM lines")
+else:
+    print(max(usages[int(d)] for d in wanted))
+PYEOF
+)
+  case "$HBM_USED" in
+    CHECK-FAIL*)
+      echo "$HBM_USED"
+      exit 1
+      ;;
+  esac
+  echo "PREFLIGHT: using NPU(s) $NPUS (max HBM used ${HBM_USED}/65536 MB)"
+fi
+if [ "${HBM_USED:-0}" -gt 1024 ]; then
+  echo "PREFLIGHT-FAIL: selected NPU(s) already hold ${HBM_USED} MB HBM (another job?)."
+  echo "Pick a free one: NPUS=<id> bash research/run_baseline_npu.sh $MODE $PORT"
+  exit 1
+fi
+export ASCEND_RT_VISIBLE_DEVICES="$NPUS"
+echo "PREFLIGHT: ASCEND_RT_VISIBLE_DEVICES=$ASCEND_RT_VISIBLE_DEVICES"
+
 SPEC_ARGS=""
 TAG="npu-bf16-dense"
 if [ "$MODE" = "sd" ]; then
@@ -77,6 +165,7 @@ on_exit() {
   echo "==================== COPY BELOW (between markers) ===================="
   echo "===NPU_BASELINE_BEGIN==="
   echo "mode=$TAG port=$PORT model=$MODEL"
+  echo "visible_devices=${ASCEND_RT_VISIBLE_DEVICES:-unset} hbm_used_mb=${HBM_USED:-?}"
   echo "repo_commit=$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
   echo "vllm_ascend_ver=$(python3 -c 'import vllm_ascend,sys; sys.stdout.write(getattr(vllm_ascend,"__version__","?"))' 2>/dev/null || echo '?')"
   echo "tiers=$TIERS concs=$CONCS nprompts=$NUM_PROMPTS maxtok=$MAX_TOKENS"
