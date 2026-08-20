@@ -28,6 +28,37 @@ MAX_TOKENS="${MAX_TOKENS:-256}"
 OUTDIR="${OUTDIR:-experiments/out}"
 mkdir -p "$OUTDIR"
 
+# --- pre-flight: guard against version drift (D5 leftover editable installs
+# could silently swap vllm_ascend to 0.22.1rc1 source inside this checkout,
+# mixing with the image's 0.23.0 vllm). Must be 0.23.x AND resolved outside
+# this repo dir; override expected version via EXPECT_VLLM_ASCEND if needed.
+REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+if ! python3 - "$REPO_DIR" "${EXPECT_VLLM_ASCEND:-0.23.}" <<'PYEOF'
+import os, sys
+repo_dir, want_prefix = sys.argv[1], sys.argv[2]
+try:
+    import vllm_ascend
+except ImportError:
+    print(f"PREFLIGHT-FAIL: cannot import vllm_ascend (run inside the v0.23.0 docker)")
+    sys.exit(1)
+ver = getattr(vllm_ascend, "__version__", "?")
+path = os.path.realpath(os.path.dirname(vllm_ascend.__file__))
+print(f"PREFLIGHT: vllm_ascend {ver} @ {path}")
+ok = True
+if not ver.startswith(want_prefix):
+    print(f"PREFLIGHT-FAIL: vllm_ascend version {ver} does not start with '{want_prefix}'")
+    ok = False
+if path.startswith(os.path.realpath(repo_dir) + os.sep):
+    print(f"PREFLIGHT-FAIL: vllm_ascend resolves INSIDE this repo checkout (leftover "
+          f"'pip install -e .'?). Use a fresh container or a clean checkout at another path.")
+    ok = False
+sys.exit(0 if ok else 1)
+PYEOF
+then
+  echo "Pre-flight failed; aborting before serve. (see messages above)"
+  exit 1
+fi
+
 SPEC_ARGS=""
 TAG="npu-bf16-dense"
 if [ "$MODE" = "sd" ]; then
