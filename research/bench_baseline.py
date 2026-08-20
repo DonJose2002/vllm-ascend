@@ -83,9 +83,12 @@ QUESTIONS = [
     "How do the concepts above relate to each other?",
 ]
 
-# Rough chars-per-token for English technical text (Qwen3 BPE). Only used to
-# size the synthesis; actual token counts are read back from the server.
-CHARS_PER_TOKEN = 3.7
+# Rough chars-per-token for English technical text, calibrated for the Qwen3
+# BPE on SEED_PARAGRAPHS (measured 3.7 -> actual 63% of target tokens, i.e.
+# ~5.87 real chars/token; 5.7 undershoots ~3% so tiers never exceed
+# max_model_len). Only used to size the synthesis; actual token counts are
+# read back from the server and recorded in ptok.
+CHARS_PER_TOKEN = 5.7
 
 # ---------------------------------------------------------------------------
 # Streaming request + timestamp capture
@@ -371,6 +374,36 @@ def cmd_table(args):
             )
 
 
+def cmd_summary(args):
+    """Compact paste-ready TSV of result JSONs (for no-export servers)."""
+    for p in args.paths:
+        with open(p) as f:
+            d = json.load(f)
+        print(f"# file={p} tag={d['tag']} created={d.get('created','')}")
+        if d.get("note"):
+            print(f"# note={d['note']}")
+        cols = (
+            "tier conc ok fail ptok ttft50 ttft90 itl50 itl90 itl99 "
+            "outs reqs accC accB err"
+        ).split(" ")
+        print("# " + "\t".join(cols))
+        for c in d["cells"]:
+            row = [
+                str(c.get("tier", "")), str(c.get("conc", "")),
+                str(c.get("ok", "")), str(c.get("failed", "")),
+                str(c.get("prompt_tokens_mean") or ""),
+                str(c.get("ttft_ms_p50") or ""), str(c.get("ttft_ms_p90") or ""),
+                str(c.get("itl_ms_p50") or ""), str(c.get("itl_ms_p90") or ""),
+                str(c.get("itl_ms_p99") or ""),
+                str(c.get("aggregate_out_tok_per_s") or ""),
+                str(c.get("request_per_s") or ""),
+                str(c.get("accept_len_counters", "")),
+                str(c.get("accept_len_burst", "")),
+                (c.get("errors") or [""])[0][:60],
+            ]
+            print("\t".join(row))
+
+
 def main():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -391,6 +424,10 @@ def main():
     t = sub.add_parser("table", help="print results as a table")
     t.add_argument("paths", nargs="+")
     t.set_defaults(func=cmd_table)
+
+    s = sub.add_parser("summary", help="compact TSV summary for pasting back")
+    s.add_argument("paths", nargs="+")
+    s.set_defaults(func=cmd_summary)
 
     args = ap.parse_args()
     args.func(args)
