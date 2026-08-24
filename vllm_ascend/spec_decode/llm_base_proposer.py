@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 import copy
+import os
 from collections.abc import Callable
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import replace
@@ -75,6 +76,10 @@ def patch_tensor_parallel_group(tp_group):
 
 # Currently we will fix block size to a small one since `num_reqs` can't be too large
 _PREPARE_INPUTS_BLOCK_SIZE = 4
+
+# [research instrumentation 2026-08-24] eagle3 16K aivec crash triage probes.
+# "off" (default) | "clamp" | "sync_check" | "both"; see _propose docstring.
+_SD_DEBUG = os.getenv("VLLM_ASCEND_SD_DEBUG", "off")
 
 
 # TODO: Remove it when the bug of fx-graph is solved
@@ -804,6 +809,37 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         num_scheduled_tokens: int = 0,
         num_rejected_tokens_gpu: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        # [research instrumentation 2026-08-24] eagle3 16K aivec crash triage.
+        # Fault kernel (plog) = vocab-sized embedding gather reading garbage ids
+        # (0xa5a5 uninit marker); ASCEND_LAUNCH_BLOCKING=1 makes it pass ->
+        # async race. Two env-gated probes, research-only, default off:
+        #   VLLM_ASCEND_SD_CLAMP=1     clamp ids to [0, vocab) at draft entry
+        #                               (no host sync; if the run passes, the
+        #                               garbage was in the ids themselves)
+        #   VLLM_ASCEND_SD_SYNC_CHECK=1 log id ranges per draft call (host
+        #                               sync; heisenbug may hide, but a crash
+        #                               with this on captures values red-handed)
+        _dbg = _SD_DEBUG
+        if _dbg != "off":
+            _vocab = self.draft_model_config.get_vocab_size()
+            for _name, _t in (
+                ("target_token_ids", target_token_ids),
+                ("next_token_ids", next_token_ids),
+            ):
+                if _t is None or not torch.is_tensor(_t) or _t.numel() == 0:
+                    continue
+                if _dbg in ("clamp", "both"):
+                    torch.clamp_(_t, 0, _vocab - 1)
+                if _dbg in ("sync_check", "both"):
+                    _mn, _mx, _oob = int(_t.min()), int(_t.max()), int(((_t < 0) | (_t >= _vocab)).sum())
+                    if _oob or _mx >= _vocab or _mn < 0:
+                        logger.warning(
+                            "[SD-debug] %s BAD range [%d, %d] oob=%d vocab=%d numel=%d",
+                            _name, _mn, _mx, _oob, _vocab, _t.numel(),
+                        )
+                    else:
+                        logger.info("[SD-debug] %s ok range [%d, %d] numel=%d", _name, _mn, _mx, _t.numel())
+
         batch_size = common_attn_metadata.batch_size()
 
         if token_indices_to_sample is None:
