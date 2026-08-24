@@ -18,8 +18,14 @@ Usage:
   # server: vllm serve <model> --port 8001 ...
   python3 bench_baseline.py run --base-url http://127.0.0.1:8001 \
       --model qwen3-8b-awq --tag gpu-awq-dense --out results_gpu.json \
-      [--tiers 4096,16384] [--concs 1,4,16] [--num-prompts 8] [--sd]
+      [--tiers 4096,16384] [--concs 1,4,16] [--num-prompts 8] \
+      [--seed-profile generic|repetitive] [--save-ts]
   python3 bench_baseline.py table results_gpu.json [results_npu.json ...]
+  python3 bench_baseline.py summary results.json ...
+  # Phase 1 analysis:
+  python3 bench_baseline.py kregress k1.json k3.json k5.json k8.json   # E1
+  python3 bench_baseline.py diff dense.json planA.json ngram.json ...  # E2 (ngram+planA pair -> derived components)
+  python3 bench_baseline.py rt c16run.json                              # E4 (needs --save-ts)
 
 Only stdlib + urllib (no requests/torch), so it runs on server and laptop alike.
 """
@@ -82,6 +88,24 @@ QUESTIONS = [
     "What terminology above would need definition for a newcomer?",
     "How do the concepts above relate to each other?",
 ]
+
+# Repetitive profile (Phase 1 E2): questions demand verbatim reproduction of
+# the prompt, so prompt-lookup drafters (ngram) find their drafts inside the
+# prompt itself. Only the questions swap; seed paragraphs (hence ptok sizing
+# and CHARS_PER_TOKEN) stay identical to generic.
+REPETITIVE_QUESTIONS = [
+    "Repeat the passage above verbatim, word for word.",
+    "Quote the passage above exactly as written.",
+    "Copy the passage above without changing anything.",
+    "Reproduce the passage above exactly, from beginning to end.",
+    "Write out the passage above again, character for character.",
+    "Echo the passage above back to me precisely.",
+]
+
+SEED_PROFILES = {
+    "generic": {"questions": QUESTIONS},
+    "repetitive": {"questions": REPETITIVE_QUESTIONS},
+}
 
 # Rough chars-per-token for English technical text, calibrated for the Qwen3
 # BPE on SEED_PARAGRAPHS (measured 3.7 -> actual 63% of target tokens, i.e.
@@ -232,9 +256,10 @@ def snapshot_spec_metrics(base_url: str) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def run_cell(base_url, model, tier, conc, num_prompts, max_tokens, timeout, tag, results):
+def run_cell(base_url, model, tier, conc, num_prompts, max_tokens, timeout, tag, results, profile="generic", save_ts=False):
+    questions = SEED_PROFILES[profile]["questions"]
     prompts = [
-        synthesize_prompt(int(tier * CHARS_PER_TOKEN), QUESTIONS[i % len(QUESTIONS)])
+        synthesize_prompt(int(tier * CHARS_PER_TOKEN), questions[i % len(questions)])
         for i in range(num_prompts)
     ]
     # Warmup single short request (compile/cudagraph warm paths), not measured.
@@ -264,6 +289,7 @@ def run_cell(base_url, model, tier, conc, num_prompts, max_tokens, timeout, tag,
         "conc": conc,
         "num_prompts": num_prompts,
         "max_tokens": max_tokens,
+        "seed_profile": profile,
         "ok": len(ok),
         "failed": len(failed),
         "errors": [o.err for o in failed][:3],
@@ -297,6 +323,13 @@ def run_cell(base_url, model, tier, conc, num_prompts, max_tokens, timeout, tag,
         )
     if steps_total > 0:
         cell["accept_len_burst"] = round(toks_total / steps_total, 4)
+
+    if save_ts:
+        # Per-request token timestamps (s, relative to cell t0) for offline
+        # R(t) occupancy / ITL-vs-R analysis (`rt` subcommand).
+        cell["req_token_ts"] = [
+            [round(ts - t0, 3) for ts in o.token_ts] for o in ok if len(o.token_ts) >= 1
+        ]
 
     print(
         f"[{tag}] tier={tier:>6} conc={conc:>2}: ok={cell['ok']}/{num_prompts} "
@@ -341,13 +374,16 @@ def cmd_run(args):
                     args.timeout,
                     args.tag,
                     results,
+                    profile=args.seed_profile,
+                    save_ts=args.save_ts,
                 )
 
     doc = {
-        "harness": "bench_baseline.py v1",
+        "harness": "bench_baseline.py v2",
         "base_url": args.base_url,
         "model": args.model,
         "tag": args.tag,
+        "seed_profile": args.seed_profile,
         "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "note": args.note,
         "cells": results,
@@ -385,7 +421,7 @@ def cmd_summary(args):
     for p in args.paths:
         with open(p) as f:
             d = json.load(f)
-        print(f"# file={p} tag={d['tag']} created={d.get('created','')}")
+        print(f"# file={p} tag={d['tag']} created={d.get('created','')} profile={d.get('seed_profile','generic')}")
         if d.get("note"):
             print(f"# note={d['note']}")
         cols = (
@@ -410,6 +446,209 @@ def cmd_summary(args):
             print("\t".join(row))
 
 
+# ---------------------------------------------------------------------------
+# Phase 1 analysis: K regression / method differential / R(t) occupancy
+# ---------------------------------------------------------------------------
+
+
+def _load_cells(paths):
+    """Yield (file, doc, cell) tuples from result JSONs."""
+    for p in paths:
+        with open(p) as f:
+            d = json.load(f)
+        for c in d["cells"]:
+            yield p, d, c
+
+
+def _accept_of(cell):
+    return cell.get("accept_len_counters") or cell.get("accept_len_burst") or None
+
+
+def _linreg(xs, ys):
+    """Least-squares fit; returns (slope, intercept, r2)."""
+    n = len(xs)
+    mx = sum(xs) / n
+    my = sum(ys) / n
+    sxx = sum((x - mx) ** 2 for x in xs)
+    sxy = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+    if sxx == 0:
+        return float("nan"), my, float("nan")
+    slope = sxy / sxx
+    intercept = my - slope * mx
+    ss_tot = sum((y - my) ** 2 for y in ys)
+    r2 = (
+        1 - sum((y - (intercept + slope * x)) ** 2 for x, y in zip(xs, ys)) / ss_tot
+        if ss_tot
+        else float("nan")
+    )
+    return slope, intercept, r2
+
+
+TAG_K_RE = re.compile(r"[-_]k(\d+)")
+
+
+def cmd_kregress(args):
+    """E1: regress itl_ms_p50 ~ K across K-sweep JSONs; K parsed from tags."""
+    # group: (tier, conc, profile) -> {K: cell}
+    groups: dict[tuple, dict[int, dict]] = {}
+    for _p, doc, c in _load_cells(args.paths):
+        m = TAG_K_RE.search(c.get("tag", ""))
+        if not m or c.get("itl_ms_p50") is None:
+            continue
+        k = int(m.group(1))
+        key = (c["tier"], c["conc"], doc.get("seed_profile", "generic"))
+        groups.setdefault(key, {})[k] = c
+
+    print(f"{'tier':>7}{'conc':>5}{'profile':>11}  {'per-K itl50 (ms) / accept':<44}")
+    for key in sorted(groups):
+        ks = groups[key]
+        row = "  ".join(f"K{k}={ks[k]['itl_ms_p50']:.0f}/{_accept_of(ks[k]) or '-'}" for k in sorted(ks))
+        print(f"{key[0]:>7}{key[1]:>5}{key[2]:>11}  {row}")
+
+    print()
+    print(f"{'tier':>7}{'conc':>5}{'profile':>11}{'nK':>4}"
+          f"{'slope ms/K':>12}{'intercept ms':>14}{'R^2':>7}{'netK':>6}{'@itl/acc':>10}")
+    for key in sorted(groups):
+        ks = groups[key]
+        if len(ks) < 3:
+            continue  # need >=3 points for a meaningful fit
+        k_sorted = sorted(ks)
+        xs = [float(k) for k in k_sorted]
+        ys = [ks[k]["itl_ms_p50"] for k in k_sorted]
+        slope, intercept, r2 = _linreg(xs, ys)
+        # net-optimal K: minimize ms per emitted token (itl / accept)
+        eff = {
+            k: (ks[k]["itl_ms_p50"] / a if a else float("inf"))
+            for k in k_sorted
+            if (a := _accept_of(ks[k]))
+        }
+        best_k = min(eff, key=eff.get) if eff else None
+        best_v = f"{eff[best_k]:.1f}" if best_k else "-"
+        print(f"{key[0]:>7}{key[1]:>5}{key[2]:>11}{len(ks):>4}"
+              f"{slope:>12.2f}{intercept:>14.1f}{r2:>7.2f}"
+              f"{str(best_k or '-'):>6}{best_v:>10}")
+    print("\nreading: slope = marginal cost per draft token (drafter fwd + KV rescan);")
+    print("          intercept = per-step fixed cost (graph replay, metadata, sampling glue);")
+    print("          netK = argmin itl50/accept (ms per emitted token).")
+
+
+def cmd_diff(args):
+    """E2: dense vs SD methods per cell; derive drafter-chain cost when both
+    a planA-tagged and an ngram-tagged run are present.
+
+    drafter chain (planA - ngram) = drafter fwd cost + draft KV tax
+    verify+bookkeeping (ngram - dense) = target 6-token verify + SD metadata
+    """
+    docs = []
+    for p in args.paths:
+        with open(p) as f:
+            docs.append(json.load(f))
+    dense = docs[0]
+    sds = docs[1:]
+    dmap = {(c["tier"], c["conc"]): c for c in dense["cells"] if c.get("itl_ms_p50")}
+
+    print(f"dense = {args.paths[0]} tag={dense['tag']}")
+    for d in sds:
+        print(f"sd    = tag={d['tag']}")
+    print()
+    hdr = f"{'tier':>7}{'conc':>5}"
+    for d in sds:
+        hdr += f"{'| ' + d['tag'][-24:]:>34}"
+    print(hdr)
+    keys = sorted({(c["tier"], c["conc"]) for d in sds for c in d["cells"] if c.get("itl_ms_p50")})
+    for tier, conc in keys:
+        base = dmap.get((tier, conc), {}).get("itl_ms_p50")
+        row = f"{tier:>7}{conc:>5}"
+        for d in sds:
+            c = next((x for x in d["cells"] if x["tier"] == tier and x["conc"] == conc), None)
+            if not c or c.get("itl_ms_p50") is None:
+                row += f"{'-':>34}"
+                continue
+            itl = c["itl_ms_p50"]
+            acc = _accept_of(c)
+            spd = f"{itl / base:.2f}x" if base else "-"
+            acc_s = f"{acc}" if acc else "-"
+            row += f"{f'{itl:.0f}ms {spd} a={acc_s}':>34}"
+        print(row)
+
+    # derived components when planA + ngram pair exists (same profile)
+    by_tag = {}
+    for d in sds:
+        by_tag[d["tag"]] = d
+    plana = next((d for t, d in by_tag.items() if "planA" in t and "ngram" not in t), None)
+    ngram = next((d for t, d in by_tag.items() if "ngram" in t), None)
+    if plana and ngram:
+        print("\nderived per cell (ms):")
+        print(f"{'tier':>7}{'conc':>5}{'dense':>9}{'ngram':>9}{'planA':>9}"
+              f"{'drafter-chain':>15}{'verify+bookkeeping':>20}")
+        nmap = {(c["tier"], c["conc"]): c for c in ngram["cells"] if c.get("itl_ms_p50")}
+        for tier, conc in keys:
+            dm = dmap.get((tier, conc), {}).get("itl_ms_p50")
+            nm = nmap.get((tier, conc), {}).get("itl_ms_p50")
+            pm = next(
+                (x.get("itl_ms_p50") for x in plana["cells"] if x["tier"] == tier and x["conc"] == conc),
+                None,
+            )
+            if dm is None or nm is None or pm is None:
+                continue
+            print(f"{tier:>7}{conc:>5}{dm:>9.1f}{nm:>9.1f}{pm:>9.1f}"
+                  f"{pm - nm:>15.1f}{nm - dm:>20.1f}")
+        print("\nreading: drafter-chain = planA - ngram (drafter fwd + draft KV tax);")
+        print("          verify+bookkeeping = ngram - dense (target multi-token verify + SD glue).")
+
+
+def cmd_rt(args):
+    """E4: R(t) occupancy + ITL-vs-R from cells saved with --save-ts."""
+    any_ts = False
+    for _p, _doc, c in _load_cells(args.paths):
+        ts_lists = c.get("req_token_ts")
+        if not ts_lists:
+            continue
+        any_ts = True
+        # occupancy step function from (start, +1) / (end, -1) sweep
+        events = []
+        for ts in ts_lists:
+            if len(ts) >= 1:
+                events.append((ts[0], 1))
+                events.append((ts[-1], -1))
+        events.sort(key=lambda e: (e[0], -e[1]))
+        changes = []  # (t, R_after)
+        r = 0
+        for t, d in events:
+            r += d
+            changes.append((t, r))
+        t_lo, t_hi = changes[0][0], changes[-1][0]
+        if t_hi <= t_lo:
+            continue
+
+        def r_at(t):
+            lo, hi = 0, len(changes) - 1
+            while lo < hi:
+                mid = (lo + hi + 1) // 2
+                if changes[mid][0] <= t:
+                    lo = mid
+                else:
+                    hi = mid - 1
+            return changes[lo][1]
+
+        occ = [r_at(t_lo + (t_hi - t_lo) * q / 10) for q in range(11)]
+        # ITL bucketed by concurrent R at gap midpoint
+        buckets: dict[int, list[float]] = {}
+        for ts in ts_lists:
+            for a, b in zip(ts, ts[1:]):
+                mid = (a + b) / 2
+                buckets.setdefault(r_at(mid), []).append((b - a) * 1000)
+        print(f"[{c['tag']}] tier={c['tier']} conc={c['conc']}:")
+        print(f"  R deciles  : {' '.join(f'{x}' for x in occ)}")
+        rows = sorted(buckets)
+        for rv in rows:
+            v = buckets[rv]
+            v.sort()
+            print(f"  R={rv:<3} n={len(v):<6} ITL p50={v[len(v)//2]:8.1f}ms mean={sum(v)/len(v):8.1f}ms")
+    if not any_ts:
+        print("no req_token_ts found; re-run bench with --save-ts (cells with conc>1 are the useful ones)")
+
+
 def main():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -425,6 +664,10 @@ def main():
     r.add_argument("--max-tokens", type=int, default=256, help="generation length")
     r.add_argument("--timeout", type=float, default=600.0)
     r.add_argument("--note", default="", help="free-form note stored in JSON")
+    r.add_argument("--seed-profile", choices=sorted(SEED_PROFILES), default="generic",
+                   help="question set: generic (summarize etc) or repetitive (verbatim recall, ngram-friendly)")
+    r.add_argument("--save-ts", action="store_true",
+                   help="store per-request token timestamps for R(t) analysis (`rt`)")
     r.set_defaults(func=cmd_run)
 
     t = sub.add_parser("table", help="print results as a table")
@@ -434,6 +677,18 @@ def main():
     s = sub.add_parser("summary", help="compact TSV summary for pasting back")
     s.add_argument("paths", nargs="+")
     s.set_defaults(func=cmd_summary)
+
+    kr = sub.add_parser("kregress", help="E1: itl~K regression + net-optimal K (K from tags)")
+    kr.add_argument("paths", nargs="+")
+    kr.set_defaults(func=cmd_kregress)
+
+    df = sub.add_parser("diff", help="E2: dense.json first, then SD JSONs; derives drafter-chain vs verify cost")
+    df.add_argument("paths", nargs="+")
+    df.set_defaults(func=cmd_diff)
+
+    rt = sub.add_parser("rt", help="E4: R(t) occupancy + ITL-vs-R (needs --save-ts cells)")
+    rt.add_argument("paths", nargs="+")
+    rt.set_defaults(func=cmd_rt)
 
     args = ap.parse_args()
     args.func(args)

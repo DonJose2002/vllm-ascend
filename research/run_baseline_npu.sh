@@ -13,14 +13,30 @@
 #   cd /path/to/vllm-ascend && git fetch myfork && git checkout research/main && git pull
 #
 # Usage (inside container, adjust weight paths via env if needed):
-#   bash research/run_baseline_npu.sh dense 8001
-#   bash research/run_baseline_npu.sh sd    8002
+#   bash research/run_baseline_npu.sh dense  8001
+#   bash research/run_baseline_npu.sh sd     8002          # plan C, K=5
+#   bash research/run_baseline_npu.sh sda    8003          # plan A, K=5
+#   K=8 bash research/run_baseline_npu.sh sda 8004         # E1 K-sweep (capture table auto-derived)
+#   bash research/run_baseline_npu.sh ngram  8005          # E2 zero-drafter differential
+#   bash research/run_baseline_npu.sh eagle3 8006          # E2 (first-ever run; smoke first!)
+#   bash research/run_baseline_npu.sh dflash 8007          # E2 (first-ever run; smoke first!)
+#   SEED_PROFILE=repetitive bash research/run_baseline_npu.sh ngram 8008   # ngram-friendly workload
+#   SAVE_TS=1 ...                                            # store token timestamps for R(t)
+#   TIERS=4096 CONCS=1 bash research/run_baseline_npu.sh eagle3 8009       # smoke = 1 cell
+# Key envs: NPU_MODEL, DRAFT, EAGLE3_MODEL, DFLASH_MODEL, K, NGRAM_MAX/NGRAM_MIN,
+#           TIERS, CONCS, NUM_PROMPTS, MAX_TOKENS, SEED_PROFILE, SAVE_TS, NPUS
 set -euo pipefail
 
-MODE="${1:?usage: run_baseline_npu.sh dense|sd|sda PORT}"
+MODE="${1:?usage: run_baseline_npu.sh dense|sd|sda|ngram|eagle3|dflash PORT}"
 PORT="${2:-8001}"
 MODEL="${NPU_MODEL:-/nfs-share/hf_weights/Qwen3-8B}"
 DRAFT="${NPU_DRAFT:-/nfs-share/hf_weights/Qwen3-0.6B}"
+EAGLE3_MODEL="${EAGLE3_MODEL:-/nfs-share/hf_weights/qwen3_8b_eagle3}"
+DFLASH_MODEL="${DFLASH_MODEL:-/nfs-share/hf_weights/Qwen3-8B-DFlash-b16}"
+K="${K:-5}"
+NGRAM_MAX="${NGRAM_MAX:-5}"
+NGRAM_MIN="${NGRAM_MIN:-3}"
+SEED_PROFILE="${SEED_PROFILE:-generic}"
 TIERS="${NPU_TIERS:-4096,16384,32768}"
 CONCS="${CONCS:-1,4,16}"
 NUM_PROMPTS="${NUM_PROMPTS:-8}"
@@ -150,29 +166,70 @@ echo "PREFLIGHT: ASCEND_RT_VISIBLE_DEVICES=$ASCEND_RT_VISIBLE_DEVICES"
 SPEC_ARGS=""
 TAG="npu-bf16-dense"
 NOTE="910B3 x1, v0.23.0 docker, bf16, block_size=128; 32K tier NPU-only (model max_pos=40960)"
-if [ "$MODE" = "sd" ] || [ "$MODE" = "sda" ]; then
-  SPEC_ARGS="--speculative-config {\"method\":\"draft_model\",\"model\":\"$DRAFT\",\"num_speculative_tokens\":5}"
-  TAG="npu-bf16-sd-k5"
-  NOTE="$NOTE; plan C (drafter eager, default)"
-  if [ "$MODE" = "sda" ]; then
-    # Plan A: drafter-side FULL aclgraph behind the additional_config gate
-    # (same flag as upstream PR #14510). No spaces in the JSON so unquoted
-    # $SPEC_ARGS expansion stays intact.
-    # Capture table is bounded explicitly: the default table (~48 sizes)
-    # doubles under plan A (target + drafter) and exhausts the NPU driver
-    # stream limit during capture (EE1023 "Too many streams are created";
-    # D5 5c only ever validated plan A with 2 graphs). The bench workload
-    # has R<=8 concurrent requests -> target needs [6..48]; prefill steps
-    # never used FULL graphs under the default table either (cap 498 is far
-    # below chunked-prefill sizes), so FULL-graph applicability for this
-    # bench is identical to the unbounded plan C run. 30 is included so R=5
-    # hits its bucket exactly instead of padding.
-    SPEC_ARGS="$SPEC_ARGS --additional-config {\"draft_model_full_graph\":true}"
-    SPEC_ARGS="$SPEC_ARGS --compilation-config {\"cudagraph_capture_sizes\":[6,12,18,24,30,36,42,48]}"
-    TAG="npu-bf16-sd-k5-planA"
-    NOTE="$NOTE -> OVERRIDDEN to plan A (draft_model_full_graph=true, capture table bounded to [6..48] for R<=8)"
-  fi
+BENCH_EXTRA=()
+
+if [ "$SEED_PROFILE" != "generic" ]; then
+  TAG="$TAG-$SEED_PROFILE"
 fi
+if [ "${SAVE_TS:-0}" = "1" ]; then
+  BENCH_EXTRA+=(--save-ts)
+fi
+
+# Bounded target capture table: (K+1)*i for i=1..8, R<=8 bench. Overridable.
+derive_capture_sizes() {
+  local step=$((K + 1)) sizes="" i=1 v
+  while [ "$i" -le 8 ]; do
+    v=$((step * i))
+    sizes="${sizes:+$sizes,}$v"
+    i=$((i + 1))
+  done
+  printf '%s' "$sizes"
+}
+
+case "$MODE" in
+  dense)
+    ;;
+  sd|sda)
+    # K+2 note: draft_model drafter consumes R*(K+2) tokens (extra seed slot);
+    # plan C keeps it eager, plan A gives it a derived R*(K+2) table (PR #14510).
+    SPEC_ARGS="--speculative-config {\"method\":\"draft_model\",\"model\":\"$DRAFT\",\"num_speculative_tokens\":$K}"
+    TAG="npu-bf16-sd-k${K}"
+    NOTE="$NOTE; plan C (drafter eager, default)"
+    if [ "$MODE" = "sda" ]; then
+      SPEC_ARGS="$SPEC_ARGS --additional-config {\"draft_model_full_graph\":true}"
+      SPEC_ARGS="$SPEC_ARGS --compilation-config {\"cudagraph_capture_sizes\":[$(derive_capture_sizes)]}"
+      TAG="npu-bf16-sd-k${K}-planA"
+      NOTE="$NOTE -> OVERRIDDEN to plan A (draft_model_full_graph=true, capture table [$(derive_capture_sizes)])"
+    fi
+    ;;
+  ngram)
+    # Host-side prompt-lookup proposer: zero drafter forward, zero draft KV.
+    # Keys verified against tests/e2e/.../test_ngram.py (prompt_lookup_max/min, no _k suffix).
+    SPEC_ARGS="--speculative-config {\"method\":\"ngram\",\"prompt_lookup_max\":$NGRAM_MAX,\"prompt_lookup_min\":$NGRAM_MIN,\"num_speculative_tokens\":$K}"
+    TAG="npu-bf16-ngram-k${K}"
+    NOTE="$NOTE; ngram host proposer (lookup ${NGRAM_MIN}-${NGRAM_MAX}), default capture table (like dense)"
+    ;;
+  eagle3|dflash)
+    # First-ever runs on this stack (code path exists, never validated here):
+    # smoke with TIERS=4096 CONCS=1 before committing a full matrix. Bounded
+    # capture table (same derivation as sda) to dodge EE1023 if drafter graphs
+    # double like plan A; if capture still dies, retry with GRAPH_MODE
+    # (e.g. GRAPH_MODE=FULL_DECODE_ONLY, the mode upstream e2e uses).
+    DMODEL="$EAGLE3_MODEL"; [ "$MODE" = "dflash" ] && DMODEL="$DFLASH_MODEL"
+    SPEC_ARGS="--speculative-config {\"method\":\"$MODE\",\"model\":\"$DMODEL\",\"num_speculative_tokens\":$K}"
+    CCOMP="{\"cudagraph_capture_sizes\":[$(derive_capture_sizes)]"
+    if [ -n "${GRAPH_MODE:-}" ]; then
+      CCOMP="$CCOMP,\"cudagraph_mode\":\"$GRAPH_MODE\""
+    fi
+    CCOMP="$CCOMP}"
+    SPEC_ARGS="$SPEC_ARGS --compilation-config $CCOMP"
+    TAG="npu-bf16-${MODE}-k${K}"
+    NOTE="$NOTE; $MODE drafter ($DMODEL), capture [$(derive_capture_sizes)]${GRAPH_MODE:+, mode=$GRAPH_MODE} - FIRST RUN, smoke first"
+    ;;
+  *)
+    echo "unknown MODE '$MODE' (dense|sd|sda|ngram|eagle3|dflash)"; exit 1
+    ;;
+esac
 
 strip_log() {
   sed -E 's/^\((APIServer|EngineCore) pid=[0-9]+\) //; s/(INFO|ERROR|WARNING) [0-9]{2}-[0-9]{2} [0-9:]{8} \[[^]]*\] //'
@@ -188,11 +245,11 @@ on_exit() {
   echo "visible_devices=${ASCEND_RT_VISIBLE_DEVICES:-unset} hbm_used_mb=${HBM_USED:-?}"
   echo "repo_commit=$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
   echo "vllm_ascend_dist=$DIST_VER"
-  echo "tiers=$TIERS concs=$CONCS nprompts=$NUM_PROMPTS maxtok=$MAX_TOKENS"
+  echo "tiers=$TIERS concs=$CONCS nprompts=$NUM_PROMPTS maxtok=$MAX_TOKENS k=$K profile=$SEED_PROFILE"
   SERVE_LOG="$OUTDIR/serve-$TAG.log"
   if [ -s "$SERVE_LOG" ]; then
-    grep -E "Available KV cache memory|GPU KV cache size|Maximum concurrency|Wrapping draft model|drafter FULL graph enabled|Capturing CUDA graphs" \
-      "$SERVE_LOG" | tail -4 | strip_log | sed 's/^/cfg: /'
+    grep -E "Available KV cache memory|GPU KV cache size|model weights take|Maximum concurrency|Wrapping draft model|drafter FULL graph enabled|drafter sizes|Capturing CUDA graphs" \
+      "$SERVE_LOG" | tail -6 | strip_log | sed 's/^/cfg: /'
   else
     echo "cfg: (serve log empty or missing at $SERVE_LOG)"
   fi
@@ -238,7 +295,7 @@ for i in $(seq 1 120); do
 done
 
 if curl -s -o /dev/null "http://127.0.0.1:$PORT/v1/models"; then
-  echo ">>> benching $TAG (tiers=$TIERS concs=$CONCS)"
+  echo ">>> benching $TAG (tiers=$TIERS concs=$CONCS profile=$SEED_PROFILE)"
   python3 research/bench_baseline.py run \
     --base-url "http://127.0.0.1:$PORT" \
     --model qwen3-8b \
@@ -247,6 +304,8 @@ if curl -s -o /dev/null "http://127.0.0.1:$PORT/v1/models"; then
     --concs "$CONCS" \
     --num-prompts "$NUM_PROMPTS" \
     --max-tokens "$MAX_TOKENS" \
+    --seed-profile "$SEED_PROFILE" \
+    "${BENCH_EXTRA[@]:+${BENCH_EXTRA[@]}}" \
     --out "$OUTDIR/baseline-npu-qwen3-8b-$TAG.json" \
     --note "$NOTE" \
     || echo "# bench exited non-zero (partial summary follows)"
