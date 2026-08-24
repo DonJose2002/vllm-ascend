@@ -188,8 +188,15 @@ def stream_one(base_url: str, model: str, prompt: str, max_tokens: int, timeout:
         # the SD engine crashed mid-cell and 5 truncated streams were
         # counted ok=8).
         res.ok = res.saw_done and (bool(res.token_ts) or res.completion_tokens > 0)
-        if not res.ok and res.err is None and (res.token_ts or res.completion_tokens):
-            res.err = f"stream truncated (saw_done={res.saw_done}, got {max(res.completion_tokens, len(res.token_ts))} tokens)"
+        if not res.ok and res.err is None:
+            # covers both partial streams and empty-clean-close streams
+            # (the latter leave err=None and used to crash summary with
+            # errors=[None]; give every failed request a diagnostic string)
+            res.err = (
+                f"stream truncated (saw_done={res.saw_done}, got {max(res.completion_tokens, len(res.token_ts))} tokens)"
+                if (res.token_ts or res.completion_tokens)
+                else f"empty stream (saw_done={res.saw_done}, 0 tokens, no exception)"
+            )
     except Exception as e:  # noqa: BLE001
         res.err = repr(e)
     return res
@@ -441,7 +448,7 @@ def cmd_summary(args):
                 str(c.get("request_per_s") or ""),
                 str(c.get("accept_len_counters", "")),
                 str(c.get("accept_len_burst", "")),
-                (c.get("errors") or [""])[0][:60],
+                next((e[:60] for e in (c.get("errors") or []) if isinstance(e, str)), ""),
             ]
             print("\t".join(row))
 
