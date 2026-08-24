@@ -1,0 +1,140 @@
+# 复盘:eagle 系投机解码 16K 崩溃(pinned H2D 异步竞态)
+
+> 2026-08-24 | 修复 commit:research 线 `62533dafa`(v0.23.0 容器验证)/ PR 分支 `pr/bugfix-eagle-h2d-race`(`56f262aa1`,基于 origin/main `1a086ce8a`)| 环境:vllm-ascend v0.23.0 = fixes,910B3,Qwen3-8B + Tengyunw/qwen3_8b_eagle3(eagle3 头,1 层,draft_vocab 32000),K=5
+> 姊妹篇:`eagle-h2d-race-journey.md`(人话版,给同事)
+
+## 0. 一句话
+
+`prepare_next_token_ids_padded` 把一批"兜底 token id"用 pinned **非阻塞** H2D 拷贝送上 NPU;torch_npu 上这类拷贝走 SDMA 引擎,与发射流上后续计算 kernel 的先后顺序**没有保证**——输掉竞态时 `torch.where` 读到未初始化内存(0xa5a5a5a5,CANN 毒化标记),垃圾 id 混进 drafter 的 input_ids,词表规模的 embedding gather 拿垃圾当索引,越界读 GM,aivec 硬件异常,引擎死亡。
+
+## 1. 现象与误判
+
+1. **误判"16K 特异"**(与 SD 收缩崩溃同款教训):首跑 4K/c1 全绿、16K/32K 全灭。真相:4K 也中(同日 B 实验 4K 6/8,2 条"干净空流"),只是概率低;16K 深异步队列下近 100%。
+2. **误判"eagle3 头权重有问题"**:首跑即出 NPU 首个 SD 正收益(4K ITL 22.9ms、out/s 104),不像坏权重;但崩溃签名(vector core 异常)容易让人先怀疑硬件/权重。三张物理卡(NPU 1/2/4/5)复现 → 排除单卡。
+3. **"干净空流"的迷惑性**:失败请求的流是"正常关闭、0 token、无异常"——不是 HTTP 500。引擎死在更深处,APIServer 只是优雅收尾。若 harness 的 ok 判定只看"连接正常关闭",这种失败会被静默吞掉(bench_baseline.py 的 [DONE] 判定救了我们)。
+
+## 2. 定位过程(时间线)
+
+### 2.1 现场与第一轮假设
+
+首跑(4K/c1 8/8 绿,ITL 22.9ms / accept 2.55 / out/s 104),16K/32K 全灭。serve log traceback 漂在 `shutdown` 时的 `AclrtSynchronizeDevice`(EZ9999 → vector core exception)——**崩溃点与肇事点分离**,这是异步执行故障的典型特征。scheduler dump:16K 请求 chunked prefill 第 6 块(11904/2048),单请求,非 SD 步。`num_common_prefix_blocks=[110]` 引出 H1(前缀缓存交互)。
+
+### 2.2 三个判别实验
+
+| 实验 | 结果 | 结论 |
+|---|---|---|
+| B:`--no-enable-prefix-caching` 16K | 仍全灭 | **H1(前缀缓存)驳倒** |
+| C:`--max-num-batched-tokens 32768`(单块 prefill) | 启动 dummy_run 即崩 | 与 chunk 边界无关;单次前向 token 数相关 |
+| eager:`--enforce-eager` 16K | 仍崩(同签名) | **图重放排除** |
+
+### 2.3 plog 锁定故障 kernel
+
+```
+~/ascend/log/debug/plog/plog-<pid>_*.log
+fault kernel_name = GatherV2_..._high_precision
+args[12] = 0x25180 = 151936 = Qwen3 词表大小   → embedding 类查表
+args[18] 高位 = 0xa5a5a5a5                      → CANN 未初始化内存毒化标记
+errcode 0x800000: MTE accesses an invalid GM address
+```
+
+结论:某个 token-id/索引 buffer 未初始化就被消费,垃圾 id 越界读词表。
+
+### 2.4 决定性翻转:ASCEND_LAUNCH_BLOCKING=1
+
+`ASCEND_LAUNCH_BLOCKING=1`(每次 kernel launch 同步等待完成)+ eager → **16K 通过**(accept 2.66)。去掉 env → 必崩。唯一能被这样翻转的故障类别:**异步竞态**。这同时解释了 4K 偶发(窗口窄)与 16K 必现(深队列窗口宽)。
+
+### 2.5 二分探针:找到垃圾的 carrier
+
+静态分析锁定两条候选链(所有写入路径表面流内有序,纯读码无法再二分):
+
+- 链 A(target):`target_token_ids = input_ids.gpu[token_indices]`(索引链)
+- 链 B(next):`backup_next_token_ids` pinned H2D(`CpuGpuBuffer.copy_to_gpu`,`non_blocking=True`)→ `torch.where` 消费
+
+插桩(env 门控,`VLLM_ASCEND_SD_DEBUG`,默认 off):**保持时序**的单张量 clamp(一次 elementwise,不加 host 同步):
+
+| 探针 | 结果 | 结论 |
+|---|---|---|
+| clamp(双钳) | 过 | 垃圾确在两个 id 张量之一 |
+| sync_check(min/max 打印,host 同步) | 过 + 216 次全 ok + 零 BAD | 观察治愈竞态 → 写入是异步的、消费先跑 |
+| clamp_target(只钳 A) | **崩** | A 无辜 |
+| clamp_next(只钳 B) | **过** | **垃圾 carrier = 链 B 实锚** |
+
+### 2.6 根因链闭合
+
+```
+prepare_next_token_ids_padded (llm_base_proposer.py):
+  backup.np[:n] = <host 侧 get_token_id 兜底值>       # host 写 pinned
+  copy_to_gpu(n) → gpu.copy_(cpu, non_blocking=True)  # ← pinned H2D,SDMA 引擎,无流序保证
+  next_token_ids = torch.where(cond, selected, backup.gpu[:n])   # 竞态消费点
+      ↓
+set_inputs_first_pass eagle 分支:
+  self.input_ids[token_indices_to_sample] = next_token_ids      # 垃圾 scatter 进 drafter 输入
+      ↓
+eagle 头 embedding gather(GatherV2,词表 151936 表)
+      ↓ 垃圾 id(0xa5a5...) 越界索引
+MTE invalid GM address → aivec 异常 → EE9999 → 引擎死亡
+```
+
+## 3. 三个"为什么"
+
+### 3.1 为什么上游 vllm(CUDA)没有这个 bug?
+
+上游 GPU 的同型代码也用 `CpuGpuBuffer.copy_to_gpu`(non_blocking=True),但 **CUDA 的 `cudaMemcpyAsync` 入队到 stream 后,与同 stream 的后续 kernel 严格有序**——异步只是"不阻塞 host",顺序由流语义保证。torch_npu 的 pinned H2D 走 SDMA 引擎,与发射流(launch stream)上后续计算 kernel 的先后**没有等价保证**。一句话:**代码相同,后端流语义不同;NPU 移植不能默认继承 CUDA 的流序直觉**。
+
+### 3.2 为什么只有 eagle 系触发?
+
+调用矩阵(`model_runner` 的 `use_padded_batch` 分派):
+
+| drafter | 是否走 `prepare_next_token_ids_padded` | next_token_ids 的消费路径 | 结果 |
+|---|---|---|---|
+| eagle / eagle3 / mtp(`pass_hidden_states=True` → `net_slots=0`) | ✅ | eagle 分支:scatter 进 `self.input_ids` → 1 层头 embedding gather,**launch 密、消费快** | 16K 必崩,4K 偶发 |
+| draft_model(`net_slots=1`) | ✅ | CopyAndExpandEagleInputs 算子分支 | 理论暴露,**27 cell 从未复现**(0.6B 前向重、launch 间隔大,窗口关上) |
+| dflash(parallel_drafting) | ✅ | 同上 CopyAndExpand 分支 + 单 pass 全 token | 未复现 |
+| ngram / suffix(host 提议器) | ❌(bookkeeping 后走 CPU list) | 无 | 结构性免疫 |
+
+**eagle 系高危的物理解释**:1 层头前向极快,`torch.where` → scatter → gather 的 kernel 链在 device 上排得密;H2D 拷贝若被 SDMA 延后,消费链先到。draft_model 共享同一拷贝但从未复现——**"没崩过"不等于"安全"**,它只是窗口更窄(修复同样保护它)。
+
+### 3.3 为什么 16K 必现、4K 偶发?
+
+16K/32K 的 chunked prefill 使 device 端异步队列深(每块 2048 token 的 kernel 串),host 远跑在前面,SDMA 拷贝从发射到落地的间隔被拉长;4K 时队列浅,拷贝大概率在消费前落地。概率随队列深度变化——这也是它潜伏至今的原因:短 prompt 测试全绿,长 prompt 一跑就死。
+
+## 4. 修复
+
+最小改动:该处 H2D 改 **blocking** 拷贝:
+
+```python
+self.backup_next_token_ids.gpu[:num_reqs].copy_(
+    self.backup_next_token_ids.cpu[:num_reqs], non_blocking=False
+)
+```
+
+- payload = `num_reqs × int32`(<1KB),阻塞开销微秒级,换正确性稳赚;
+- **不**全局改 `CpuGpuBuffer.copy_to_gpu`(大量大缓冲依赖 non_blocking 性能,如 hidden_states);
+- 备选方案(未采用):拷贝后补 event/record_stream 依赖——正确但复杂,1KB 载荷不值得。
+
+### 验证(修复 `62533dafa`,工作区遮蔽零重装生效)
+
+1. 16K 单请求 × 4 种配置(裸跑/两种探针/全量矩阵)全过——此前该配置 4/4 必崩;
+2. eagle3 **全量矩阵 9/9 cell**(4K/16K/32K × c1/c4/c16)全绿,accept 2.34-2.66 双口径一致;
+3. 修复前 4K 偶发空流(B 实验 2/8)同根同愈,后续多轮 4K 全 8/8。
+
+## 5. 教训清单
+
+1. **崩溃点 ≠ 肇事点**:异步栈的 traceback 漂在 sync 点,先看 plog 的 fault kernel 名再谈代码定位;
+2. **`ASCEND_LAUNCH_BLOCKING=1` 翻转 = 竞态实锤**:同步启动是 NPU 竞态的"活检工具",一翻即知类别——但绝不能当修复(性能不可接受,且掩盖问题);
+3. **0xa5a5a5a5 是通用诊断锚**:任何 NPU kernel 故障 args 里出现它 = 读到未初始化设备内存,顺藤摸"谁没写完就被读";
+4. **保持时序的探针是竞态二分的唯一姿势**:clamp(一次 elementwise)保时序,host 同步打印(sync_check)会治好竞态——只证明"异步写入存在",不能定位 carrier;两者配合,单张量 clamp 完成二分;
+5. **CUDA 直觉在 NPU 上要逐条验证**:non_blocking 拷贝、event、stream 语义是最容易踩的三件套(本项目已集齐:本 bug + D5 的 stream 上限);
+6. **竞态 bug 无法 UT 回归**:可复现配置 + 证据链 + 修复翻转就是验收物,PR 描述要写全(同 SD 收缩崩溃先例);
+7. **"干净空流"是深层故障的礼貌面具**:ok 判定必须看 [DONE] 与 token 数,harness 早已修对,这次直接受益。
+
+## 6. 文件索引
+
+| 文件 | 位置 | 角色 |
+|---|---|---|
+| `vllm_ascend/spec_decode/llm_base_proposer.py` `prepare_next_token_ids_padded` | 修复点(`62533dafa` research 线 / `56f262aa1` PR 线) | blocking H2D |
+| 上游 `vllm/v1/utils.py` `CpuGpuBuffer.copy_to_gpu` | 根因侧(未改) | non_blocking=True 的来源;CUDA 安全/NPU 无保证 |
+| 同文件 `set_inputs_first_pass` eagle 分支 | 消费链 | scatter 进 drafter input_ids |
+| plog(`~/ascend/log/debug/plog/plog-<pid>_*.log`) | 证据 | fault kernel=GatherV2,0xa5a5 标记 |
+| 插桩 `VLLM_ASCEND_SD_DEBUG`(research 线保留,PR 线不含) | 工具 | clamp/clamp_target/clamp_next/sync_check |
+| `experiments/out/serve-npu-bf16-eagle3-k5.log` + SUMMARY 块 | 证据 | 9/9 全绿矩阵 |
