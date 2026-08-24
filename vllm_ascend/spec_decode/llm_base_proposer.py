@@ -812,23 +812,26 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         # [research instrumentation 2026-08-24] eagle3 16K aivec crash triage.
         # Fault kernel (plog) = vocab-sized embedding gather reading garbage ids
         # (0xa5a5 uninit marker); ASCEND_LAUNCH_BLOCKING=1 makes it pass ->
-        # async race. Two env-gated probes, research-only, default off:
-        #   VLLM_ASCEND_SD_CLAMP=1     clamp ids to [0, vocab) at draft entry
-        #                               (no host sync; if the run passes, the
-        #                               garbage was in the ids themselves)
-        #   VLLM_ASCEND_SD_SYNC_CHECK=1 log id ranges per draft call (host
-        #                               sync; heisenbug may hide, but a crash
-        #                               with this on captures values red-handed)
+        # async race. Probes (research-only, default off), all no-host-sync
+        # unless stated; values: clamp | clamp_target | clamp_next |
+        # sync_check | both. clamp_* bisect WHICH id tensor carries the
+        # garbage (timing-preserving: one tiny elementwise kernel each):
+        #   clamp        - clamp both target_token_ids and next_token_ids
+        #   clamp_target - clamp only target_token_ids (token-indices chain)
+        #   clamp_next   - clamp only next_token_ids (backup H2D chain)
+        #   sync_check   - log id ranges per draft call (host sync; heisenbug
+        #                   may hide, but a crash with this on captures values)
         _dbg = _SD_DEBUG
         if _dbg != "off":
             _vocab = self.draft_model_config.get_vocab_size()
-            for _name, _t in (
+            _probes = (
                 ("target_token_ids", target_token_ids),
                 ("next_token_ids", next_token_ids),
-            ):
+            )
+            for _name, _t in _probes:
                 if _t is None or not torch.is_tensor(_t) or _t.numel() == 0:
                     continue
-                if _dbg in ("clamp", "both"):
+                if _dbg in ("clamp", "both") or _dbg == f"clamp_{_name.split('_')[0]}":
                     torch.clamp_(_t, 0, _vocab - 1)
                 if _dbg in ("sync_check", "both"):
                     _mn, _mx, _oob = int(_t.min()), int(_t.max()), int(((_t < 0) | (_t >= _vocab)).sum())
