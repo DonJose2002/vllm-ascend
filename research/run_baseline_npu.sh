@@ -23,6 +23,7 @@
 #   SEED_PROFILE=repetitive bash research/run_baseline_npu.sh ngram 8008   # ngram-friendly workload
 #   SAVE_TS=1 ...                                            # store token timestamps for R(t)
 #   TIERS=4096 CONCS=1 bash research/run_baseline_npu.sh eagle3 8009       # smoke = 1 cell
+#   EXTRA_SERVE_ARGS="--no-enable-prefix-caching" ...        # passthrough extra vllm serve flags (triage)
 # Key envs: NPU_MODEL, DRAFT, EAGLE3_MODEL, DFLASH_MODEL, K, NGRAM_MAX/NGRAM_MIN,
 #           TIERS, CONCS, NUM_PROMPTS, MAX_TOKENS, SEED_PROFILE, SAVE_TS, NPUS
 set -euo pipefail
@@ -282,6 +283,7 @@ vllm serve "$MODEL" \
   --gpu-memory-utilization 0.9 \
   --port "$PORT" \
   $SPEC_ARGS \
+  ${EXTRA_SERVE_ARGS:-} \
   > "$OUTDIR/serve-$TAG.log" 2>&1 &
 SERVE_PID=$!
 
