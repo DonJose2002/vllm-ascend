@@ -2,8 +2,9 @@
 import atexit
 import copy
 import os
+import signal
 from collections.abc import Callable
-from contextlib import AbstractContextManager, contextmanager, nullcontext
+from contextlib import AbstractContextManager, contextmanager, nullcontext, suppress
 from dataclasses import replace
 from functools import partial
 from typing import Any, cast
@@ -125,14 +126,27 @@ class _RaceCounters:
         # Pre-bind names that may vanish during interpreter teardown.
         self._torch = torch
         self._logger = logger
+        self._os = os
+        self._open = open
+        self._suppress = suppress
         self.counts: torch.Tensor | None = None
         self.steps = 0
         self.reported = False
         # One-time engagement line (host-only, no device sync): without it a
         # hard crash cannot distinguish "counters ran" from "env never
         # reached the module" (Run 1 lesson, 2026-08-25).
-        self._logger.info("[SD-counters] engaged; on-device c1/c2/c3, readout at process exit")
+        self._logger.info("[SD-counters] engaged; readout at exit or kill -USR1 <pid>")
         atexit.register(self.report, origin="atexit")
+        # Live readout (Run 2 lesson): both exit-time paths (atexit/__del__)
+        # failed to produce a line - either never fired or fired after the
+        # logger/ACL runtime was gone. A signal handler fires on demand while
+        # the engine is alive, where both are guaranteed healthy. Non-main
+        # thread registration raises ValueError - then only the exit paths
+        # remain (and the file fallback below survives them).
+        try:
+            signal.signal(signal.SIGUSR1, lambda *_: self.report(origin="sigusr1", once=False))
+        except ValueError:
+            self._logger.info("[SD-counters] SIGUSR1 readout unavailable (not on main thread)")
 
     def bump(self, idx: int, delta: torch.Tensor) -> None:
         """Accumulate a 0-dim device tensor delta; stays on device."""
@@ -140,24 +154,30 @@ class _RaceCounters:
             self.counts = self._torch.zeros(3, dtype=self._torch.int64, device=delta.device)
         self.counts[idx] += delta
 
-    def report(self, origin: str = "unknown") -> None:
-        if self.reported or self.counts is None:
+    def report(self, origin: str = "unknown", once: bool = True) -> None:
+        if self.counts is None or (once and self.reported):
             return
-        self.reported = True
+        if once:
+            self.reported = True
+        pid = self._os.getpid()
+        # Belt and suspenders: the logger may already be torn down when
+        # atexit fires, and a D2H failure must NEVER be silently swallowed -
+        # a swallowed failure looks exactly like "readout never ran" (Run 2
+        # lesson). Every path lands in /tmp/sd_counters_<pid>.txt.
         try:
             c1, c2, c3 = self.counts.tolist()
-            self._logger.warning(
-                "[SD-counters] %s steps=%d c1=%d c2=%d c3=%d "
+            line = (
+                f"[SD-counters] {origin} steps={self.steps} c1={c1} c2={c2} c3={c3} "
                 "(c1=backup.gpu OOB after copy; c2=where-cond-false rows; "
-                "c3=next_token_ids OOB after where)",
-                origin,
-                self.steps,
-                c1,
-                c2,
-                c3,
+                "c3=next_token_ids OOB after where)"
             )
-        except Exception:
-            pass
+            with self._suppress(Exception):
+                self._logger.warning("%s", line)
+            with self._suppress(Exception), self._open(f"/tmp/sd_counters_{pid}.txt", "a") as f:
+                f.write(line + "\n")
+        except Exception as e:
+            with self._suppress(Exception), self._open(f"/tmp/sd_counters_{pid}.txt", "a") as f:
+                f.write(f"[SD-counters] {origin} READ FAILED: {e!r}\n")
 
 
 _RACE_COUNTERS: _RaceCounters | None = None

@@ -22,8 +22,10 @@ Run: python3 research/test_race_counters.py
 import ast
 import atexit
 import os
+import signal
 import sys
 import types
+from contextlib import suppress
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -75,6 +77,8 @@ def _make_namespace() -> dict:
         "torch": torch,
         "np": np,
         "os": os,
+        "signal": signal,
+        "suppress": suppress,
         "atexit": atexit,
         "logger": _Recorder(),
         "DeviceOperator": _DeviceOperatorStub,
@@ -136,6 +140,24 @@ def test_counters_accumulate_and_report(ns: dict) -> None:
     ctr.bump(1, torch.tensor(3, dtype=torch.int64))
     ctr.bump(2, torch.tensor(4, dtype=torch.int64))
     assert ctr.counts.tolist() == [3, 3, 4], ctr.counts.tolist()
+
+    # SIGUSR1 live readout: handler registered in __init__ must fire on the
+    # real signal and produce a logger line without setting `reported`
+    # semantics for later exit-time reports.
+    import time
+
+    os.kill(os.getpid(), signal.SIGUSR1)
+    for _ in range(50):
+        if any("sigusr1" in r for r in ns["logger"].records):
+            break
+        time.sleep(0.02)
+    line = next(r for r in ns["logger"].records if r.startswith("[SD-counters] sigusr1"))
+    assert "steps=2 c1=3 c2=3 c3=4" in line, line
+
+    # file fallback: same line must land in /tmp/sd_counters_<pid>.txt
+    fpath = f"/tmp/sd_counters_{os.getpid()}.txt"
+    assert "[SD-counters] sigusr1 steps=2 c1=3 c2=3 c3=4" in Path(fpath).read_text(), fpath
+
     ctr.report(origin="unit")
     line = ns["logger"].records[-1]
     assert line.startswith("[SD-counters] unit steps=2 c1=3 c2=3 c3=4"), line

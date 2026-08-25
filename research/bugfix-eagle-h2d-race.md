@@ -241,3 +241,27 @@ grep -E "SD-counters" experiments/out/serve-race-run2.log
 | 绿 + 全零 | 垃圾从未走值路径,但无 clamp 必崩(Run 1)→ 悖论入档,屏障故事复位且需解释"为何计数 kernel 不是屏障而 clamp kernel 是" |
 | 绿 + 混合 | 按 §2.7 矩阵部分解读(如 c1>0∧c2=0:毒落地但未被选中,崩因另寻) |
 | 崩 | clamp 在新代码下未能治愈(回归异常),贴 traceback |
+
+### 7.3 Run 2 结果:绿跑但读数丢失 → 读数机制改造(2026-08-25)
+
+**Run 2 结果**(NPU2,commit `23c1eece0`):**绿跑 8/8**(TTFT 194.7ms / ITL 25.8ms / accept 2.4945 双口径一致)——clamp 保活成立,计数器 engaged 行在(06:23:52);**但无读数行**:atexit 与 `__del__` 都没能产出输出。两个候选原因无法区分:①退出路径根本没触发(vllm EngineCore 的 shutdown 链可能绕过 Python atexit);②触发了但 `counts.tolist()`(NPU D2H)或 logger 在 shutdown 阶段已不可用,被 `except: pass` 静默吞掉。数据本身安全地累积在 device buffer 里,只是没取回。
+
+**机制改造**(三层,重跑即见效):
+1. **SIGUSR1 活体读数**:`_RaceCounters.__init__` 注册 SIGUSR1 handler——serve 存活期间任何时刻 `kill -USR1 <EngineCore pid>` 即刻 dump 计数(logger 保证健康);彻底绕开退出路径的全部不确定性;
+2. **文件双写**:report 同时 append `/tmp/sd_counters_<pid>.txt`;logger 死了文件还在;
+3. **异常显形**:D2H 失败不再静默,`READ FAILED: <异常>` 写入同一文件——重跑一次即可区分"没触发"vs"触发但失败"。
+
+harness 联动(`run_baseline_npu.sh` on_exit):**kill serve 之前自动向 EngineCore 发 USR1**(pid 从 serve log 的 `EngineCore pid=` 提取,sleep 2 落盘),SUMMARY 块新增 `counters:` 行(engaged 行除外,末 2 行)。计数未 engage 时 grep 无命中,无副作用。
+
+**重跑指令**(Run 2',与 Run 2 同配置):
+
+```bash
+# 宿主机先 git pull(含 USR1 机制),容器内:
+VLLM_ASCEND_SD_REVIVE_RACE=1 VLLM_ASCEND_SD_COUNTERS=1 VLLM_ASCEND_SD_DEBUG=clamp_next \
+  TIERS=16384 CONCS=1 bash research/run_baseline_npu.sh eagle3 8024
+# SUMMARY 块应含 counters: 行;或手工核对:
+grep "SD-counters" experiments/out/serve-npu-bf16-eagle3-k5.log
+cat /tmp/sd_counters_*.txt   # 兜底文件(含 READ FAILED 诊断)
+```
+
+判读矩阵不变(§7.2 表);USR1 在 bench 结束后触发,其后不再产生新数据,读数扰动无影响。

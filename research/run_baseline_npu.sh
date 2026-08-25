@@ -237,6 +237,18 @@ strip_log() {
 }
 
 on_exit() {
+  # [race counters] live readout BEFORE killing: the on-device c1/c2/c3
+  # accumulators (VLLM_ASCEND_SD_COUNTERS) dump on SIGUSR1 while the engine
+  # is alive - exit-time paths proved unreliable (Run 2). No-op when the
+  # counters never engaged (grep finds no pid line).
+  SERVE_LOG_EARLY="$OUTDIR/serve-$TAG.log"
+  if [ -s "$SERVE_LOG_EARLY" ]; then
+    ECPID=$(grep -oE "EngineCore pid=[0-9]+" "$SERVE_LOG_EARLY" | head -1 | grep -oE "[0-9]+")
+    if [ -n "${ECPID:-}" ] && kill -0 "$ECPID" 2>/dev/null; then
+      kill -USR1 "$ECPID" 2>/dev/null || true
+      sleep 2
+    fi
+  fi
   kill "$SERVE_PID" 2>/dev/null || true
   sleep 2
   echo ""
@@ -251,6 +263,8 @@ on_exit() {
   if [ -s "$SERVE_LOG" ]; then
     grep -E "Available KV cache memory|GPU KV cache size|model weights take|Maximum concurrency|Wrapping draft model|drafter FULL graph enabled|drafter sizes|Capturing CUDA graphs" \
       "$SERVE_LOG" | tail -6 | strip_log | sed 's/^/cfg: /'
+    # race-counter readout (last line wins; engaged lines excluded)
+    grep "SD-counters" "$SERVE_LOG" | grep -v "engaged" | tail -2 | strip_log | sed 's/^/counters: /' || true
   else
     echo "cfg: (serve log empty or missing at $SERVE_LOG)"
   fi
