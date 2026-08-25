@@ -56,8 +56,8 @@ errcode 0x800000: MTE accesses an invalid GM address
 |---|---|---|
 | clamp(双钳) | 过 | 垃圾确在两个 id 张量之一 |
 | sync_check(min/max 打印,host 同步) | 过 + 216 次全 ok + 零 BAD | 观察治愈竞态 → 写入是异步的、消费先跑 |
-| clamp_target(只钳 A) | **崩** | A 无辜 |
-| clamp_next(只钳 B) | **过** | **垃圾 carrier = 链 B 实锚** |
+| clamp_target(只钳 A) | **崩** | A 排除 |
+| clamp_next(只钳 B) | **过** | 链 B 与崩溃强关联——**注:这只证明"在 B 处插入时序扰动能救",不必然证明垃圾在 B 的值里**(值 carrier vs 时序屏障两种解释,见 §2.7;证据倾向后者) |
 
 ### 2.6 根因链闭合
 
@@ -76,19 +76,27 @@ eagle 头 embedding gather(GatherV2,表 151936×4096 bf16 = 1244659712 字节,�
 MTE invalid GM address → aivec 异常 → EE9999 → 引擎死亡
 ```
 
-时序细节(此前未强调):`seq_lens_list` 的 `.tolist()` 在拷贝前**排空了设备队列**——竞态不是"深队列插队",而是**每步在空闲设备上的 photo finish**:SDMA 拷贝(µs 级)与 host 随后几 µs 内发射的 where→scatter→gather 链几乎同时起跑。消费链长度(§3.2)= 给 SDMA 的落地缓冲垫:eagle 头 1 层 = 无垫;draft_model/dflash 的重前向 = 毫秒级垫。上下文长度两条作用:①chunked prefill 下 16K=8 块 vs 4K=2 块,= 4 倍次数的重复试验(实证);②每块伴随大量元数据 H2D,SDMA 侧可能拥塞(假设,未测)。
+时序勘误(2026-08-24 二次核查):此前"`tolist()` 排空队列 → 空闲设备 photo finish"的说法**不成立**——`gpu_input_batch.num_tokens_no_spec` 是 **CPU numpy**(`num_tokens_no_spec_cpu_tensor.numpy()`),对它 `.tolist()` 是纯 CPU 操作,不同步任何设备队列。真实时序:`where` 排在采样尾巴的 kernel 之后,SDMA 名义上有这段尾巴的时间落地拷贝——简单 copy-vs-where 模型下竞态反而应该**很难**输,与 16K 近 100% 必崩的事实矛盾(→ §2.7)。上下文长度两条作用不变:①chunked prefill 下 16K=8 块 vs 4K=2 块 = 4 倍次数的重复试验(实证);②每块伴随大量元数据 H2D,SDMA 侧可能拥塞(假设,未测)。
 
-### 2.7 开放问题:stale-value 悖论(诚实边界)
+### 2.7 开放问题:值故事的三重矛盾(诚实边界)
 
-上述模型有一个未闭合的逻辑洞:**`backup.gpu` 是 `torch.zeros_like` 初始化的持久 buffer**——若 where 只是"读在拷贝落地前",读到的应是零或上一步旧值(均为合法 id),不应是 0xa5a5(CANN 对**新分配**内存的毒化标记),也就不应越界。同 stream 下 where 的新分配输出张量也会被 where 完整写入,消费方同样不该看到毒。
+"垃圾经 `next_token_ids` 值传播"这条路径,累计有三个未闭合的逻辑洞:
+
+1. **stale-value 悖论**:`backup.gpu` 是 `torch.zeros_like` 初始化的持久 buffer——若 where 只是"读在拷贝落地前",读到的应是零或上一步旧值(均为合法 id),不应是 0xa5a5(CANN 对**新分配**内存的毒化标记),也就不应越界。
+2. **值传播与链长无关(用户连环追问引出)**:垃圾 int32 作为**值**穿过 where/scatter/CopyAndExpand 都不会出事,直到被当作**索引**(gather)才成为非法访存——"崩溃点(gather)≠竞态点(copy-vs-where)"。因此若垃圾真在 `next_token_ids` 值里,draft_model(Qwen3-0.6B embed 151936×1024)和 dflash(151936×4096)的 embedding gather 一样会越界崩——**"消费链长"不可能构成值免疫**。更进一步,`where` 是 `backup.gpu` 的唯一读者,且在**所有** padded 方法中的发射位置完全相同(都在采样尾巴后)——若竞态是 copy-vs-where,三方法的竞态窗口一模一样,"只有 eagle 崩"(§3.2)在该模型下**无法解释**。
+3. **选择条件稀有性**:`where` 仅对 `cond=false`(该行本步无任何有效采样 token,即被丢弃的请求)的行**选用** backup 值。正常跑完的 bench 里这种行即使有也极少;若垃圾必须经此选择路径传播,16K 的近 100% 必崩难以成立。
 
 两个候选微观机制(均未证实):
-- **(i) SDMA 微型 pinned 传输的异常/撕裂落地**,把毒化中间态写入目的 buffer;
-- **(ii) 乱序对根本不是 copy-vs-where**:真正失序的是别的一对(疑涉及新分配张量的相邻小 kernel,驱动级 launch 合并边角),而 blocking 拷贝恰好充当流上**全屏障**,把任何一对都串行化——统一解释修复有效、launch-blocking 有效、clamp 时序扰动有效。
+- **(i) SDMA 微型 pinned 传输的异常/撕裂落地**,把毒化中间态写入目的 buffer——但需同时解释洞 2/3(选择路径稀有却必崩);
+- **(ii) 乱序对根本不是 copy-vs-where**:真正失序的是别的一对(身份未定),而 blocking 拷贝、clamp_next 的插入 kernel、launch-blocking 的共同点是**在流上插入串行化/时序屏障**,把不管哪一对都隔开——统一解释全部翻转实验。"只有 eagle 崩"来自各方法调度形态差异(eagle 每步 µs 级密集发射 vs 重 drafter 拉长步间节奏),而非值传播路径长短。
 
-修复对两者皆对症(依赖缺失 + 确定性屏障,9/9 实证),不依赖分辨 (i)/(ii)。
+**当前证据倾向 (ii)**(三重矛盾都指向值路径可能从未发生),但 (i) 不能排除。修复对两者皆对症(依赖缺失处补确定性屏障 + 9/9 实证),不依赖分辨 (i)/(ii)。
 
-**判别实验(待做)**:device 侧 OOB 计数器——where 之后插 clamp+计数 kernel(纯 device,不加 host 同步,躲开海森堡),步末一次性 D2H 汇总。计数 >0 = 垃圾实流经 next_token_ids 值(支持 i);=0 = 垃圾另有产地、屏障才是修复本质(支持 ii)。
+**判别实验(三计数器版,零 host 同步,run 结束一次读走)**:
+- c1:copy 之后立即数 `backup.gpu` OOB(毒在不在 buffer 里;>0 支持 (i) 撕裂落地);
+- c2:数 `cond=false` 行数(backup 到底有没有被选中过;≈0 = 值传播路径不通,值故事出局);
+- c3:where 之后数 `next_token_ids` OOB(垃圾有没有流出去;c1>0 ∧ c2>0 ∧ c3>0 = 值故事全链闭合)。
+跑全绿 + 三计数全零 → 屏障故事定性;此后才值得猎"真正的乱序对"(候选:跨流 buffer 复用如 draft_token_ids 侧流、scatter-vs-gather 与图参数 update_stream 的交互)。
 
 ## 3. 三个"为什么"
 
@@ -107,16 +115,17 @@ MTE invalid GM address → aivec 异常 → EE9999 → 引擎死亡
 | draft_model(`net_slots=1`) | ✅ `uses_draft_model()` | **分支 B**:CopyAndExpandEagleInputs → 0.6B × K+2 步串行(即 plan A 图) | 27 cell 从未复现 |
 | ngram / suffix(host 提议器) | ❌(bookkeeping 后走 CPU list 路径,函数不被调用) | 无设备 buffer | **唯一结构性免疫** |
 
-**准确结论**:竞态拷贝被除 ngram/suffix 外的全部 padded 方法共享;draft_model/dflash 是"**共享毒源、消费链更长(B 分支多一跳算子 + 更重的头)、实测未爆**",不是免疫。修复作用于拷贝本身,同时拆掉 A/B 两条分支脚下的雷——这是本修复覆盖面大于表象证据(只有 eagle3 爆)的原因。
+**准确结论(2026-08-24 修正)**:竞态拷贝被除 ngram/suffix 外的全部 padded 方法共享。但"消费链长 → draft_model/dflash 未爆"的旧解释**不成立**:①值传播与链长无关(垃圾值会崩任何方法的词表 gather,见 §2.7 洞 2);②`where` 作为 backup 的唯一读者,在三方法中发射位置相同,链长连首读时序也影响不了。方法间差异在简单 copy-vs-where 模型下**无法解释**,是支持 §2.7 假设 (ii)(乱序对另有其人、修复实为屏障)的关键证据之一;方法差异更可能来自调度形态(eagle µs 级步节奏 vs 重 drafter 毫秒级)。修复作用于拷贝/屏障,对全部 padded 方法的保护不变。
 
 ### 3.3 为什么 16K 必现、4K 偶发?(机制假设,非实证)
 
-**已实证**:竞态存在(翻转实验)、carrier 是该拷贝(clamp 二分)、16K 近必现/4K 偶发(多轮复现)。
+**已实证**:竞态存在(翻转实验)、blocking 该拷贝即愈(9/9)、16K 近必现/4K 偶发(多轮复现)。
 
-**机制解释为最佳拟合假设**,两种可并存:
-1. **消费链密度(解释方法间差异)**:eagle 系从拷贝到 gather 只有几个轻 kernel + 1 层头,device 侧很快追上 SDMA;B 分支多一跳 AscendC 算子且头模型重,窗口天然宽。
-2. **SDMA 队列拥塞(解释长度间差异)**:16K/32K chunked prefill 每块产生大量 metadata H2D,backup 拷贝在 SDMA 队列里被排到后面、延迟拉大;4K 拷贝少,大概率在消费前落地。注意这与"计算队列深所以窗口宽"的直觉相反——计算队列深反而给拷贝更多时间,**拥塞必须发生在 SDMA 侧**才能解释观察。
-   (我们未直接测量 SDMA 延迟,该条为推断;修复不依赖此假设成立。)
+**机制解释(均为假设)**:
+1. **掷骰子次数(最扎实)**:chunked prefill 下 16K=8 块 vs 4K=2 块 = 4 倍次数的重复试验;decode 阶段 16K 的元数据 H2D 也更大更多。
+2. **SDMA 队列拥塞**:每块 prefill 伴随大量元数据 H2D,backup 拷贝在 SDMA 队列被排后(未测;注意计算队列深反而给拷贝更多时间,拥塞必须在 SDMA 侧才解释得通)。
+3. **方法间差异(eagle-only)**:无已证机制;调度形态假设见 §3.2/§2.7。
+   修复不依赖以上任何一条成立。
 
 ## 4. 修复
 
@@ -146,7 +155,8 @@ self.backup_next_token_ids.gpu[:num_reqs].copy_(
 4. **保持时序的探针是竞态二分的唯一姿势**:clamp(一次 elementwise)保时序,host 同步打印(sync_check)会治好竞态——只证明"异步写入存在",不能定位 carrier;两者配合,单张量 clamp 完成二分;
 5. **CUDA 直觉在 NPU 上要逐条验证**:non_blocking 拷贝、event、stream 语义是最容易踩的三件套(本项目已集齐:本 bug + D5 的 stream 上限);
 6. **竞态 bug 无法 UT 回归**:可复现配置 + 证据链 + 修复翻转就是验收物,PR 描述要写全(同 SD 收缩崩溃先例);
-7. **"干净空流"是深层故障的礼貌面具**:ok 判定必须看 [DONE] 与 token 数,harness 早已修对,这次直接受益。
+7. **"干净空流"是深层故障的礼貌面具**:ok 判定必须看 [DONE] 与 token 数,harness 早已修对,这次直接受益;
+8. **崩溃点 ≠ 竞态点,值传播 ≠ 时序传播**(用户连环追问引出):垃圾作为**值**穿过多少中间计算都无害,直到被当**索引**才炸(plog 指 gather 是崩溃点,不是竞态点);反过来,"在 X 插一个 kernel 就治好"只证明 X 处的**时序**与崩溃相关,不证明垃圾在 X 的值里——二分探针给的是**时序定位**,值定位需要无扰动的计数器。
 
 ## 6. 文件索引
 
