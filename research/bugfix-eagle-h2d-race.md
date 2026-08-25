@@ -7,6 +7,8 @@
 
 `prepare_next_token_ids_padded` 把一批"兜底 token id"用 pinned **非阻塞** H2D 拷贝送上 NPU;torch_npu 上这类拷贝走 SDMA 引擎,与发射流上后续计算 kernel 的先后顺序**没有保证**——输掉竞态时 `torch.where` 读到未初始化内存(0xa5a5a5a5,CANN 毒化标记),垃圾 id 混进 drafter 的 input_ids,词表规模的 embedding gather 拿垃圾当索引,越界读 GM,aivec 硬件异常,引擎死亡。
 
+> **终判(2026-08-25)**:三计数器实验闭合此案为**值故事**——c1=837(毒近乎常驻)× c2=7(backup 选择门稀有非零)× c3=1(流出 1 次即崩),clamp_next 的治愈实为值消毒而非时序屏障。详见 §2.7.1 与 §7。
+
 ## 1. 现象与误判
 
 1. **误判"16K 特异"**(与 SD 收缩崩溃同款教训):首跑 4K/c1 全绿、16K/32K 全灭。真相:4K 也中(同日 B 实验 4K 6/8,2 条"干净空流"),只是概率低;16K 深异步队列下近 100%。
@@ -97,6 +99,24 @@ MTE invalid GM address → aivec 异常 → EE9999 → 引擎死亡
 - c2:数 `cond=false` 行数(backup 到底有没有被选中过;≈0 = 值传播路径不通,值故事出局);
 - c3:where 之后数 `next_token_ids` OOB(垃圾有没有流出去;c1>0 ∧ c2>0 ∧ c3>0 = 值故事全链闭合)。
 跑全绿 + 三计数全零 → 屏障故事定性;此后才值得猎"真正的乱序对"(候选:跨流 buffer 复用如 draft_token_ids 侧流、scatter-vs-gather 与图参数 update_stream 的交互)。
+
+### 2.7.1 终判:值故事闭合(2026-08-25,三计数器实验执行完毕)
+
+**读数**(Run 2',NPU2,commit `ac2e4ab83`,revive+counters+clamp 保活,SIGUSR1 活体读数):
+
+```
+[SD-counters] sigusr1 steps=843 c1=837 c2=7 c3=1
+```
+
+**c1>0 ∧ c2>0 ∧ c3>0 → 值故事胜出,屏障假说出局**(执行记录与机制细节见 §7)。三重矛盾的消解:
+
+1. **stale-value 悖论消解(实测推翻前提)**:c1=837/843——毒在 buffer 里**近乎常驻**。"持久 buffer 读到的应是零或旧值"的前提不成立:non_blocking 拷贝在读时几乎总未(完整)落地,且毒化值一旦进入便持续存在(撕裂中间态/未落地期间从未被合法值覆盖)。微观机制(撕裂落地 vs cache 一致性 vs 落地次序)仍开放,但修复对症三者(blocking = host 等待完成,含全部同步语义)。
+2. **"只有 eagle 崩"的解释修正**:三方法共享 c1/c2 语义,但窗口命中率 = 试验次数 × 步节奏。eagle 每步 µs 级密集发射,单位时间试验次数远高于重 drafter(毫秒级)——不是值路径不同,是**掷骰子频率**不同。dflash 免疫的说法也随 §3.2 修正保留(结构性免疫仅 ngram)。
+3. **稀有性消解为三重门结构**:毒常驻(c1=837)× 门稀有(c2=7:cond=false 行)× 流出更稀有(c3=1:7 次开门仅 1 次撞毒)。单请求 bench 下每行 1 元素,7 次开门 1 次有毒——**c3=1 正是无 clamp 时的那一次崩溃**(Run 0/1 必崩,Run 2/2' 被 `_propose` 入口的 clamp 值消毒救下)。4K 偶发/16K 必现 = 步数即试验次数。
+
+**对 §2.5 判读表的追溯修正**:clamp_next"过"的机制是**值消毒**(把流出的垃圾钳进合法词表域),不是时序屏障——直接证据:同样插在 where 后、同样流上 elementwise/reduction 的 c3 计数 kernel(Run 1)**不**治愈(只数不改值)。教训 4 的"保时序探针"框架仍然成立,但"插入即屏障"的隐含假设被证伪。
+
+**修复语义的重述**:blocking 拷贝的本质不是"补时序屏障"而是**消灭源头**——拷贝同步落地 → buffer 恒合法 → c1 归零(可由 Run 3 直接验证,见 §7.4)→ 值路径全链枯竭。9/9 实证与此一致。
 
 ## 3. 三个"为什么"
 
@@ -265,3 +285,30 @@ cat /tmp/sd_counters_*.txt   # 兜底文件(含 READ FAILED 诊断)
 ```
 
 判读矩阵不变(§7.2 表);USR1 在 bench 结束后触发,其后不再产生新数据,读数扰动无影响。
+
+### 7.4 Run 2' 读数与终判(2026-08-25)
+
+**Run 2'**(NPU2,commit `ac2e4ab83`,与 Run 2 同配置 + USR1 机制):**绿跑 8/8**(TTFT 201.3 / ITL 25.8 / accept 2.4945,与 Run 2 一致),SIGUSR1 活体读数成功(serve log 与 `/tmp/sd_counters_<pid>.txt` 双写一致):
+
+```
+[SD-counters] sigusr1 steps=843 c1=837 c2=7 c3=1
+```
+
+**按 §7.2 矩阵判读:c1>0 ∧ c2>0 ∧ c3>0 → 值故事闭合**(详判与三重矛盾的消解见 §2.7.1)。要点:
+
+1. c1=837/843:毒近乎常驻(non_blocking 拷贝读时几乎总未完整落地);
+2. c2=7:backup 选择门(cond=false)稀有但非零——洞 3 的实测答案;
+3. c3=1:7 次开门 1 次撞毒;**无 clamp 时这 1 次即崩溃**(Run 0/1 必崩),clamp 值消毒救下(Run 2/2' 绿);
+4. Run 1 的"计数 kernel 不治愈"与"clamp 治愈"合并成钳:治愈靠改值不靠时序 → 屏障假说出局。
+
+### 7.5 Run 3(可选收官):fix 状态下 c1 应归零
+
+值故事预测:默认 fix(blocking)下拷贝同步落地 → buffer 恒合法 → **c1=0**(c2 仍可能有罕见非零,c3 应为 0)。这是"修复消灭源头"的直接读数:
+
+```bash
+# 不带 REVIVE_RACE、不带 clamp,纯 fix + counters:
+VLLM_ASCEND_SD_COUNTERS=1 TIERS=16384 CONCS=1 \
+  bash research/run_baseline_npu.sh eagle3 8025
+```
+
+预期绿跑 + `c1=0 c3=0`(c2 允许罕见非零——门本身与竞态无关)。若 c1>0 则说明毒源不止这一处拷贝,需再追(意外但高价值)。
