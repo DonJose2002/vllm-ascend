@@ -168,3 +168,44 @@ self.backup_next_token_ids.gpu[:num_reqs].copy_(
 | plog(`~/ascend/log/debug/plog/plog-<pid>_*.log`) | 证据 | fault kernel=GatherV2,0xa5a5 标记 |
 | 插桩 `VLLM_ASCEND_SD_DEBUG`(research 线保留,PR 线不含) | 工具 | clamp/clamp_target/clamp_next/sync_check |
 | `experiments/out/serve-npu-bf16-eagle3-k5.log` + SUMMARY 块 | 证据 | 9/9 全绿矩阵 |
+
+## 7. 三计数器判别实验(runbook,2026-08-25 实现)
+
+§2.7 设计的实现与执行手册。**实现**(research 线 commit `d978d01c9`,`llm_base_proposer.py`):两个独立 env + `_RaceCounters`(int64 device 累加,零 host 同步,run 末 atexit/`__del__` 一次 D2H 读走)+ `_oob_count` helper + CPU UT `research/test_race_counters.py`(ast 抽取真实源码节点验证:scenario A 模拟值故事端到端 c1=c2=c3=1 精确恢复;scenario B 修复路径只 c2 增;scenario C 全关零计数)。
+
+| env | 语义 |
+|---|---|
+| `VLLM_ASCEND_SD_REVIVE_RACE=1` | 拷贝点复活原始竞态路径(`CpuGpuBuffer.copy_to_gpu()`,整缓冲 non_blocking);默认关 = blocking 修复生效 |
+| `VLLM_ASCEND_SD_COUNTERS=1` | 启用 c1/c2/c3 计数(steps 为 host 侧纯计数,计数 kernel 与 clamp 探针同为保时序 device 归约) |
+
+两开关独立是**故意的**:Run 0 只复活竞态不加计数,对照"计数 kernel 自身治愈竞态"的混淆(clamp_next 教训)。
+
+**执行顺序**(16K 复现配置,eagle3 K=5,修前 4/4 必崩;工作区遮蔽 → 宿主机 pull 即生效,serve 期间禁切分支):
+
+```bash
+# 服务器容器内(先宿主机 git pull):
+# Run 0 对照:预期仍崩(复现成立)。不崩 = 复现条件漂移,停下重估,勿继续解读
+VLLM_ASCEND_SD_REVIVE_RACE=1 TIERS=16384 CONCS=1 \
+  NPUS=<id> bash research/run_baseline_npu.sh eagle3 8021
+cp experiments/out/serve-npu-bf16-eagle3-k5.log experiments/out/serve-race-run0.log
+
+# Run 1 实验:跑 ≥2 次(换卡/重跑),判读矩阵见 §2.7
+VLLM_ASCEND_SD_REVIVE_RACE=1 VLLM_ASCEND_SD_COUNTERS=1 TIERS=16384 CONCS=1 \
+  NPUS=<id> bash research/run_baseline_npu.sh eagle3 8022
+cp experiments/out/serve-npu-bf16-eagle3-k5.log experiments/out/serve-race-run1.log
+
+# 证据收集(两个 run 都要):
+grep -E "SD-counters" experiments/out/serve-race-run*.log
+```
+
+**读数语义**:serve 进程退出时(atexit 或 proposer `__del__` 双保险)打一行
+`[SD-counters] <origin> steps=N c1=X c2=Y c3=Z`。硬崩(aivec 原生故障)两路都不触发——**崩本身即数据点**(计数 kernel 未治愈竞态,对照 clamp_next 先例解读)。SUMMARY 块照常贴回。
+
+**判读速查**(详矩阵见 §2.7):
+
+| 观测 | 结论 |
+|---|---|
+| Run 1 绿 + 三计数全零 | **屏障故事定性**:垃圾从未走值路径;下一步猎真正乱序对(候选:draft_token_ids 侧流 / update_stream / scatter-vs-gather 与图参数交互) |
+| Run 1 绿 + c1>0 ∧ c2>0 ∧ c3>0 | **值故事闭合**(撕裂落地→被选中→流出,三环齐证) |
+| Run 1 绿 + 混合(如 c1>0 ∧ c2=0) | 毒落地但从未被选中 → 值路径不通,倒向屏障故事;c1 单独成立则"撕裂落地"机制局部成立 |
+| Run 1 崩 | 计数归约未能如 clamp_next 般治愈 → 插入点时序不足以隔开乱序对;结合 Run 0 是否崩一起入档 |
