@@ -11,6 +11,14 @@
 # Layout decision: all Phase-1 output goes to experiments/out/phase1/ (E3 under
 # e3-1p7b/) so Phase-0 JSONs in experiments/out/ are never clobbered - the E2
 # planA-k5 and E3 sda-k5 tags would otherwise reuse Phase-0 filenames.
+#
+# [incident 2026-08-25] first e1 run wedged the shared server. Root cause
+# candidates (unconfirmed, host died): the per-run teardown (kill SERVE_PID +
+# sleep 2) underestimates engine death time, so back-to-back serves overlap and
+# stack host RAM (weights + pinned pools + compile caches per cold start); a
+# crash core-dump of a huge engine could also fill the disk. Guards added
+# below - same family of lesson as the D5 `-j=192` incident: batch drivers
+# must model resource dimensions, not just wall time.
 set -uo pipefail
 
 BATCH="${1:?usage: run_phase1.sh e1|e2|e3|all [start_port]}"
@@ -20,8 +28,93 @@ NPU_DRAFT17="${NPU_DRAFT17:-/nfs-share/hf_weights/Qwen3-1.7B}"
 mkdir -p "$OUTROOT"
 MASTER="$OUTROOT/phase1-${BATCH}-$(date +%Y%m%d-%H%M).log"
 
+# --- resource safety guards (see incident note above) ---
+ulimit -c 0 2>/dev/null || true   # never core-dump a huge engine onto shared disks
+export TORCHINDUCTOR_COMPILE_THREADS="${TORCHINDUCTOR_COMPILE_THREADS:-16}"
+FREE_MEM_MIN_MB="${FREE_MEM_MIN_MB:-40000}"   # host available-RAM floor before each serve
+DRAIN_WAIT_MAX="${DRAIN_WAIT_MAX:-900}"       # max seconds to wait for the card to drain
+HBM_DRAINED_MB="${HBM_DRAINED_MB:-6144}"      # same threshold the harness preflight uses
+
 # Guard: never let the race-research envs leak into Phase-1 measurements.
 unset VLLM_ASCEND_SD_REVIVE_RACE VLLM_ASCEND_SD_COUNTERS VLLM_ASCEND_SD_DEBUG || true
+
+npu_hbm_list() {
+  python3 - <<'PYEOF'
+import re, subprocess
+try:
+    out = subprocess.run(["npu-smi", "info"], capture_output=True, text=True, timeout=15).stdout
+except Exception as e:
+    print(f"PARSE-FAIL: npu-smi info failed: {e}")
+    raise SystemExit(0)
+cur, found = None, False
+for line in out.splitlines():
+    m = re.match(r"^\|\s*(\d+)\s+\S+\s+\|\s*(OK|Warning|Alarm|Crit\w*|Unknown|Bad)", line)
+    if m:
+        cur = int(m.group(1))
+        continue
+    if cur is not None and re.search(r"[0-9A-Fa-f]{4}:[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}\.[0-9A-Fa-f]", line):
+        pairs = re.findall(r"(\d+)\s*/\s*(\d+)", line)
+        if pairs:
+            used, _total = pairs[-1]
+            print(f"{cur} {used}")
+            found = True
+if not found:
+    print("PARSE-FAIL: no device blocks parsed")
+PYEOF
+}
+
+card_hbm() { npu_hbm_list | awk -v id="$1" '$1==id{print $2}'; }
+
+pin_npus() {
+  # One card for the WHOLE batch: without pinning, each child invocation
+  # re-runs auto-pick and can hop onto a different card when the previous
+  # engine is still dying - hiding the overlap instead of preventing it.
+  if [ -z "${NPUS:-}" ]; then
+    local dev_list pick
+    dev_list="$(npu_hbm_list)"
+    case "$dev_list" in
+      PARSE-FAIL*)
+        echo "$dev_list" | tee -a "$MASTER"
+        echo "Cannot read NPU occupancy; set NPUS=<id> explicitly." | tee -a "$MASTER"
+        exit 1
+        ;;
+    esac
+    pick=$(echo "$dev_list" | awk '{if(!($1 in mx)||$2>mx[$1])mx[$1]=$2} END{best="";for(id in mx){if(best==""||mx[id]<bestv){best=id;bestv=mx[id]}}print best}')
+    export NPUS="$pick"
+    echo "PINNED: NPUS=$NPUS for the whole batch (auto-picked lowest-HBM card)" | tee -a "$MASTER"
+  else
+    echo "PINNED: NPUS=$NPUS (user-specified) for the whole batch" | tee -a "$MASTER"
+  fi
+}
+
+wait_host_ram() {
+  while :; do
+    local avail
+    avail=$(free -m 2>/dev/null | awk '/^Mem:/{print $7}')
+    [ -z "$avail" ] && return 0  # free unreadable -> skip guard rather than block
+    [ "$avail" -ge "$FREE_MEM_MIN_MB" ] && return 0
+    echo "WAIT: host available RAM ${avail}MB < ${FREE_MEM_MIN_MB}MB $(date +%H:%M:%S)" | tee -a "$MASTER"
+    sleep 30
+  done
+}
+
+drain_card() {
+  # Wait until OUR pinned card actually released its HBM before the next
+  # serve claims ~58GB - the sleep-2 of the child teardown is nowhere near
+  # enough for an engine to die. Timeout -> hard-kill anything still holding
+  # our port (port is unique per run, so the match only ever hits our own
+  # processes on this shared server).
+  local deadline=$(( $(date +%s) + DRAIN_WAIT_MAX )) used
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    used=$(card_hbm "$NPUS"); used="${used:-0}"
+    [ "$used" -le "$HBM_DRAINED_MB" ] && { echo "DRAIN-OK: NPU $NPUS at ${used}MB $(date +%H:%M:%S)" | tee -a "$MASTER"; return 0; }
+    sleep 15
+  done
+  echo "DRAIN-TIMEOUT (${DRAIN_WAIT_MAX}s): NPU $NPUS still at ${used}MB - hard-killing leftovers on port $PORT" | tee -a "$MASTER"
+  pkill -KILL -f "vllm serve.*--port $PORT" 2>/dev/null || true
+  sleep 30
+}
+
 
 banner() { printf '\n===== %s =====\n' "$*" | tee -a "$MASTER"; }
 
@@ -32,10 +125,14 @@ run() {
   if [ -n "${RUN_SUBDIR:-}" ]; then outdir="$OUTROOT/$RUN_SUBDIR"; mkdir -p "$outdir"; fi
   PORT=$((PORT + 1))
   banner "RUN mode=$mode tiers=$tiers concs=$concs port=$PORT outdir=$outdir envs=$* $(date +%H:%M:%S)"
+  wait_host_ram
   env -u VLLM_ASCEND_SD_REVIVE_RACE -u VLLM_ASCEND_SD_COUNTERS -u VLLM_ASCEND_SD_DEBUG \
     "$@" TIERS="$tiers" CONCS="$concs" SAVE_TS=1 OUTDIR="$outdir" \
     bash research/run_baseline_npu.sh "$mode" "$PORT" 2>&1 | tee -a "$MASTER"
-  sleep 5  # let the port settle before the next serve
+  # post-run: catch a still-dying API server by our unique port, then wait
+  # for the pinned card to actually drain before the next serve claims it
+  pkill -TERM -f "vllm serve.*--port $PORT" 2>/dev/null || true
+  drain_card
 }
 
 digest() {
@@ -80,7 +177,9 @@ digest() {
   banner "PHASE1 BATCH=$BATCH host=$(hostname) $(date)"
   echo "repo: $(git rev-parse --abbrev-ref HEAD) @ $(git rev-parse --short HEAD) - $(git log -1 --format=%s)"
   echo "model: ${NPU_MODEL:-/nfs-share/hf_weights/Qwen3-8B} draft17: $NPU_DRAFT17"
+  echo "guards: FREE_MEM_MIN_MB=$FREE_MEM_MIN_MB DRAIN_WAIT_MAX=${DRAIN_WAIT_MAX}s HBM_DRAINED_MB=$HBM_DRAINED_MB"
 } | tee -a "$MASTER"
+pin_npus
 
 case "$BATCH" in
   e1|all)
