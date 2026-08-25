@@ -169,9 +169,11 @@ TAG="npu-bf16-dense"
 NOTE="910B3 x1, v0.23.0 docker, bf16, block_size=128; 32K tier NPU-only (model max_pos=40960)"
 BENCH_EXTRA=()
 
-if [ "$SEED_PROFILE" != "generic" ]; then
-  TAG="$TAG-$SEED_PROFILE"
-fi
+# NOTE: the seed-profile suffix is appended AFTER the mode case below - it
+# used to be applied here, and every case-branch TAG= assignment (sd/ngram/
+# eagle3/...) silently dropped it, so a repetitive-profile run clobbered the
+# generic-profile JSON of the same mode (phase1 incident 2026-08-25: ngram
+# generic 4 cells lost this way).
 if [ "${SAVE_TS:-0}" = "1" ]; then
   BENCH_EXTRA+=(--save-ts)
 fi
@@ -231,6 +233,12 @@ case "$MODE" in
     echo "unknown MODE '$MODE' (dense|sd|sda|ngram|eagle3|dflash)"; exit 1
     ;;
 esac
+
+# Append the seed-profile suffix to the FINAL tag (post-case; see note above).
+if [ "$SEED_PROFILE" != "generic" ]; then
+  TAG="$TAG-$SEED_PROFILE"
+  NOTE="$NOTE; seed_profile=$SEED_PROFILE"
+fi
 
 strip_log() {
   sed -E 's/^\((APIServer|EngineCore) pid=[0-9]+\) //; s/(INFO|ERROR|WARNING) [0-9]{2}-[0-9]{2} [0-9:]{8} \[[^]]*\] //'

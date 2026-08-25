@@ -4,9 +4,11 @@
 # runs unattended; collects every SUMMARY block into a master log and prints a
 # paste-ready digest (per-JSON TSV + kregress/diff/KV-tax lines) at the end.
 #
-# Usage:  bash research/run_phase1.sh e1|e2|e3|all [start_port]
+# Usage:  bash research/run_phase1.sh e1|e2|e3|all|digest [start_port]
 # Night 1: e1 (K sweep, 16 cells, ~1h)      Night 2: e2 (22 cells, ~2h)
 # E3 requires Qwen3-1.7B at $NPU_DRAFT17 (default /nfs-share/hf_weights/Qwen3-1.7B).
+# digest: analysis only (summary + kregress + diff + KV tax) over whatever
+#         JSONs already sit under experiments/out/phase1 - no serves, no card.
 #
 # Layout decision: all Phase-1 output goes to experiments/out/phase1/ (E3 under
 # e3-1p7b/) so Phase-0 JSONs in experiments/out/ are never clobbered - the E2
@@ -140,32 +142,39 @@ digest() {
   local jsons
   jsons=$(ls "$OUTROOT"/*.json "$OUTROOT"/*/*.json 2>/dev/null | sort -u)
   [ -z "$jsons" ] && { echo "no JSONs found under $OUTROOT" | tee -a "$MASTER"; return; }
+  # keep only files that exist: a missing member must degrade the digest,
+  # never crash it (phase1 incident 2026-08-25: the overwritten ngram file
+  # made the hardcoded diff list throw FileNotFoundError and took the whole
+  # digest section down with it)
+  local k_files=() d_files=() f
+  for f in \
+    "$OUTROOT"/baseline-npu-qwen3-8b-npu-bf16-sd-k1-planA.json \
+    "$OUTROOT"/baseline-npu-qwen3-8b-npu-bf16-sd-k3-planA.json \
+    "$OUTROOT"/baseline-npu-qwen3-8b-npu-bf16-sd-k5-planA.json \
+    "$OUTROOT"/baseline-npu-qwen3-8b-npu-bf16-sd-k8-planA.json; do
+    [ -f "$f" ] && k_files+=("$f")
+  done
+  for f in \
+    "$OUTROOT"/baseline-npu-qwen3-8b-npu-bf16-dense.json \
+    "$OUTROOT"/baseline-npu-qwen3-8b-npu-bf16-sd-k5-planA.json \
+    "$OUTROOT"/baseline-npu-qwen3-8b-npu-bf16-ngram-k5.json \
+    "$OUTROOT"/baseline-npu-qwen3-8b-npu-bf16-ngram-k5-repetitive.json \
+    "$OUTROOT"/baseline-npu-qwen3-8b-npu-bf16-eagle3-k5.json \
+    "$OUTROOT"/baseline-npu-qwen3-8b-npu-bf16-dflash-k5.json; do
+    [ -f "$f" ] && d_files+=("$f")
+  done
   {
     echo "--- per-file TSV ---"
     python3 research/bench_baseline.py summary $jsons
     echo
-    case "$BATCH" in
-      e1|all)
-        echo "--- E1 kregress ---"
-        python3 research/bench_baseline.py kregress \
-          "$OUTROOT"/baseline-npu-qwen3-8b-npu-bf16-sd-k1-planA.json \
-          "$OUTROOT"/baseline-npu-qwen3-8b-npu-bf16-sd-k3-planA.json \
-          "$OUTROOT"/baseline-npu-qwen3-8b-npu-bf16-sd-k5-planA.json \
-          "$OUTROOT"/baseline-npu-qwen3-8b-npu-bf16-sd-k8-planA.json 2>&1
-        ;;
-    esac
-    case "$BATCH" in
-      e2|all)
-        echo "--- E2 diff (dense | planA | ngram | eagle3 | dflash) ---"
-        python3 research/bench_baseline.py diff \
-          "$OUTROOT"/baseline-npu-qwen3-8b-npu-bf16-dense.json \
-          "$OUTROOT"/baseline-npu-qwen3-8b-npu-bf16-sd-k5-planA.json \
-          "$OUTROOT"/baseline-npu-qwen3-8b-npu-bf16-ngram-k5.json \
-          "$OUTROOT"/baseline-npu-qwen3-8b-npu-bf16-ngram-k5-repetitive.json \
-          "$OUTROOT"/baseline-npu-qwen3-8b-npu-bf16-eagle3-k5.json \
-          "$OUTROOT"/baseline-npu-qwen3-8b-npu-bf16-dflash-k5.json 2>&1
-        ;;
-    esac
+    if [ "${#k_files[@]}" -ge 2 ]; then
+      echo "--- E1 kregress ---"
+      python3 research/bench_baseline.py kregress "${k_files[@]}" 2>&1
+    fi
+    if [ "${#d_files[@]}" -ge 2 ]; then
+      echo "--- E2 diff (${#d_files[@]} files) ---"
+      python3 research/bench_baseline.py diff "${d_files[@]}" 2>&1
+    fi
     echo
     echo "--- E4 KV tax (per serve log) ---"
     grep -H "GPU KV cache size" "$OUTROOT"/serve-*.log "$OUTROOT"/*/serve-*.log 2>/dev/null \
@@ -179,7 +188,8 @@ digest() {
   echo "model: ${NPU_MODEL:-/nfs-share/hf_weights/Qwen3-8B} draft17: $NPU_DRAFT17"
   echo "guards: FREE_MEM_MIN_MB=$FREE_MEM_MIN_MB DRAIN_WAIT_MAX=${DRAIN_WAIT_MAX}s HBM_DRAINED_MB=$HBM_DRAINED_MB"
 } | tee -a "$MASTER"
-pin_npus
+# digest-only mode runs nothing -> no card pinning needed
+[ "$BATCH" != "digest" ] && pin_npus
 
 case "$BATCH" in
   e1|all)
