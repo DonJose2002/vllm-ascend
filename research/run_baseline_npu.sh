@@ -245,10 +245,9 @@ strip_log() {
 }
 
 on_exit() {
-  # [race counters] live readout BEFORE killing: the on-device c1/c2/c3
-  # accumulators (VLLM_ASCEND_SD_COUNTERS) dump on SIGUSR1 while the engine
-  # is alive - exit-time paths proved unreliable (Run 2). No-op when the
-  # counters never engaged (grep finds no pid line).
+  # Robust to early exits (preflight failures abort before SERVE_PID exists;
+  # with set -u an unset var here would crash the trap itself and bury the
+  # real failure message in a flash) - hence ${SERVE_PID:-} guards.
   SERVE_LOG_EARLY="$OUTDIR/serve-$TAG.log"
   if [ -s "$SERVE_LOG_EARLY" ]; then
     ECPID=$(grep -oE "EngineCore pid=[0-9]+" "$SERVE_LOG_EARLY" | head -1 | grep -oE "[0-9]+")
@@ -257,7 +256,7 @@ on_exit() {
       sleep 2
     fi
   fi
-  kill "$SERVE_PID" 2>/dev/null || true
+  [ -n "${SERVE_PID:-}" ] && kill "$SERVE_PID" 2>/dev/null || true
   sleep 2
   echo ""
   echo "==================== COPY BELOW (between markers) ===================="
