@@ -70,10 +70,25 @@ prepare_next_token_ids_padded (llm_base_proposer.py):
 set_inputs_first_pass eagle 分支:
   self.input_ids[token_indices_to_sample] = next_token_ids      # 垃圾 scatter 进 drafter 输入
       ↓
-eagle 头 embedding gather(GatherV2,词表 151936 表)
+eagle 头 embedding gather(GatherV2,表 151936×4096 bf16 = 1244659712 字节,与 plog dump 吻合;
+                          32000 缩减词表只在输出侧 lm_head,输入侧无映射)
       ↓ 垃圾 id(0xa5a5...) 越界索引
 MTE invalid GM address → aivec 异常 → EE9999 → 引擎死亡
 ```
+
+时序细节(此前未强调):`seq_lens_list` 的 `.tolist()` 在拷贝前**排空了设备队列**——竞态不是"深队列插队",而是**每步在空闲设备上的 photo finish**:SDMA 拷贝(µs 级)与 host 随后几 µs 内发射的 where→scatter→gather 链几乎同时起跑。消费链长度(§3.2)= 给 SDMA 的落地缓冲垫:eagle 头 1 层 = 无垫;draft_model/dflash 的重前向 = 毫秒级垫。上下文长度两条作用:①chunked prefill 下 16K=8 块 vs 4K=2 块,= 4 倍次数的重复试验(实证);②每块伴随大量元数据 H2D,SDMA 侧可能拥塞(假设,未测)。
+
+### 2.7 开放问题:stale-value 悖论(诚实边界)
+
+上述模型有一个未闭合的逻辑洞:**`backup.gpu` 是 `torch.zeros_like` 初始化的持久 buffer**——若 where 只是"读在拷贝落地前",读到的应是零或上一步旧值(均为合法 id),不应是 0xa5a5(CANN 对**新分配**内存的毒化标记),也就不应越界。同 stream 下 where 的新分配输出张量也会被 where 完整写入,消费方同样不该看到毒。
+
+两个候选微观机制(均未证实):
+- **(i) SDMA 微型 pinned 传输的异常/撕裂落地**,把毒化中间态写入目的 buffer;
+- **(ii) 乱序对根本不是 copy-vs-where**:真正失序的是别的一对(疑涉及新分配张量的相邻小 kernel,驱动级 launch 合并边角),而 blocking 拷贝恰好充当流上**全屏障**,把任何一对都串行化——统一解释修复有效、launch-blocking 有效、clamp 时序扰动有效。
+
+修复对两者皆对症(依赖缺失 + 确定性屏障,9/9 实证),不依赖分辨 (i)/(ii)。
+
+**判别实验(待做)**:device 侧 OOB 计数器——where 之后插 clamp+计数 kernel(纯 device,不加 host 同步,躲开海森堡),步末一次性 D2H 汇总。计数 >0 = 垃圾实流经 next_token_ids 值(支持 i);=0 = 垃圾另有产地、屏障才是修复本质(支持 ii)。
 
 ## 3. 三个"为什么"
 
