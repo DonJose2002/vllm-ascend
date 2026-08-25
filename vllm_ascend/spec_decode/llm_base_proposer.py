@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+import atexit
 import copy
 import os
 from collections.abc import Callable
@@ -80,6 +81,94 @@ _PREPARE_INPUTS_BLOCK_SIZE = 4
 # [research instrumentation 2026-08-24] eagle3 16K aivec crash triage probes.
 # "off" (default) | "clamp" | "sync_check" | "both"; see _propose docstring.
 _SD_DEBUG = os.getenv("VLLM_ASCEND_SD_DEBUG", "off")
+
+# [research instrumentation 2026-08-25] three-counter discriminating experiment
+# for the eagle H2D race; design and verdict matrix in
+# research/bugfix-eagle-h2d-race.md §2.7. Research-only, never lands on PR
+# branches. Two independent switches so a control run can revive the race
+# WITHOUT the counting kernels (probe-induced-heal control, the clamp_next
+# lesson):
+#   VLLM_ASCEND_SD_REVIVE_RACE=1  backup H2D reverts to the original
+#                                 non_blocking CpuGpuBuffer.copy_to_gpu()
+#   VLLM_ASCEND_SD_COUNTERS=1     count c1/c2/c3 on-device (zero host sync)
+# c1 = OOB ids in backup.gpu[:num_reqs] right after the copy (torn SDMA
+#      payload landed in the buffer?)
+# c2 = rows where the where() cond is False (backup value ever selected?)
+# c3 = OOB ids in next_token_ids after the where() (garbage flowed out?)
+# Verdict: green run + all-zero -> barrier story (fix works as a timing
+# barrier, garbage never rides the value path); c1>0 and c2>0 and c3>0 ->
+# value story closed. A hard crash reads nothing: the crash itself is the
+# datapoint (counting kernels failed to heal, cf. clamp_next).
+
+
+def _env_flag(name: str) -> bool:
+    return os.getenv(name, "0") == "1"
+
+
+_SD_REVIVE_RACE = _env_flag("VLLM_ASCEND_SD_REVIVE_RACE")
+_SD_COUNTERS = _env_flag("VLLM_ASCEND_SD_COUNTERS")
+
+
+class _RaceCounters:
+    """Persistent on-device accumulators for the H2D-race probes.
+
+    Counting must not perturb timing: c1/c2/c3 accumulate in an int64 device
+    tensor via in-place indexed adds (no host sync); the single D2H read
+    happens at process exit. atexit covers normal shutdown and engine-fatal
+    exits that still unwind Python; the proposer's __del__ is the second
+    chance. A native crash (aivec fault) fires neither - accepted, the crash
+    is its own datapoint. Telemetry paths are defensive: interpreter globals
+    may already be cleared when report() fires.
+    """
+
+    def __init__(self) -> None:
+        # Pre-bind names that may vanish during interpreter teardown.
+        self._torch = torch
+        self._logger = logger
+        self.counts: torch.Tensor | None = None
+        self.steps = 0
+        self.reported = False
+        atexit.register(self.report, origin="atexit")
+
+    def bump(self, idx: int, delta: torch.Tensor) -> None:
+        """Accumulate a 0-dim device tensor delta; stays on device."""
+        if self.counts is None:
+            self.counts = self._torch.zeros(3, dtype=self._torch.int64, device=delta.device)
+        self.counts[idx] += delta
+
+    def report(self, origin: str = "unknown") -> None:
+        if self.reported or self.counts is None:
+            return
+        self.reported = True
+        try:
+            c1, c2, c3 = self.counts.tolist()
+            self._logger.warning(
+                "[SD-counters] %s steps=%d c1=%d c2=%d c3=%d "
+                "(c1=backup.gpu OOB after copy; c2=where-cond-false rows; "
+                "c3=next_token_ids OOB after where)",
+                origin,
+                self.steps,
+                c1,
+                c2,
+                c3,
+            )
+        except Exception:
+            pass
+
+
+_RACE_COUNTERS: _RaceCounters | None = None
+
+
+def _get_race_counters() -> _RaceCounters:
+    global _RACE_COUNTERS
+    if _RACE_COUNTERS is None:
+        _RACE_COUNTERS = _RaceCounters()
+    return _RACE_COUNTERS
+
+
+def _oob_count(t: torch.Tensor, vocab: int) -> torch.Tensor:
+    """0-dim device count of out-of-vocab elements; no host sync."""
+    return ((t < 0) | (t >= vocab)).sum()
 
 
 # TODO: Remove it when the bug of fx-graph is solved
@@ -321,6 +410,18 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         self.token_arange_np = np.arange(self.max_num_tokens + 1, dtype=np.int32)
         self.enable_enpu = self.runner.enable_enpu
         self.use_eagle = self.runner.use_eagle
+
+    def __del__(self) -> None:
+        # [research instrumentation 2026-08-25] second chance to read the race
+        # counters if the proposer is GC'd before interpreter exit (atexit is
+        # the primary path). Defensive by necessity: during teardown the
+        # module globals this touches may already be cleared.
+        try:
+            ctr = globals().get("_RACE_COUNTERS")
+            if ctr is not None:
+                ctr.report(origin="__del__")
+        except Exception:
+            pass
 
     def _raise_if_padded_drafter_batch_disabled_and_full_graph_enabled(self):
         if (
@@ -1909,18 +2010,34 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         self.backup_next_token_ids.np[:num_reqs] = np.array(
             [requests[gpu_input_batch.req_ids[i]].get_token_id(seq_lens_list[i]) for i in range(num_reqs)]
         )
-        # [fix 2026-08-24] CpuGpuBuffer.copy_to_gpu uses non_blocking=True; on
-        # torch_npu the pinned H2D rides the SDMA engine whose ordering w.r.t.
-        # later compute kernels on the launch stream is not guaranteed. The
-        # garbage (0xa5a5 uninit marker) then rides next_token_ids into the
-        # vocab-sized embedding gather inside the drafter and faults the
-        # vector core (aivec MTE invalid GM address, EE9999) - 100% repro at
-        # 16K prompts with eagle-family drafters, intermittent at 4K;
-        # ASCEND_LAUNCH_BLOCKING=1 hiding it confirmed the race. Payload is
-        # num_reqs int32 (<1KB) - a blocking copy is effectively free.
-        self.backup_next_token_ids.gpu[:num_reqs].copy_(
-            self.backup_next_token_ids.cpu[:num_reqs], non_blocking=False
-        )
+        # [research instrumentation 2026-08-25] three-counter probe hook, see
+        # _RaceCounters at module top. steps is a plain host int (no device
+        # traffic); the c1 bump is a timing-preserving on-device reduction
+        # queued right after the copy - same probe discipline as the clamp
+        # bisect.
+        _ctr = _get_race_counters() if _SD_COUNTERS else None
+        if _ctr is not None:
+            _ctr.steps += 1
+        if _SD_REVIVE_RACE:
+            # research-only: the exact original racy path (full-buffer pinned
+            # non_blocking H2D via CpuGpuBuffer.copy_to_gpu). Default off;
+            # the blocking fix below stays active.
+            self.backup_next_token_ids.copy_to_gpu()
+        else:
+            # [fix 2026-08-24] CpuGpuBuffer.copy_to_gpu uses non_blocking=True; on
+            # torch_npu the pinned H2D rides the SDMA engine whose ordering w.r.t.
+            # later compute kernels on the launch stream is not guaranteed. The
+            # garbage (0xa5a5 uninit marker) then rides next_token_ids into the
+            # vocab-sized embedding gather inside the drafter and faults the
+            # vector core (aivec MTE invalid GM address, EE9999) - 100% repro at
+            # 16K prompts with eagle-family drafters, intermittent at 4K;
+            # ASCEND_LAUNCH_BLOCKING=1 hiding it confirmed the race. Payload is
+            # num_reqs int32 (<1KB) - a blocking copy is effectively free.
+            self.backup_next_token_ids.gpu[:num_reqs].copy_(
+                self.backup_next_token_ids.cpu[:num_reqs], non_blocking=False
+            )
+        if _ctr is not None:
+            _ctr.bump(0, _oob_count(self.backup_next_token_ids.gpu[:num_reqs], gpu_input_batch.vocab_size))
 
         # Mask out the sampled tokens indices that should not be sampled.
         discard_sampled_tokens_req_indices = discard_request_indices[:num_discarded_requests]
@@ -1954,6 +2071,11 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             selected_tokens,
             self.backup_next_token_ids.gpu[:batch_size],
         )
+        if _ctr is not None:
+            # [research instrumentation 2026-08-25] c2 = backup-selected rows,
+            # c3 = garbage that actually flowed out of the where().
+            _ctr.bump(1, (last_valid_indices == -1).sum())
+            _ctr.bump(2, _oob_count(next_token_ids, gpu_input_batch.vocab_size))
 
         return next_token_ids, valid_sampled_tokens_count
 
