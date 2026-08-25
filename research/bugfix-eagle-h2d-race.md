@@ -177,6 +177,44 @@ MTE invalid GM address → aivec 异常 → EE9999 → 引擎死亡
 3. **方法间差异(eagle-only)**:无已证机制;调度形态假设见 §3.2/§2.7。
    修复不依赖以上任何一条成立。
 
+> **勘误(2026-08-25,计数器数据后)**:计数器实证门开次数与上下文长度**无关**(8 请求 → 两档都是 ~7 次,门开只由请求边界决定)——上文"4 倍次数"的试验计法不成立,第 1 条降级。真实差异在**边界步的窗口构成**(16K 的 SDMA 队列更深),详见 §3.4。
+
+### 3.4 窗口模型与未证假设存档(2026-08-25 讨论定格;验证搁置,仅存档)
+
+**窗口定义——所有方法/长度差异的唯一容身之处**:
+
+```
+窗口 = [backup 拷贝入队(host)] → [where 实际执行(device)],两条硬件队列赛跑:
+  表 A(拷贝落地)= SDMA 队列积压(本步已发射未落地的 H2D)+ 传输时间
+  表 B(where 执行)= 计算队列积压(采样尾巴的 kernel)
+逃逸 ⟺ 表 B < 表 A(拷贝输)∧ 该步门开(cond=false)
+```
+
+两个结构性事实:
+
+1. **窗口之外无差异可言**:逃逸后的 scatter → embedding gather → aivec 故障是三方法公共代码(§3.2 论证的反向应用)——垃圾一旦逃逸,对谁都是死刑。因此方法差异与长度差异**必然**全部装在窗口内。
+2. **垃圾是单步事件,不跨步残留**:`next_token_ids` 每步重算;门关步(99%)即使拷贝输了,旧值也被 `where` 直接丢弃,连"成为垃圾"的资格都没有;逃逸在**同一个 step 内**被 drafter 前向消费掉。不存在"垃圾已就位、等某个时刻爆"的悬置状态。(故障异步浮出是另一回事:崩溃点 ≠ 逃逸点 ≠ 竞态点,三层分离。)
+
+**"eagle kernel 快"单因子反驳**(为何该假设单独不成立):host 发射密集 → where 前面的计算队列积压**更多** → where 执行**更晚** → 拷贝反而更从容。单独看,"计算快"是保护因子而非风险因子。eagle 必输的机制必须落在 **SDMA 侧积压(表 A)**,不在计算侧(表 B)。
+
+**两分支的 H2D/发射差异(静态核实,行号为 research/v0.23.0)**:
+
+| 环节 | eagle 分支(`set_inputs_first_pass` 前半,llm_base_proposer.py:1670-1718,`needs_extra_input_slots=False`) | CopyAndExpand 分支(draft_model/dflash,llm_base_proposer.py:1719-1830) |
+|---|---|---|
+| where 之后 → drafter 前向 | 全 D2D:`input_ids` 平移、scatter(`input_ids[indices] = next_token_ids`,**垃圾直接消费点**)、`_set_positions`(D2D,上游 llm_base_proposer.py:380)、`hidden_states` 拷贝;**零额外 H2D** | `npu_copy_and_expand_eagle_inputs` AscendC 融合算子(消费 `next_token_ids`)→ 4× D2D copy → `compute_new_slot_mapping`/`extend_all_queries_by_N`(device op) |
+| 分支内 H2D | 无 | plan A 路径另有 `query_start_loc.copy_to_gpu()`(llm_base_proposer.py:1102,dispatch 阶段,**在 backup 拷贝之后**发射,不排它前面) |
+| drafter 前向重量 | 1 层头多步合并,µs 级/步 | draft_model:0.6B × K+2 步串行(几十 ms);dflash:5 层头单 pass |
+| 步节奏 | µs 级密集发射,host 持续跑在 device 之前 | 每步几十/几百 ms,步间 SDMA 有整段空闲墙钟 |
+
+**候选机制(未证,最强候选)**:**SDMA 稳态积压差**。backup 拷贝之前发射的 H2D 集合对三方法基本相同(公共前缀:model_runner 元数据/采样 pinned buffer,含随上下文线性增长的 block_table)——差异不在"每步 H2D 内容不同",在**步节奏决定的 SDMA 稳态积压**:eagle 步循环极短,单位墙钟发射的步数多,SDMA 队列持续高压,边界步的 backup 拷贝落地时前面压着未消化完的积压;draft_model/dflash 每步重,步间 SDMA 把队列清空,边界步窗口里 backup 前面几乎没队。
+
+**4K vs 16K(窗口构成差异,非试验次数)**:门开次数相同(~7,请求边界),差异在那 7 步的窗口:16K = 8 块 chunked prefill,每块伴随大块元数据 H2D(block_table 行数随上下文线性涨),边界步 SDMA 队列深;4K = 2 块,压力小,拷贝基本赶得上。Run 2'/Run 4 计数器逐位复现(843/837/7/1)证明该负载下逃逸步**确定性输**;4K 未跑过 counters,"4K 窗口赢"是从崩溃频率反推的推断。
+
+**待验证清单(存档搁置)**:
+1. SDMA 队列稳态积压差:CANN profiling / 队列深度打点,同负载对比 eagle vs draft_model 的 backup 拷贝落地延迟;
+2. 4K + counters:预期门开 ~7、c3=0(无逃逸或窗口极窄);
+3. block_table H2D 规模与窗口的因果:固定 16K 单变量缩 block 行数。
+
 ## 4. 修复
 
 最小改动:该处 H2D 改 **blocking** 拷贝:
