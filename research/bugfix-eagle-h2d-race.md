@@ -81,22 +81,27 @@ MTE invalid GM address → aivec 异常 → EE9999 → 引擎死亡
 
 上游 GPU 的同型代码也用 `CpuGpuBuffer.copy_to_gpu`(non_blocking=True),但 **CUDA 的 `cudaMemcpyAsync` 入队到 stream 后,与同 stream 的后续 kernel 严格有序**——异步只是"不阻塞 host",顺序由流语义保证。torch_npu 的 pinned H2D 走 SDMA 引擎,与发射流(launch stream)上后续计算 kernel 的先后**没有等价保证**。一句话:**代码相同,后端流语义不同;NPU 移植不能默认继承 CUDA 的流序直觉**。
 
-### 3.2 为什么只有 eagle 系触发?
+### 3.2 为什么只有 eagle 系触发?(暴露矩阵)
 
-调用矩阵(`model_runner` 的 `use_padded_batch` 分派):
+调用归属(按上游 `SpeculativeConfig`:`use_eagle()` = `{"eagle","eagle3","mtp","dflash","dspark"}`,`uses_draft_model()` = `{"draft_model"}`;`model_runner` 的 `use_padded_batch` 分派):
 
-| drafter | 是否走 `prepare_next_token_ids_padded` | next_token_ids 的消费路径 | 结果 |
+| drafter | 走 `prepare_next_token_ids_padded`(含竞态拷贝) | next_token_ids 的消费路径 | 结果 |
 |---|---|---|---|
-| eagle / eagle3 / mtp(`pass_hidden_states=True` → `net_slots=0`) | ✅ | eagle 分支:scatter 进 `self.input_ids` → 1 层头 embedding gather,**launch 密、消费快** | 16K 必崩,4K 偶发 |
-| draft_model(`net_slots=1`) | ✅ | CopyAndExpandEagleInputs 算子分支 | 理论暴露,**27 cell 从未复现**(0.6B 前向重、launch 间隔大,窗口关上) |
-| dflash(parallel_drafting) | ✅ | 同上 CopyAndExpand 分支 + 单 pass 全 token | 未复现 |
-| ngram / suffix(host 提议器) | ❌(bookkeeping 后走 CPU list) | 无 | 结构性免疫 |
+| eagle / eagle3 / mtp(`pass_hidden_states=True` → `net_slots=0`) | ✅ `use_eagle()` | **分支 A**:eagle 分支直接 scatter 进 `self.input_ids`(裸 tensor op)→ 1 层头多步合并前向 → embedding gather | eagle3 16K 必崩,4K 偶发 |
+| dflash / dspark(`parallel_drafting`,`net_slots=K`) | ✅ `use_eagle()` | **分支 B**:CopyAndExpandEagleInputs(AscendC 算子)→ 5 层头单 pass 并行 | 4K/16K 探针未复现 |
+| draft_model(`net_slots=1`) | ✅ `uses_draft_model()` | **分支 B**:CopyAndExpandEagleInputs → 0.6B × K+2 步串行(即 plan A 图) | 27 cell 从未复现 |
+| ngram / suffix(host 提议器) | ❌(bookkeeping 后走 CPU list 路径,函数不被调用) | 无设备 buffer | **唯一结构性免疫** |
 
-**eagle 系高危的物理解释**:1 层头前向极快,`torch.where` → scatter → gather 的 kernel 链在 device 上排得密;H2D 拷贝若被 SDMA 延后,消费链先到。draft_model 共享同一拷贝但从未复现——**"没崩过"不等于"安全"**,它只是窗口更窄(修复同样保护它)。
+**准确结论**:竞态拷贝被除 ngram/suffix 外的全部 padded 方法共享;draft_model/dflash 是"**共享毒源、消费链更长(B 分支多一跳算子 + 更重的头)、实测未爆**",不是免疫。修复作用于拷贝本身,同时拆掉 A/B 两条分支脚下的雷——这是本修复覆盖面大于表象证据(只有 eagle3 爆)的原因。
 
-### 3.3 为什么 16K 必现、4K 偶发?
+### 3.3 为什么 16K 必现、4K 偶发?(机制假设,非实证)
 
-16K/32K 的 chunked prefill 使 device 端异步队列深(每块 2048 token 的 kernel 串),host 远跑在前面,SDMA 拷贝从发射到落地的间隔被拉长;4K 时队列浅,拷贝大概率在消费前落地。概率随队列深度变化——这也是它潜伏至今的原因:短 prompt 测试全绿,长 prompt 一跑就死。
+**已实证**:竞态存在(翻转实验)、carrier 是该拷贝(clamp 二分)、16K 近必现/4K 偶发(多轮复现)。
+
+**机制解释为最佳拟合假设**,两种可并存:
+1. **消费链密度(解释方法间差异)**:eagle 系从拷贝到 gather 只有几个轻 kernel + 1 层头,device 侧很快追上 SDMA;B 分支多一跳 AscendC 算子且头模型重,窗口天然宽。
+2. **SDMA 队列拥塞(解释长度间差异)**:16K/32K chunked prefill 每块产生大量 metadata H2D,backup 拷贝在 SDMA 队列里被排到后面、延迟拉大;4K 拷贝少,大概率在消费前落地。注意这与"计算队列深所以窗口宽"的直觉相反——计算队列深反而给拷贝更多时间,**拥塞必须发生在 SDMA 侧**才能解释观察。
+   (我们未直接测量 SDMA 延迟,该条为推断;修复不依赖此假设成立。)
 
 ## 4. 修复
 
