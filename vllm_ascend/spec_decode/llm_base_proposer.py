@@ -128,6 +128,10 @@ class _RaceCounters:
         self.counts: torch.Tensor | None = None
         self.steps = 0
         self.reported = False
+        # One-time engagement line (host-only, no device sync): without it a
+        # hard crash cannot distinguish "counters ran" from "env never
+        # reached the module" (Run 1 lesson, 2026-08-25).
+        self._logger.info("[SD-counters] engaged; on-device c1/c2/c3, readout at process exit")
         atexit.register(self.report, origin="atexit")
 
     def bump(self, idx: int, delta: torch.Tensor) -> None:

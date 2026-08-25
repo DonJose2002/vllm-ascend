@@ -57,6 +57,9 @@ class _Recorder:
     def __init__(self) -> None:
         self.records: list[str] = []
 
+    def info(self, msg: str, *args: object) -> None:
+        self.records.append(msg % args if args else msg)
+
     def warning(self, msg: str, *args: object) -> None:
         self.records.append(msg % args)
 
@@ -126,6 +129,7 @@ def test_env_flag(ns: dict) -> None:
 def test_counters_accumulate_and_report(ns: dict) -> None:
     ctr = ns["_get_race_counters"]()
     assert ctr is ns["_RACE_COUNTERS"], "singleton must be cached"
+    assert any(r.startswith("[SD-counters] engaged") for r in ns["logger"].records), "engagement line"
     ctr.steps += 2
     ctr.bump(0, torch.tensor(1, dtype=torch.int64))
     ctr.bump(0, torch.tensor(2, dtype=torch.int64))

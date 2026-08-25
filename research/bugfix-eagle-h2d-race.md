@@ -209,3 +209,35 @@ grep -E "SD-counters" experiments/out/serve-race-run*.log
 | Run 1 绿 + c1>0 ∧ c2>0 ∧ c3>0 | **值故事闭合**(撕裂落地→被选中→流出,三环齐证) |
 | Run 1 绿 + 混合(如 c1>0 ∧ c2=0) | 毒落地但从未被选中 → 值路径不通,倒向屏障故事;c1 单独成立则"撕裂落地"机制局部成立 |
 | Run 1 崩 | 计数归约未能如 clamp_next 般治愈 → 插入点时序不足以隔开乱序对;结合 Run 0 是否崩一起入档 |
+
+### 7.1 首轮结果与判读(2026-08-25,Run 0/1)
+
+| Run | 配置 | 卡 | 结果 |
+|---|---|---|---|
+| 0 | REVIVE_RACE 单开 | NPU2 | **崩**:8/8 空流,aivec MTE @ prefill ~12-14K(num_computed_tokens=12288+2048,单请求),签名与修前一致;证据 `experiments/out/serve-race-run0.log` |
+| 1 | REVIVE_RACE + COUNTERS | NPU4 | **崩**:同签名;无 `[SD-counters]` 行(原生故障杀进程,atexit 不触发);证据 `serve-race-run1.log` |
+
+判读:
+1. **Run 0 = 复现成立 + revive 生效**(site-packages 是 blocking 修复版,能崩的唯一路径就是 revive 分支——兼为工作区代码活跃的旁证)。
+2. **Run 1 = 计数 kernel 未治愈竞态**,这是重要反向证据:c3 的归约 kernel 插在 where 后、scatter 前,与 clamp_next 的插入位置几乎相同、同为流上 elementwise/reduction kernel——屏障假说预言它应同样隔开乱序对,但没有 → **clamp_next 的治愈更可能是"值消毒"(把垃圾钳进合法词表域)而非时序屏障,证据流向值故事**(§2.7 假设 i 方向)。
+3. **洞 3(cond=false 稀有)出现解法候选**:两次崩溃步都在 chunked prefill 期间(num_output_tokens=0,尚未生成任何 token)——预填充步可能根本没有已采样 token → cond=false 或许并不稀有,值故事的"选择路径稀有却必崩"矛盾可能在预填充场景消解。待 c2 实测。
+4. 歧义消除跟进:首版无 engagement 日志,"计数器是否真跑过"不可证 → 已补一次性 engagement 行(`_RaceCounters.__init__`,host-only 零同步)。
+
+### 7.2 Run 2:clamp 组合保活取读数(决定性)
+
+思路:**clamp 治愈保住引擎(绿跑 → atexit 触发读数),计数器在 clamp 之前计数**——时序链:`prepare_next_token_ids_padded`(c1 → where → c2 → c3)返回 → `_propose` 入口才施加 clamp。故 c3 数的是 where 原始输出,垃圾是否流出不受 clamp 影响。
+
+```bash
+# 宿主机先 git pull(含 engagement 日志),容器内:
+VLLM_ASCEND_SD_REVIVE_RACE=1 VLLM_ASCEND_SD_COUNTERS=1 VLLM_ASCEND_SD_DEBUG=clamp_next \
+  TIERS=16384 CONCS=1 bash research/run_baseline_npu.sh eagle3 8023
+cp experiments/out/serve-npu-bf16-eagle3-k5.log experiments/out/serve-race-run2.log
+grep -E "SD-counters" experiments/out/serve-race-run2.log
+```
+
+| 观测(Run 2) | 结论 |
+|---|---|
+| 绿 + c1>0 ∧ c2>0 ∧ c3>0 | **值故事闭合**:撕裂落地→被选中→流出,三环齐证(clamp 只救不改证) |
+| 绿 + 全零 | 垃圾从未走值路径,但无 clamp 必崩(Run 1)→ 悖论入档,屏障故事复位且需解释"为何计数 kernel 不是屏障而 clamp kernel 是" |
+| 绿 + 混合 | 按 §2.7 矩阵部分解读(如 c1>0∧c2=0:毒落地但未被选中,崩因另寻) |
+| 崩 | clamp 在新代码下未能治愈(回归异常),贴 traceback |
