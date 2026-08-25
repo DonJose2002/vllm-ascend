@@ -130,6 +130,8 @@ class _RaceCounters:
         self._open = open
         self._suppress = suppress
         self.counts: torch.Tensor | None = None
+        self.esc_min: torch.Tensor | None = None
+        self.esc_max: torch.Tensor | None = None
         self.steps = 0
         self.reported = False
         # One-time engagement line (host-only, no device sync): without it a
@@ -151,8 +153,24 @@ class _RaceCounters:
     def bump(self, idx: int, delta: torch.Tensor) -> None:
         """Accumulate a 0-dim device tensor delta; stays on device."""
         if self.counts is None:
-            self.counts = self._torch.zeros(3, dtype=self._torch.int64, device=delta.device)
+            self.counts = self._torch.zeros(4, dtype=self._torch.int64, device=delta.device)
         self.counts[idx] += delta
+
+    def bump_escape(self, nt: torch.Tensor, vocab: int) -> None:
+        """Track min/max of OOB values that escaped the where (Run 4 probe).
+
+        Decides stale-sentinel (-1) vs CANN poison (0xa5a5a5a5 = -1515870811
+        as int32/int64) as the actual crash-index value; device-side only.
+        """
+        if self.esc_min is None or self.esc_max is None:
+            self.esc_min = self._torch.full((), _INT64_MAX, dtype=self._torch.int64, device=nt.device)
+            self.esc_max = self._torch.full((), _INT64_MIN, dtype=self._torch.int64, device=nt.device)
+        m = (nt < 0) | (nt >= vocab)
+        vals = nt.long()
+        cand_min = self._torch.where(m, vals, self._torch.full_like(vals, _INT64_MAX)).min()
+        cand_max = self._torch.where(m, vals, self._torch.full_like(vals, _INT64_MIN)).max()
+        self._torch.minimum(self.esc_min, cand_min, out=self.esc_min)
+        self._torch.maximum(self.esc_max, cand_max, out=self.esc_max)
 
     def report(self, origin: str = "unknown", once: bool = True) -> None:
         if self.counts is None or (once and self.reported):
@@ -165,11 +183,17 @@ class _RaceCounters:
         # a swallowed failure looks exactly like "readout never ran" (Run 2
         # lesson). Every path lands in /tmp/sd_counters_<pid>.txt.
         try:
-            c1, c2, c3 = self.counts.tolist()
+            c1, c2, c3, c1x = self.counts.tolist()
+            if self.esc_min is not None and int(self.esc_min) <= int(self.esc_max):
+                esc = f"[{int(self.esc_min)}, {int(self.esc_max)}]"
+            else:
+                esc = "none"
             line = (
                 f"[SD-counters] {origin} steps={self.steps} c1={c1} c2={c2} c3={c3} "
-                "(c1=backup.gpu OOB after copy; c2=where-cond-false rows; "
-                "c3=next_token_ids OOB after where)"
+                f"c1x={c1x} esc={esc} "
+                "(c1=backup.gpu OOB incl -1 sentinel; c1x=OOB excl sentinel; "
+                "c2=where-cond-false rows; c3=next_token_ids OOB after where; "
+                "esc=min/max escaped OOB value)"
             )
             with self._suppress(Exception):
                 self._logger.warning("%s", line)
@@ -193,6 +217,19 @@ def _get_race_counters() -> _RaceCounters:
 def _oob_count(t: torch.Tensor, vocab: int) -> torch.Tensor:
     """0-dim device count of out-of-vocab elements; no host sync."""
     return ((t < 0) | (t >= vocab)).sum()
+
+
+# Run 3 lesson (2026-08-25): upstream CachedRequestState.get_token_id returns
+# a -1 SENTINEL for not-yet-committed positions, so backup.gpu legitimately
+# holds -1 on every gate-closed step. c1 above saturates at that sentinel
+# floor and cannot see the race; c1x below counts REAL garbage only.
+def _oob_count_hard(t: torch.Tensor, vocab: int) -> torch.Tensor:
+    """OOB count excluding the upstream -1 sentinel (real garbage)."""
+    return ((t < -1) | (t >= vocab)).sum()
+
+
+_INT64_MAX = torch.iinfo(torch.int64).max
+_INT64_MIN = torch.iinfo(torch.int64).min
 
 
 # TODO: Remove it when the bug of fx-graph is solved
@@ -2062,6 +2099,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             )
         if _ctr is not None:
             _ctr.bump(0, _oob_count(self.backup_next_token_ids.gpu[:num_reqs], gpu_input_batch.vocab_size))
+            _ctr.bump(3, _oob_count_hard(self.backup_next_token_ids.gpu[:num_reqs], gpu_input_batch.vocab_size))
 
         # Mask out the sampled tokens indices that should not be sampled.
         discard_sampled_tokens_req_indices = discard_request_indices[:num_discarded_requests]
@@ -2097,9 +2135,11 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         )
         if _ctr is not None:
             # [research instrumentation 2026-08-25] c2 = backup-selected rows,
-            # c3 = garbage that actually flowed out of the where().
+            # c3 = garbage that actually flowed out of the where(), esc =
+            # min/max of the escaped values (sentinel vs poison, Run 4).
             _ctr.bump(1, (last_valid_indices == -1).sum())
             _ctr.bump(2, _oob_count(next_token_ids, gpu_input_batch.vocab_size))
+            _ctr.bump_escape(next_token_ids, gpu_input_batch.vocab_size)
 
         return next_token_ids, valid_sampled_tokens_count
 

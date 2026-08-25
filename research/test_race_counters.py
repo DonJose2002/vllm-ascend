@@ -37,6 +37,7 @@ SOURCE = Path(__file__).resolve().parents[1] / "vllm_ascend" / "spec_decode" / "
 WANTED = (
     "_RaceCounters",
     "_oob_count",
+    "_oob_count_hard",
     "_env_flag",
     "_get_race_counters",
     "prepare_next_token_ids_padded",
@@ -79,6 +80,8 @@ def _make_namespace() -> dict:
         "os": os,
         "signal": signal,
         "suppress": suppress,
+        "_INT64_MAX": torch.iinfo(torch.int64).max,
+        "_INT64_MIN": torch.iinfo(torch.int64).min,
         "atexit": atexit,
         "logger": _Recorder(),
         "DeviceOperator": _DeviceOperatorStub,
@@ -139,7 +142,8 @@ def test_counters_accumulate_and_report(ns: dict) -> None:
     ctr.bump(0, torch.tensor(2, dtype=torch.int64))
     ctr.bump(1, torch.tensor(3, dtype=torch.int64))
     ctr.bump(2, torch.tensor(4, dtype=torch.int64))
-    assert ctr.counts.tolist() == [3, 3, 4], ctr.counts.tolist()
+    ctr.bump(3, torch.tensor(5, dtype=torch.int64))
+    assert ctr.counts.tolist() == [3, 3, 4, 5], ctr.counts.tolist()
 
     # SIGUSR1 live readout: handler registered in __init__ must fire on the
     # real signal and produce a logger line without setting `reported`
@@ -152,15 +156,15 @@ def test_counters_accumulate_and_report(ns: dict) -> None:
             break
         time.sleep(0.02)
     line = next(r for r in ns["logger"].records if r.startswith("[SD-counters] sigusr1"))
-    assert "steps=2 c1=3 c2=3 c3=4" in line, line
+    assert "steps=2 c1=3 c2=3 c3=4 c1x=5 esc=none" in line, line
 
     # file fallback: same line must land in /tmp/sd_counters_<pid>.txt
     fpath = f"/tmp/sd_counters_{os.getpid()}.txt"
-    assert "[SD-counters] sigusr1 steps=2 c1=3 c2=3 c3=4" in Path(fpath).read_text(), fpath
+    assert "[SD-counters] sigusr1 steps=2 c1=3 c2=3 c3=4 c1x=5 esc=none" in Path(fpath).read_text(), fpath
 
     ctr.report(origin="unit")
     line = ns["logger"].records[-1]
-    assert line.startswith("[SD-counters] unit steps=2 c1=3 c2=3 c3=4"), line
+    assert line.startswith("[SD-counters] unit steps=2 c1=3 c2=3 c3=4 c1x=5 esc=none"), line
     n = len(ns["logger"].records)
     ctr.report(origin="again")  # idempotent
     assert len(ns["logger"].records) == n, "report must be idempotent"
@@ -170,8 +174,9 @@ def test_counters_accumulate_and_report(ns: dict) -> None:
 
 def test_prepare_functional(ns: dict) -> None:
     VOCAB = 100
-    # backup: cpu rows [:2] clean; gpu poisoned at rows 1 (>= vocab) and 2 (<0)
-    backup = _make_backup([10, 11, 12, 13], [10, 9999, -1, 13])
+    # backup gpu: row0 = -1 (upstream sentinel, "OOB" for c1 but not c1x),
+    # row1 = 9999 (real garbage), row2 = -1, row3 clean. cpu rows [:2] clean.
+    backup = _make_backup([10, 11, 12, 13], [-1, 9999, -1, 13])
     stub_self = SimpleNamespace(backup_next_token_ids=backup)
     prepare = types.MethodType(ns["prepare_next_token_ids_padded"], stub_self)  # type: ignore[arg-type]
     gib = _make_input_batch(num_reqs=2, vocab=VOCAB, seq_lens=[5, 6])
@@ -188,7 +193,7 @@ def test_prepare_functional(ns: dict) -> None:
     nxt, cnt = prepare(sampled, requests, gib, discard, 1)
     assert ns["_RACE_COUNTERS"] is None, "counters must stay uncreated when off"
     # scenario C's blocking copy just cleaned gpu[:2]; re-poison for scenario A
-    backup.gpu.copy_(torch.tensor([10, 9999, -1, 13], dtype=torch.int32))
+    backup.gpu.copy_(torch.tensor([-1, 9999, -1, 13], dtype=torch.int32))
 
     # --- scenario A: value story simulated (revive + un-landed copy + poison)
     ns["_SD_COUNTERS"] = True
@@ -196,22 +201,26 @@ def test_prepare_functional(ns: dict) -> None:
     nxt, cnt = prepare(sampled, requests, gib, discard, 1)
     ctr = ns["_RACE_COUNTERS"]
     assert ctr is not None and ctr.steps == 1
-    assert ctr.counts.tolist() == [1, 1, 1], f"scenario A expected c1=1 c2=1 c3=1, got {ctr.counts.tolist()}"
-    assert nxt.tolist() == [3, 9999, 7], nxt.tolist()  # row1 took the poisoned backup
+    assert ctr.counts.tolist() == [2, 1, 1, 1], (
+        f"scenario A expected c1=2 (sentinel+9999) c2=1 c3=1 c1x=1, got {ctr.counts.tolist()}"
+    )
+    assert nxt.tolist() == [3, 9999, 7], nxt.tolist()  # row1 took the garbage backup
     assert cnt.tolist() == [3, 0, 3], cnt.tolist()
+    assert int(ctr.esc_min) == 9999 and int(ctr.esc_max) == 9999, (
+        f"esc range should capture the escaped 9999, got [{int(ctr.esc_min)}, {int(ctr.esc_max)}]"
+    )
 
     # --- scenario B: fix active (blocking copy lands over [:num_reqs])
     ns["_SD_REVIVE_RACE"] = False
     nxt, cnt = prepare(sampled, requests, gib, discard, 1)
     assert ctr.steps == 2
-    assert ctr.counts.tolist() == [1, 2, 1], (
-        f"scenario B expected c1=1 c2=2 c3=1 (only c2 grows), got {ctr.counts.tolist()}"
-    )
+    assert ctr.counts.tolist() == [2, 2, 1, 1], f"B: only c2 grows, got {ctr.counts.tolist()}"
     assert nxt.tolist() == [3, 11, 7], nxt.tolist()  # row1 now reads the landed cpu value
+    assert int(ctr.esc_min) == 9999 and int(ctr.esc_max) == 9999, "esc unchanged in B"
 
     ctr.report(origin="functional")
     line = ns["logger"].records[-1]
-    assert "steps=2 c1=1 c2=2 c3=1" in line, line
+    assert "steps=2 c1=2 c2=2 c3=1 c1x=1 esc=[9999, 9999]" in line, line
 
 
 def main() -> int:

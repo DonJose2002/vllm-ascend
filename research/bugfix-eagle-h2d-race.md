@@ -7,7 +7,7 @@
 
 `prepare_next_token_ids_padded` 把一批"兜底 token id"用 pinned **非阻塞** H2D 拷贝送上 NPU;torch_npu 上这类拷贝走 SDMA 引擎,与发射流上后续计算 kernel 的先后顺序**没有保证**——输掉竞态时 `torch.where` 读到未初始化内存(0xa5a5a5a5,CANN 毒化标记),垃圾 id 混进 drafter 的 input_ids,词表规模的 embedding gather 拿垃圾当索引,越界读 GM,aivec 硬件异常,引擎死亡。
 
-> **终判(2026-08-25)**:三计数器实验闭合此案为**值故事**——c1=837(毒近乎常驻)× c2=7(backup 选择门稀有非零)× c3=1(流出 1 次即崩),clamp_next 的治愈实为值消毒而非时序屏障。详见 §2.7.1 与 §7。
+> **终判(2026-08-25,同日二次修正)**:三计数器实验闭合此案为**值故事**——逃逸门是 `where` 的 backup 选择门(c2=7 次/843 步),racy 配置下恰有 1 次读到未落地旧值而流出 1 个 OOB id(c3=1),即引擎死亡事件;clamp_next 的治愈实为值消毒而非时序屏障。**c1 的"毒常驻"解读已被 Run 3 勘误**:那 837/840 个 OOB 是上游 `get_token_id` 的 **-1 哨兵**(设计如此,门关步 backup 本就是 -1),逃逸值实为 **stale 哨兵 -1**(待 Run 4 esc 值捕获定谳)。详见 §2.7.1 与 §7.4-7.6。
 
 ## 1. 现象与误判
 
@@ -100,7 +100,7 @@ MTE invalid GM address → aivec 异常 → EE9999 → 引擎死亡
 - c3:where 之后数 `next_token_ids` OOB(垃圾有没有流出去;c1>0 ∧ c2>0 ∧ c3>0 = 值故事全链闭合)。
 跑全绿 + 三计数全零 → 屏障故事定性;此后才值得猎"真正的乱序对"(候选:跨流 buffer 复用如 draft_token_ids 侧流、scatter-vs-gather 与图参数 update_stream 的交互)。
 
-### 2.7.1 终判:值故事闭合(2026-08-25,三计数器实验执行完毕)
+### 2.7.1 终判:值故事闭合(2026-08-25,三计数器实验执行完毕;同日 Run 3 勘误一次)
 
 **读数**(Run 2',NPU2,commit `ac2e4ab83`,revive+counters+clamp 保活,SIGUSR1 活体读数):
 
@@ -108,15 +108,37 @@ MTE invalid GM address → aivec 异常 → EE9999 → 引擎死亡
 [SD-counters] sigusr1 steps=843 c1=837 c2=7 c3=1
 ```
 
-**c1>0 ∧ c2>0 ∧ c3>0 → 值故事胜出,屏障假说出局**(执行记录与机制细节见 §7)。三重矛盾的消解:
+**c2>0 ∧ c3>0 → 值故事胜出,屏障假说出局**:门开 7 次,racy 配置下 1 次读到未落地旧值、1 个 OOB id 流出 where——**这 1 次逃逸就是无 clamp 时的引擎死亡事件**。clamp 值消毒救下(Run 2/2' 绿),fix 下 c3=0(Run 3)。
 
-1. **stale-value 悖论消解(实测推翻前提)**:c1=837/843——毒在 buffer 里**近乎常驻**。"持久 buffer 读到的应是零或旧值"的前提不成立:non_blocking 拷贝在读时几乎总未(完整)落地,且毒化值一旦进入便持续存在(撕裂中间态/未落地期间从未被合法值覆盖)。微观机制(撕裂落地 vs cache 一致性 vs 落地次序)仍开放,但修复对症三者(blocking = host 等待完成,含全部同步语义)。
-2. **"只有 eagle 崩"的解释修正**:三方法共享 c1/c2 语义,但窗口命中率 = 试验次数 × 步节奏。eagle 每步 µs 级密集发射,单位时间试验次数远高于重 drafter(毫秒级)——不是值路径不同,是**掷骰子频率**不同。dflash 免疫的说法也随 §3.2 修正保留(结构性免疫仅 ngram)。
-3. **稀有性消解为三重门结构**:毒常驻(c1=837)× 门稀有(c2=7:cond=false 行)× 流出更稀有(c3=1:7 次开门仅 1 次撞毒)。单请求 bench 下每行 1 元素,7 次开门 1 次有毒——**c3=1 正是无 clamp 时的那一次崩溃**(Run 0/1 必崩,Run 2/2' 被 `_propose` 入口的 clamp 值消毒救下)。4K 偶发/16K 必现 = 步数即试验次数。
+**勘误(同日,Run 3 触发)**:我最初把 c1=837 解读为"毒近乎常驻"——**错**。Run 3(纯 fix+counters)读数 `steps=847 c1=840 c2=7 c3=0`:fix 下拷贝已同步落地,c1 仍 ~99%。真相(源码核实):
 
-**对 §2.5 判读表的追溯修正**:clamp_next"过"的机制是**值消毒**(把流出的垃圾钳进合法词表域),不是时序屏障——直接证据:同样插在 where 后、同样流上 elementwise/reduction 的 c3 计数 kernel(Run 1)**不**治愈(只数不改值)。教训 4 的"保时序探针"框架仍然成立,但"插入即屏障"的隐含假设被证伪。
+- 上游 `CachedRequestState.get_token_id(idx)`(vllm/v1/worker/gpu_input_batch.py)对**未提交位置返回 -1 哨兵**;
+- 正常 decode 步里 `num_tokens_no_spec-1` 恰指向"刚采样未提交"的位置 → **门关步的 backup 恒为 -1**(设计如此:门关时该值永不被 where 选中,是死数据);
+- 门开步(请求边界/discarded,7 次)idx 落在已提交 token 上 → backup 是**真 token**;
+- 数值自洽的铁证:**847-840=7=c2**(两次 run 均完美重合)——c1 数的就是哨兵底噪,它从一开始就看不见竞态;
+- `CpuGpuBuffer` 是 `torch.zeros_like` 初始化(utils.py)——buffer 里从来没有 0xa5a5。
 
-**修复语义的重述**:blocking 拷贝的本质不是"补时序屏障"而是**消灭源头**——拷贝同步落地 → buffer 恒合法 → c1 归零(可由 Run 3 直接验证,见 §7.4)→ 值路径全链枯竭。9/9 实证与此一致。
+**修正后的完整机制(stale 哨兵故事)**:
+
+```
+正常步:门关,backup 落地 -1(哨兵,无害死数据)
+门开步(≈1%):host 写真 token → non_blocking 拷贝在途 → where 抢先读
+             → 读到该行上一次落地的旧值 = -1 哨兵(OOB!)
+             → next_token_ids 流出 -1(c3=1)
+无 clamp:-1 scatter 进 drafter input_ids → embedding gather 以 -1 为索引
+        → GM 越界 → aivec → 引擎死亡(Run 0/1 的崩溃,亦是修前 16K 必崩)
+```
+
+三重矛盾的最终消解:
+1. **stale-value 悖论**:旧值不是"零或合法旧 token"而是 **-1 哨兵本身**——它作为值 OOB,只是上游设计里永远不该被消费;竞态打破的正是这个契约。0xa5a5 无需入场(plog args[18] 的 0xa5a5 是 kernel 参数区某字段,并非索引值本身;索引实际值待 Run 4 esc 捕获定谳)。
+2. **"只有 eagle 崩"**:门开频率(≈1/120 步,请求边界)对所有 padded 方法相同,差异在单位时间的试验次数与 launch-ahead 深度(eagle µs 级密集发射把 host 推得更靠前,窗口更宽)。
+3. **稀有性**:门开 7 次 × 竞态命中 1/7 = 每 run 恰 1 次逃逸。4K 偶发/16K 必现 = 步数即试验次数。
+
+**对 §2.5 判读表的追溯修正**:clamp_next"过"的机制是**值消毒**(把流出的 -1/垃圾钳进合法词表域),不是时序屏障——直接证据:同样插在 where 后、同样流上 elementwise/reduction 的 c3 计数 kernel(Run 1)**不**治愈(只数不改值)。教训 4 的"保时序探针"框架仍然成立,但"插入即屏障"的隐含假设被证伪。
+
+**修复语义**:blocking 拷贝 = 门开步的 where 之前拷贝必然已落地 → 门开必读到真 token → 值路径枯竭(c3=0,Run 3 实证;哨兵底噪 c1 留存属正常)。9/9 实证一致。
+
+**剩余开放点(仅一个)**:逃逸值的直接捕获——esc 探针(Run 4)将给出 min/max:预期 **-1**(哨兵故事);若测得 0xa5a5a5a5(int32 = -1515870811)则"毒落地"路径复活,需再议。
 
 ## 3. 三个"为什么"
 
@@ -294,11 +316,11 @@ cat /tmp/sd_counters_*.txt   # 兜底文件(含 READ FAILED 诊断)
 [SD-counters] sigusr1 steps=843 c1=837 c2=7 c3=1
 ```
 
-**按 §7.2 矩阵判读:c1>0 ∧ c2>0 ∧ c3>0 → 值故事闭合**(详判与三重矛盾的消解见 §2.7.1)。要点:
+**按 §7.2 矩阵判读:c1>0 ∧ c2>0 ∧ c3>0 → 值故事闭合**(详判与三重矛盾的消解见 §2.7.1)。要点(**注:第 1 条的"毒近乎常驻"解读已被 Run 3 勘误为 -1 哨兵底噪,见 §2.7.1/§7.5;c2/c3 两条不受影响**):
 
-1. c1=837/843:毒近乎常驻(non_blocking 拷贝读时几乎总未完整落地);
+1. ~~c1=837/843:毒近乎常驻~~ → 实为 `get_token_id` 的 -1 哨兵(门关步 backup 恒为 -1,设计如此);
 2. c2=7:backup 选择门(cond=false)稀有但非零——洞 3 的实测答案;
-3. c3=1:7 次开门 1 次撞毒;**无 clamp 时这 1 次即崩溃**(Run 0/1 必崩),clamp 值消毒救下(Run 2/2' 绿);
+3. c3=1:7 次开门 1 次撞上未落地旧值;**无 clamp 时这 1 次即崩溃**(Run 0/1 必崩),clamp 值消毒救下(Run 2/2' 绿);
 4. Run 1 的"计数 kernel 不治愈"与"clamp 治愈"合并成钳:治愈靠改值不靠时序 → 屏障假说出局。
 
 ### 7.5 Run 3(可选收官):fix 状态下 c1 应归零
@@ -312,3 +334,25 @@ VLLM_ASCEND_SD_COUNTERS=1 TIERS=16384 CONCS=1 \
 ```
 
 预期绿跑 + `c1=0 c3=0`(c2 允许罕见非零——门本身与竞态无关)。若 c1>0 则说明毒源不止这一处拷贝,需再追(意外但高价值)。
+
+**Run 3 结果(2026-08-25,NPU2,commit `acb66ee80`)**:绿跑 8/8(TTFT 214.7/ITL 33.6/accept 2.4824),读数 `steps=847 c1=840 c2=7 c3=0`——**c3=0 符合预期(fix 阻断逃逸),c1=840 违背预期**。这触发 §2.7.1 的同日勘误:c1 的"毒常驻"解读是错的,837/840 是上游 `get_token_id` 的 -1 哨兵底噪(数值铁证:847-840=7=c2,门开步恰好是 backup 合法的步)。fix 的实证判据由此修正为 **c3=0**(而非 c1=0)。
+
+### 7.6 Run 4:逃逸值捕获(esc 探针,最后一个开放点)
+
+c1 语义修正后,唯一悬而未决的是**逃逸值本身**:stale 哨兵 -1(源码推理的主选)vs CANN 毒 0xa5a5(SDMA 撕裂落地,需重新入场的暗牌)。实现(`esc` 探针,device 侧 min/max 归约,零 host 同步):计数行新增 `c1x`(OOB 排除 -1 哨兵 = 真垃圾计数)与 `esc=[min, max]`(where 后 next_token_ids 中 OOB 元素的值域;无逃逸显示 `esc=none`)。
+
+```bash
+# 宿主机 git pull 后,容器内:
+# Run 4(主):revive + counters + clamp 保活 —— 复刻 Run 2' 的逃逸条件
+VLLM_ASCEND_SD_REVIVE_RACE=1 VLLM_ASCEND_SD_COUNTERS=1 VLLM_ASCEND_SD_DEBUG=clamp_next \
+  TIERS=16384 CONCS=1 bash research/run_baseline_npu.sh eagle3 8026
+```
+
+| 观测(Run 4) | 结论 |
+|---|---|
+| 绿 + `esc=[-1, -1]`(或含 -1) | **哨兵故事定谳**:逃逸值 = stale -1,plog 的 0xa5a5 与索引无涉;机制链全闭合 |
+| 绿 + `esc=[-1515870811, ...]` | **毒落地复活**:0xa5a5 真在值路径里,SDMA 撕裂/毒写机制需重开调查 |
+| 绿 + `esc=none` | 本 run 门开 7 次未撞竞态(1/7 概率,正常)——重跑 1-2 次 |
+| 崩 | clamp 回归异常,贴 traceback |
+
+预期解读注:c1x 在 racy 配置下若 >0(排除哨兵后仍有真垃圾)则说明 buffer 里除哨兵外还有别的脏东西——那才是"毒常驻"的真正残部;预期 c1x≈0(哨兵故事下 buffer 只有哨兵与真值)。
