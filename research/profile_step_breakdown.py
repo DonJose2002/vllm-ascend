@@ -154,8 +154,24 @@ def _cat_hist_add(agg: dict, events: list[dict]) -> None:
         agg["cat_hist"][c] = agg["cat_hist"].get(c, 0) + 1
 
 
-CSV_NAME_RE = re.compile(r"^(op_?name|name|kernel_?name)$", re.I)
+CSV_NAME_RE = re.compile(r"^(op_? ?type|op_?name|name|kernel_?name)$", re.I)
 CSV_DUR_RE = re.compile(r"dur|elapsed|time", re.I)
+CSV_COUNT_RE = re.compile(r"^count$", re.I)
+# msprof text export canonical per-kernel sources, in priority order. Dir-level
+# --csv MUST NOT ingest task_time.csv (same kernels recounted) or
+# operator_details.csv (host-side aten durations) - see first p15 run.
+CSV_CANONICAL = ("op_statistic", "kernel_details")
+
+
+def select_canonical_csv(csvs: list[str]) -> tuple[list[str], list[str]]:
+    """From a directory scan keep exactly one canonical source family."""
+    picked = [f for f in csvs if os.path.basename(f).startswith(CSV_CANONICAL)]
+    if not picked:
+        return csvs, []
+    # if the pre-aggregated op_statistic exists anywhere, prefer it exclusively
+    stat = [f for f in picked if os.path.basename(f).startswith("op_statistic")]
+    chosen = stat or picked
+    return chosen, [f for f in csvs if f not in chosen]
 
 
 def load_csv_rows(path: str) -> list[dict]:
@@ -170,10 +186,14 @@ def load_csv_rows(path: str) -> list[dict]:
     return []
 
 
-def csv_events(rows: list[dict], fields: list[str]) -> list[tuple[str, float]]:
-    """Extract (name, duration_us) from an msprof-style summary csv."""
+def csv_events(rows: list[dict], fields: list[str]) -> list[tuple[str, float, int]]:
+    """Extract (name, duration_us, count) from an msprof-style summary csv."""
     name_col = next((f for f in fields if CSV_NAME_RE.match(f.strip())), None)
-    dur_col = next((f for f in fields if CSV_DUR_RE.search(f) and "start" not in f.lower()), None)
+    dur_col = next(
+        (f for f in fields if CSV_DUR_RE.search(f) and "start" not in f.lower() and "stop" not in f.lower()),
+        None,
+    )
+    count_col = next((f for f in fields if CSV_COUNT_RE.match(f.strip())), None)
     if not name_col or not dur_col:
         return []
     out = []
@@ -183,9 +203,16 @@ def csv_events(rows: list[dict], fields: list[str]) -> list[tuple[str, float]]:
         if not name:
             continue
         try:
-            out.append((name, float(raw)))
+            dur = float(raw)
         except ValueError:
             continue
+        cnt = 1
+        if count_col:
+            try:
+                cnt = int(float((row.get(count_col) or "1").strip()))
+            except ValueError:
+                cnt = 1
+        out.append((name, dur, cnt))
     return out
 
 
@@ -230,6 +257,15 @@ def aggregate(
         agg["cats"][c]["us"] += dur
         agg["events"] += 1
 
+    # csv dir-scan safety: keep exactly one canonical msprof source family,
+    # never task_time (recounts kernels) / operator_details (host side)
+    if use_csv:
+        csvs = [p for p in paths if p.endswith(".csv")]
+        chosen, dropped = select_canonical_csv(csvs)
+        for d in dropped:
+            agg["skipped"].append((d, "non-canonical csv source (prefer op_statistic/kernel_details)"))
+        paths = [p for p in paths if not (p.endswith(".csv") and p in dropped)]
+
     for path in paths:
         if path.endswith(".csv"):
             if not use_csv:
@@ -244,9 +280,15 @@ def aggregate(
                 continue
             agg["files"].append(path)
             agg["notes"].append(f"{os.path.basename(path)}: csv summary source, {len(pairs)} rows")
-            for name, dur in pairs:
+            for name, dur, cnt in pairs:
                 hint = "memcpy" if "memcpy" in name.lower() else ("memset" if "memset" in name.lower() else None)
                 bump(name, dur, hint)
+                if cnt != 1:
+                    # pre-aggregated row (op_statistic): fold row multiplicity
+                    c = memcpy_dir(name) if hint == "memcpy" else ("memset" if hint == "memset" else classify(name))
+                    agg["cats"][c]["count"] += cnt - 1
+                    if c == "other_kernel":
+                        name_us[name][1] += cnt - 1
             continue
 
         try:
@@ -536,6 +578,35 @@ def cmd_selftest() -> int:
                 f"FAIL csv: gemm={agg4['cats']['gemm']['us']} attn={agg4['cats']['attention']['us']}"
                 f" d2h={agg4['cats']['memcpy_d2h']['us']}"
             )
+            ok = False
+
+        # canonical-source selection + Count-column folding (op_statistic dir):
+        # task_time/operator_details must be dropped, counts folded, totals exact
+        cdir = os.path.join(td, "msprof_out")
+        os.mkdir(cdir)
+        with open(os.path.join(cdir, "op_statistic.csv"), "w", newline="") as f:
+            w = csv_mod.writer(f)
+            w.writerow(["Device_id", "OP Type", "Core Type", "Count", "Total Time(us)", "Avg(us)"])
+            w.writerow([3, "MatMulV2", "AI_CORE", 4, 1000.0, 250.0])  # 4x250us pre-aggregated
+            w.writerow([3, "FlashAttentionScoreDev", "AI_CORE", 2, 300.0, 150.0])
+        with open(os.path.join(cdir, "task_time.csv"), "w", newline="") as f:
+            w = csv_mod.writer(f)
+            w.writerow(["kernel_name", "kernel_type", "task_time(us)", "task_start(us)", "task_stop(us)"])
+            w.writerow(["MatMulV2", "ai_core", 9999.0, 0.0, 9999.0])  # must NOT be counted
+        with open(os.path.join(cdir, "operator_details.csv"), "w", newline="") as f:
+            w = csv_mod.writer(f)
+            w.writerow(["Name", "Host Self Duration(us)"])
+            w.writerow(["aten::linear", 500.0])  # host side: must NOT be counted
+        agg5 = aggregate(discover([cdir]), steps=1, use_csv=True)
+        if (
+            agg5["cats"]["gemm"]["us"] != 1000.0
+            or agg5["cats"]["gemm"]["count"] != 4
+            or agg5["cats"]["attention"]["us"] != 300.0
+            or agg5["cats"]["attention"]["count"] != 2
+            or len(agg5["files"]) != 1
+            or len(agg5["skipped"]) != 2
+        ):
+            print(f"FAIL canonical csv: {agg5['cats']['gemm']} files={agg5['files']} skipped={agg5['skipped']}")
             ok = False
 
         # inspect smoke: must not crash on the mixed fixture dir
