@@ -8,9 +8,9 @@
 | 部件 | 文件 | 验证状态 |
 |---|---|---|
 | 窗口触发器 | `research/profile_window.py` | 本地伪 SSE 服务器 E2E 通过(2 轮、start@tok5、stop 每轮、退出码) |
-| trace 聚合器 | `research/profile_step_breakdown.py` | `selftest` 全过:类别预算精确恢复、gzip、未归类榜、graph 不透明告警、差分精确 |
+| trace 聚合器 | `research/profile_step_breakdown.py` | `selftest` 全过:类别预算精确恢复、gzip、csv 源、未归类榜、graph 不透明告警、差分精确 |
 | serve 集成 | `run_baseline_npu.sh`(PROFILER/PROFILE_ONLY env) | bash -n;API 链路人工核实(见 §4) |
-| 批驱动 | `run_phase1.sh p15` | bash -n |
+| 批驱动 | `run_phase1.sh p15` | bash -n;**服务器首跑(08-26):T1 全绿,T2 触发链通但导出为 msprof Text 格式 → 走 §3 inspect 流程** |
 
 ## 1. 一键执行(容器内,repo 根目录)
 
@@ -32,6 +32,7 @@ bash research/run_phase1.sh p15          # ~10 个 run,一夜
 | 观察到 | 含义 | 动作 |
 |---|---|---|
 | SUMMARY 含 `prof:` 类别表 + `wall_ms_per_step` | 链路通 | 对比 wall_ms_per_step vs T1 同 cell ITL(profiler 税 sanity,应同量级) |
+| **`no device events (cats seen: ...)`** | **导出是 msprof Text 格式**(torch_npu Text 导出不产 chrome trace;首跑实证) | `python3 research/profile_step_breakdown.py inspect <prof目录>` 贴回结构摘要 → 按 cats 列用 `--device-cats/--memcpy-cats/--memset-cats` 覆盖参数重聚合,或 `--csv` 走 per-op 汇总表 |
 | `OPAQUE-GRAPH WARNING` | FULL 图 replay 把逐算子遮成单事件 | 用 `EXTRA_SERVE_ARGS=--enforce-eager` 重跑该配置(p15-prof 目录别覆盖:`PROFILER_DIR` 指新目录) |
 | `PROFILE-FAIL: /start_profile HTTP 404` | profiler router 未挂(vllm v0.23.0 门在 profiler_config 后) | 检查 serve 命令里 `--profiler-config` 是否带上(脚本自动加;被 EXTRA_SERVE_ARGS 覆盖会丢) |
 | `prof: NO trace files` + serve log 无 profiler 行 | TorchNPUProfilerWrapper 或 torch_npu profiler 崩 | 贴 serve log 中 profil 相关行;T2 降级 T1-only(设计 §7 预案) |
@@ -45,6 +46,7 @@ bash research/run_phase1.sh p15          # ~10 个 run,一夜
 - `ProfilerConfig`:`max_iterations`(engine 自动停,worker.py 每 execute_model 调 `profiler.step()`)、`torch_profiler_with_stack`(默认 true,NPU wrapper 映射到 with_modules、开销大 → 我们显式关)、`ignore_frontend`(跳过 AsyncLLM CPU 侧 trace)
 - NPU 侧:`vllm_ascend/profiler/torch_npu_profiler.py` 的 `TorchNPUProfilerWrapper`(Level1,`with_stack=False` 硬编码,data_simplification,`tensorboard_trace_handler` 导出 chrome trace)
 - 二次 /start_profile 语义:wrapper 自动停后仍 active,**每轮必须显式 /stop_profile** 复位(profile_window.py 已内置)
+- **勘误(08-26 服务器首跑实证)**:上一条"tensorboard_trace_handler 导出 chrome trace"**不成立**——torch_npu 的 `tensorboard_trace_handler` 只是触发 `prof_if.analyse()`,而 wrapper 的 `_ExperimentalConfig.export_type=Text`(torch_npu_profiler.py:50)使其走 **msprof Text 导出**(trace_view.json/profiler_info_0.json/sample.json 等,**无 chrome trace 事件文件**)。聚合器 v2 已加 `inspect` 子命令(打结构摘要)+ cat 覆盖参数 + `--csv` per-op 汇总源来吃这个格式
 
 ## 5. 参数默认值(均可 env 覆盖)
 
