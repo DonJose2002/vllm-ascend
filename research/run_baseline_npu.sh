@@ -24,8 +24,15 @@
 #   SAVE_TS=1 ...                                            # store token timestamps for R(t)
 #   TIERS=4096 CONCS=1 bash research/run_baseline_npu.sh eagle3 8009       # smoke = 1 cell
 #   EXTRA_SERVE_ARGS="--no-enable-prefix-caching" ...        # passthrough extra vllm serve flags (triage)
+#   PROFILER=1 PROFILE_ONLY=1 bash research/run_baseline_npu.sh dense 8010 # Phase 1.5 tax probe:
+#        # serve with --profiler-config (torch_npu wrapper), then ONE 4K/c1 decode window
+#        # bracketed by /start_profile //stop_profile (auto-bounded by max_iterations);
+#        # bench matrix is SKIPPED (profiler overhead would pollute it) and the SUMMARY
+#        # block embeds the aggregated per-step category TSV (profile_step_breakdown.py).
 # Key envs: NPU_MODEL, DRAFT, EAGLE3_MODEL, DFLASH_MODEL, K, NGRAM_MAX/NGRAM_MIN,
-#           TIERS, CONCS, NUM_PROMPTS, MAX_TOKENS, SEED_PROFILE, SAVE_TS, NPUS
+#           TIERS, CONCS, NUM_PROMPTS, MAX_TOKENS, SEED_PROFILE, SAVE_TS, NPUS,
+#           PROFILER, PROFILE_ONLY, PROFILER_DIR, PROFILER_STEPS, PROFILER_ROUNDS,
+#           PROFILER_START_TOKENS, PROFILE_TIER
 set -euo pipefail
 
 MODE="${1:?usage: run_baseline_npu.sh dense|sd|sda|ngram|eagle3|dflash PORT}"
@@ -240,6 +247,32 @@ if [ "$SEED_PROFILE" != "generic" ]; then
   NOTE="$NOTE; seed_profile=$SEED_PROFILE"
 fi
 
+# --- Phase 1.5 tax probe: optional torch-profiler serve + one-shot window ---
+# PROFILER and PROFILE_ONLY must be set TOGETHER: a profiled serve never runs
+# the bench matrix (profiler tax would pollute measurements - hygiene by
+# construction), and a profile-only serve without the profiler is pointless.
+# Serve-side window control (vllm v0.23.0 ProfilerConfig, consumed by the
+# vllm-ascend TorchNPUProfilerWrapper): with_stack stays FALSE (the NPU wrapper
+# maps it to with_modules - significant overhead); ignore_frontend skips the
+# AsyncLLM CPU-side trace; max_iterations lets the ENGINE auto-stop after N
+# steps, so the trace flushes per round without client-side timing guesses.
+PROFILER="${PROFILER:-0}"
+PROFILE_ONLY="${PROFILE_ONLY:-0}"
+PROFILER_STEPS="${PROFILER_STEPS:-40}"
+PROFILER_ROUNDS="${PROFILER_ROUNDS:-2}"
+PROFILER_START_TOKENS="${PROFILER_START_TOKENS:-24}"
+PROFILE_TIER="${PROFILE_TIER:-4096}"
+if [ "$PROFILER" = "1" ] || [ "$PROFILE_ONLY" = "1" ]; then
+  if [ "$PROFILER" != "1" ] || [ "$PROFILE_ONLY" != "1" ]; then
+    echo "PROFILER and PROFILE_ONLY must be set together (both =1)"; exit 1
+  fi
+  PROFILER_DIR="${PROFILER_DIR:-$OUTDIR/prof-$TAG}"
+  mkdir -p "$PROFILER_DIR"
+  PROFILER_DIR="$(cd "$PROFILER_DIR" && pwd)"
+  EXTRA_SERVE_ARGS="${EXTRA_SERVE_ARGS:-} --profiler-config {\"profiler\":\"torch\",\"torch_profiler_dir\":\"$PROFILER_DIR\",\"torch_profiler_with_stack\":false,\"ignore_frontend\":true,\"max_iterations\":$PROFILER_STEPS}"
+  NOTE="$NOTE; profile window only (steps=$PROFILER_STEPS x$PROFILER_ROUNDS, armed@tok$PROFILER_START_TOKENS, tier$PROFILE_TIER)"
+fi
+
 strip_log() {
   sed -E 's/^\((APIServer|EngineCore) pid=[0-9]+\) //; s/(INFO|ERROR|WARNING) [0-9]{2}-[0-9]{2} [0-9:]{8} \[[^]]*\] //'
 }
@@ -286,6 +319,21 @@ on_exit() {
   else
     echo "# bench json missing AND serve log empty/missing at $SERVE_LOG"
   fi
+  # Phase 1.5 profiler section: aggregate traces IN PLACE (server-side), embed
+  # the compact TSV in this paste block - trace files never leave the server.
+  if [ "${PROFILER:-0}" = "1" ]; then
+    if [ -n "${PROFILER_DIR:-}" ] && compgen -G "$PROFILER_DIR/*.json*" >/dev/null; then
+      echo "prof: dir=$PROFILER_DIR steps_per_round=$PROFILER_STEPS rounds=$PROFILER_ROUNDS"
+      python3 research/profile_step_breakdown.py \
+        --steps $((PROFILER_STEPS * PROFILER_ROUNDS)) \
+        "$PROFILER_DIR" 2>&1 | sed 's/^/prof: /' \
+        || echo "prof: aggregator failed"
+    else
+      echo "prof: NO trace files in ${PROFILER_DIR:-<unset>} - profiler chain broken"
+      echo "prof: upstream, grep serve log for 'profil' lines below:"
+      grep -i "profil" "$SERVE_LOG" 2>/dev/null | tail -5 | strip_log | sed 's/^/prof:   /' || true
+    fi
+  fi
   echo "===NPU_BASELINE_END==="
   echo "==================== COPY ABOVE ===================="
 }
@@ -318,20 +366,34 @@ for i in $(seq 1 120); do
 done
 
 if curl -s -o /dev/null "http://127.0.0.1:$PORT/v1/models"; then
-  echo ">>> benching $TAG (tiers=$TIERS concs=$CONCS profile=$SEED_PROFILE)"
-  python3 research/bench_baseline.py run \
-    --base-url "http://127.0.0.1:$PORT" \
-    --model qwen3-8b \
-    --tag "$TAG" \
-    --tiers "$TIERS" \
-    --concs "$CONCS" \
-    --num-prompts "$NUM_PROMPTS" \
-    --max-tokens "$MAX_TOKENS" \
-    --seed-profile "$SEED_PROFILE" \
-    "${BENCH_EXTRA[@]:+${BENCH_EXTRA[@]}}" \
-    --out "$OUTDIR/baseline-npu-qwen3-8b-$TAG.json" \
-    --note "$NOTE" \
-    || echo "# bench exited non-zero (partial summary follows)"
+  if [ "$PROFILE_ONLY" = "1" ]; then
+    echo ">>> profile window only (bench skipped) $TAG (tier=$PROFILE_TIER rounds=$PROFILER_ROUNDS steps=$PROFILER_STEPS)"
+    python3 research/profile_window.py \
+      --base-url "http://127.0.0.1:$PORT" \
+      --model qwen3-8b \
+      --tier "$PROFILE_TIER" \
+      --max-tokens "$MAX_TOKENS" \
+      --start-after-tokens "$PROFILER_START_TOKENS" \
+      --rounds "$PROFILER_ROUNDS" \
+      --timeout 600 \
+      || echo "# profile window failed (details above; SUMMARY still reports what traces exist)"
+    sleep 8  # let the engine flush the last trace file before teardown
+  else
+    echo ">>> benching $TAG (tiers=$TIERS concs=$CONCS profile=$SEED_PROFILE)"
+    python3 research/bench_baseline.py run \
+      --base-url "http://127.0.0.1:$PORT" \
+      --model qwen3-8b \
+      --tag "$TAG" \
+      --tiers "$TIERS" \
+      --concs "$CONCS" \
+      --num-prompts "$NUM_PROMPTS" \
+      --max-tokens "$MAX_TOKENS" \
+      --seed-profile "$SEED_PROFILE" \
+      "${BENCH_EXTRA[@]:+${BENCH_EXTRA[@]}}" \
+      --out "$OUTDIR/baseline-npu-qwen3-8b-$TAG.json" \
+      --note "$NOTE" \
+      || echo "# bench exited non-zero (partial summary follows)"
+  fi
 else
   echo ">>> server not up; skipping bench"
 fi

@@ -4,8 +4,12 @@
 # runs unattended; collects every SUMMARY block into a master log and prints a
 # paste-ready digest (per-JSON TSV + kregress/diff/KV-tax lines) at the end.
 #
-# Usage:  bash research/run_phase1.sh e1|e2|e3|all|digest [start_port]
+# Usage:  bash research/run_phase1.sh e1|e2|e3|p15|all|digest [start_port]
 # Night 1: e1 (K sweep, 16 cells, ~1h)      Night 2: e2 (22 cells, ~2h)
+# p15: Phase 1.5 tax probe (design: experiments/phase1.5-tax-probe-design.md in
+#      the notes repo) - T2 smoke (dense+profiler, biggest unknown FIRST) ->
+#      T1 ngram K in {1,3,8} (K=5 reuses E2; the no-profiler differential) ->
+#      T2 full (ngram/eagle3). ~10 runs, one night. Runbook: research/p15-runbook.md.
 # E3 requires Qwen3-1.7B at $NPU_DRAFT17 (default /nfs-share/hf_weights/Qwen3-1.7B).
 # digest: analysis only (summary + kregress + diff + KV tax) over whatever
 #         JSONs already sit under experiments/out/phase1 - no serves, no card.
@@ -23,7 +27,7 @@
 # must model resource dimensions, not just wall time.
 set -uo pipefail
 
-BATCH="${1:?usage: run_phase1.sh e1|e2|e3|all [start_port]}"
+BATCH="${1:?usage: run_phase1.sh e1|e2|e3|p15|all|digest [start_port]}"
 PORT="${2:-8110}"
 OUTROOT="${OUTROOT:-experiments/out/phase1}"
 NPU_DRAFT17="${NPU_DRAFT17:-/nfs-share/hf_weights/Qwen3-1.7B}"
@@ -175,6 +179,28 @@ digest() {
       echo "--- E2 diff (${#d_files[@]} files) ---"
       python3 research/bench_baseline.py diff "${d_files[@]}" 2>&1
     fi
+    if [ "$BATCH" = "p15" ]; then
+      # T1: ngram K regression (K=5 from E2 + k1/k3/k8 from this batch)
+      local nk=() f
+      for f in "$OUTROOT"/baseline-npu-qwen3-8b-npu-bf16-ngram-k{1,3,5,8}.json; do
+        [ -f "$f" ] && nk+=("$f")
+      done
+      if [ "${#nk[@]}" -ge 2 ]; then
+        echo "--- p15 T1 ngram kregress (${#nk[@]} files) ---"
+        python3 research/bench_baseline.py kregress "${nk[@]}" 2>&1
+      fi
+      # T2: cross-config category diff (server-side aggregation only)
+      local pd="$OUTROOT/p15-prof" dargs=() m
+      for m in dense ngram-k5 eagle3-k5; do
+        [ -d "$pd/prof-npu-bf16-$m" ] && dargs+=("$m=$pd/prof-npu-bf16-$m")
+      done
+      if [ "${#dargs[@]}" -ge 2 ]; then
+        echo "--- p15 T2 category diff (${#dargs[@]} configs) ---"
+        python3 research/profile_step_breakdown.py \
+          --steps $((${PROFILER_STEPS:-40} * ${PROFILER_ROUNDS:-2})) \
+          --diff "${dargs[@]}" 2>&1
+      fi
+    fi
     echo
     echo "--- E4 KV tax (per serve log) ---"
     grep -H "GPU KV cache size" "$OUTROOT"/serve-*.log "$OUTROOT"/*/serve-*.log 2>/dev/null \
@@ -223,6 +249,28 @@ case "$BATCH" in
     else
       banner "E3 SKIPPED: $NPU_DRAFT17 not present (pull Qwen/Qwen3-1.7B first)"
     fi
+    ;;
+esac
+
+case "$BATCH" in
+  p15)
+    # Phase 1.5 (design: experiments/phase1.5-tax-probe-design.md, notes repo).
+    # Order per design section 8: T2 SMOKE first - the torch-profiler chain on
+    # the pinned vllm v0.23.0 (router gating, TorchNPUProfilerWrapper, trace
+    # export) is the biggest unknown; if smoke fails, T1 still runs (profiler
+    # not involved) and T2 degrades per the design's fallback. Profiler runs
+    # are isolated under p15-prof/ so E2 serve logs (KV-tax evidence) are never
+    # clobbered - same layout discipline as e3-1p7b.
+    RUN_SUBDIR=p15-prof run dense "4096" "1" PROFILER=1 PROFILE_ONLY=1
+    unset RUN_SUBDIR
+    # T1: ngram K sweep, K=5 reuses the E2 run. Plain runs (no profiler).
+    for K in 1 3 8; do
+      run ngram "4096,16384" "1" K="$K"
+    done
+    # T2 full: ngram + eagle3 under the profiler (dense came from the smoke).
+    RUN_SUBDIR=p15-prof run ngram "4096" "1" K=5 PROFILER=1 PROFILE_ONLY=1
+    RUN_SUBDIR=p15-prof run eagle3 "4096" "1" K=5 PROFILER=1 PROFILE_ONLY=1
+    unset RUN_SUBDIR
     ;;
 esac
 

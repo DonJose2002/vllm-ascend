@@ -25,3 +25,8 @@
   - `bugfix-draft-model-full-graph.md` — bug3 严谨版(方案 C/A 设计、上游调研、事故 A-1)
 - `bench_sd.py` — SD 量化基准(bench/compare/check):双口径接受长度(metrics + 突发估计)、ITL/TTFT 分位、per-position 接受率;纯 stdlib 客户端
 - `test_SD.sh` — 服务器投机解码实验启动脚本(Qwen3-8B + Qwen3-0.6B draft,单卡,eager,带 profiler)
+- **Phase 1.5 税探针(2026-08-26,设计在笔记仓库 experiments/phase1.5-tax-probe-design.md)**:
+  - `p15-runbook.md` — 服务器执行手册(一键命令、回传协议、判读速查、已核实 API 链路)
+  - `profile_window.py` — T2 窗口触发器:单流请求 + 第 N token 处 arm /start_profile,engine 侧 max_iterations 自动停
+  - `profile_step_breakdown.py` — T2 服务器端 trace 聚合器:chrome trace(json/gz)→ 每步类别 TSV + 未归类榜 + graph 不透明告警 + --diff 差分;`selftest` 子命令自带数值精确恢复测试
+  - `run_baseline_npu.sh` 新 env:`PROFILER=1 PROFILE_ONLY=1`(serve 带 --profiler-config、跳过 bench 防 profiler 污染测量、SUMMARY 内嵌聚合 TSV)
