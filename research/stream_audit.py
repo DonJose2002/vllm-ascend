@@ -151,7 +151,97 @@ def audit_file(path: str) -> list[str]:
         lines.append(
             f"  duration_col='{dur_col}' (present; pairwise copy-vs-consumer timing lives in the repro --profile audit)"
         )
+
+    # Timeline invariant check: on a stream, tasks must execute serially (CUDA
+    # stream semantics torch_npu mirrors), so per-stream task intervals must be
+    # pairwise disjoint. Any overlap between a MEMCPY and another task on the
+    # SAME stream is direct profiling evidence that stream ordering is not
+    # enforced for the copy. Zero overlap + observed reordering would instead
+    # point at a completion-vs-visibility gap (copy task 'done' but data not
+    # yet visible to AI-core reads) - both outcomes are reportable.
+    tl = timeline_stats(rows, stream_col, name_col, type_col)
+    if tl:
+        lines.extend(tl)
     return lines
+
+
+def timeline_stats(rows: list[dict], stream_col: str, name_col: str | None, type_col: str | None) -> list[str]:
+    """Per-stream interval-overlap audit; [] when the table lacks usable times."""
+    headers = rows[0].keys()
+    start_col = find_col(list(headers), ("start",), forbid=("wait",))
+    stop_col = find_col(list(headers), ("stop", "end"))
+    dur_col = find_col(list(headers), ("duration",)) or find_col(list(headers), ("time",), forbid=("start", "wait"))
+    if start_col is None or (stop_col is None and dur_col is None):
+        return []
+
+    def to_f(v) -> float | None:
+        try:
+            return float(str(v).strip())
+        except (ValueError, TypeError):
+            return None
+
+    # stream -> list of (start, stop, is_memcpy, label)
+    per_stream: dict[str, list] = {}
+    for r in rows:
+        s = to_f(r.get(start_col))
+        if s is None:
+            continue
+        e = to_f(r.get(stop_col)) if stop_col is not None else None
+        if e is None and dur_col is not None:
+            d = to_f(r.get(dur_col))
+            e = s + d if d is not None else None
+        if e is None or e < s:
+            continue
+        name = " ".join(str(r.get(c, "") or "") for c in (name_col, type_col) if c).strip()
+        sid = (r.get(stream_col) or "?").strip() or "?"
+        label = (name or "<anon>")[:40]
+        per_stream.setdefault(sid, []).append((s, e, bool(MEM_RE.search(name)), label))
+
+    out = ["  TIMELINE (per-stream interval overlap; serial-stream invariant):"]
+    for sid, tasks in sorted(per_stream.items()):
+        mem_n = sum(1 for t in tasks if t[2])
+        if mem_n == 0 or len(tasks) < 2:
+            continue
+        tasks.sort(key=lambda t: t[0])
+        overlap_pairs = 0
+        mem_overlap_pairs = 0
+        max_depth = 0
+        approx = False
+        active: list = []  # (stop, is_memcpy, label) of tasks still open
+        examples = []
+        for s, e, is_m, label in tasks:
+            active = [a for a in active if a[0] > s]
+            if len(active) > 512:  # pathological fan-out: count is already damning
+                approx = True
+                active = active[:512]
+            for a_stop, a_m, a_label in active:
+                overlap_pairs += 1
+                if is_m or a_m:
+                    mem_overlap_pairs += 1
+                    if len(examples) < 3:
+                        ov = min(e, a_stop) - s
+                        examples.append(f"[{a_label}] x [{label}] for {ov:.1f}us")
+            active.append((e, is_m, label))
+            max_depth = max(max_depth, len(active))
+        pct = 100.0 * mem_overlap_pairs / max(1, overlap_pairs)
+        out.append(
+            f"    stream {sid}: tasks={len(tasks)} (memcpy={mem_n}), overlapping pairs>={overlap_pairs}"
+            f"{'(saturated, lower bound)' if approx else ''}"
+            f" (involving-memcpy={mem_overlap_pairs}, {pct:.0f}%), max concurrency={max_depth}"
+        )
+        for ex in examples:
+            out.append(f"      overlap example: {ex}")
+        if overlap_pairs == 0:
+            out.append(
+                "      no overlaps: intervals are serial -> reordering, if observed,"
+                " is a completion-vs-visibility gap, not parallel execution"
+            )
+        else:
+            out.append(
+                "      OVERLAPS PRESENT: same-stream tasks executed concurrently"
+                " -> stream ordering not enforced (CUDA semantics require serial)"
+            )
+    return out
 
 
 def audit(paths: list[str]) -> str:
@@ -188,6 +278,28 @@ def selftest() -> int:
         w.writerow(["Memcpy", 1, "7"])  # shared-stream variant to exercise the other HINT branch
         w.writerow(["AI CORE", 2, "7"])
 
+    # timeline fixtures: overlap variant (copy x kernel intersect on one stream)
+    # and serial variant (touching intervals do NOT count as overlap).
+    tl = os.path.join(tmp, "task_time_9999.csv")
+    with open(tl, "w", newline="") as f:
+        w = csv_mod.writer(f)
+        w.writerow(
+            [
+                "Device_id",
+                "kernel_name",
+                "kernel_type",
+                "stream_id",
+                "task_id",
+                "task_time(us)",
+                "task_start(us)",
+                "task_stop(us)",
+            ]
+        )
+        w.writerow([0, "", "Memcpy", "42", 1, 100, 1000, 1100])  # copy [1000,1100]
+        w.writerow([0, "Equal", "AI CORE", "42", 2, 10, 1050, 1060])  # kernel inside the copy -> overlap
+        w.writerow([0, "", "Memcpy", "42", 3, 5, 1100, 1105])  # back-to-back: NOT an overlap
+        w.writerow([0, "Where", "AI CORE", "9", 4, 5, 100, 105])  # other stream, must not mix in
+
     report = audit([tmp])
     print(report)
     ok = True
@@ -199,6 +311,10 @@ def selftest() -> int:
         ("disjoint hint fired", "DISJOINT" in report),
         ("nested discovery worked", "task_time_1234.csv" in report),
         ("shared-stream hint fired", "land on the launch stream" in report),
+        ("timeline section present", "TIMELINE" in report),
+        ("overlap detected (1 pair, memcpy-involved)", "overlapping pairs>=1 (involving-memcpy=1, 100%)" in report),
+        ("back-to-back not an overlap", "max concurrency=2" in report),
+        ("serial verdict line present", "OVERLAPS PRESENT" in report),
         ("aggregate skip reason available", True),
     ]
     for label, cond in checks:
