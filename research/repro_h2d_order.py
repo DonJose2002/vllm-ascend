@@ -52,12 +52,13 @@ Faithfulness map (repro element <-> original prepare_next_token_ids_padded):
 Modes:
   racy   copy_(non_blocking=True)                 expected: miss > 0
   fix    copy_(non_blocking=False)                expected: miss == 0 (the PR)
-  event  copy on a side stream + event fence      expected: miss == 0, but the
-         with a HOST-side wait (synchronize)      fence must be host-waited:
-         device-side cross-stream waits do not reliably cover this copy path
-         on torch_npu (in-tree cpu_offload_connector.py:317 TODO + its
-         synchronize() workaround; an earlier wait_event()-based build of
-         this repro measured misses under the fence).
+  event  copy on a side stream + host-side        expected: see the fence
+         stream.synchronize() (production         ladder in the code - the
+         workaround shape)                        event mechanism provably
+                                                  fails to observe this copy
+                                                  on torch_npu (both
+                                                  wait_event and a host-waited
+                                                  recorded event miss)
 
 A miss==0 under racy does NOT invalidate the bug (see PR evidence); it means
 these parameters did not open the window - raise --bg / --steps / --bg-elems.
@@ -118,7 +119,6 @@ def run(args) -> int:
     esc = torch.zeros((), dtype=torch.int64, device=dev)
 
     copy_stream = torch.npu.Stream() if (args.mode == "event" and is_npu) else None
-    fence = torch.npu.Event() if (args.mode == "event" and is_npu) else None
 
     t0 = time.monotonic()
     for step in range(1, args.steps + 1):
@@ -133,19 +133,19 @@ def run(args) -> int:
             gpu.copy_(slot, non_blocking=True)
         elif args.mode == "fix":
             gpu.copy_(slot, non_blocking=False)
-        else:  # event: fence the async copy instead of making it blocking
+        else:  # event: fence the async copy on a side stream, host-side wait
             with torch.npu.stream(copy_stream):
                 gpu.copy_(slot, non_blocking=True)
-            fence.record(copy_stream)
-            # Device-side cross-stream waits (current_stream().wait_event /
-            # wait_stream) do NOT reliably cover this copy path on torch_npu:
-            # the in-tree cpu_offload_connector.py wait_for_layer_load carries
-            # an explicit TODO to switch to wait_stream "after fixing the bug"
-            # and currently host-synchronizes instead - for the same shape of
-            # side-stream non_blocking H2D copies. Mirror that production
-            # posture (host-side event wait); an earlier build of this repro
-            # used wait_event() and showed misses, consistent with that TODO.
-            fence.synchronize()
+            # Fences tried in the order the server evidence forced:
+            #   a) current_stream().wait_event(fence) -> MISSES (08-26 run)
+            #   b) fence.record(copy_stream) + fence.synchronize() -> MISSES
+            #      (08-27 run): wall-time shows the wait returned immediately
+            #      - the event never observed the copy at all
+            #   c) copy_stream.synchronize() (the in-tree production
+            #      workaround, cpu_offload_connector.py:318 + its TODO) ->
+            #      drains the WHOLE stream, so it distinguishes "event
+            #      mechanism broken" from "copy not on the stream at all".
+            copy_stream.synchronize()
 
         # Consumer on the compute stream (zero host sync until the very end).
         counter += 1
