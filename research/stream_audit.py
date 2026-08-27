@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import argparse
 import csv as csv_mod
+import itertools
 import os
 import re
 import sys
@@ -268,6 +269,19 @@ def timeline_stats(rows: list[dict], stream_col: str, name_col: str | None, type
                 f" start-inversions={inv_total} (cross-class={inv_cross} memcpy-vs-other,"
                 f" mem-mem={inv_memmem})"
             )
+            # (c) arrival-order class pattern: compress the task-id sequence
+            # into M(memcpy)/K(other) blocks. task ids are RUNTIME-arrival
+            # order, so this reveals whether copies arrive at the runtime in
+            # the Python emission order. The repro emits 9 copies then 7
+            # kernels per step: expect repeating "9M 7K" blocks; a leading K
+            # block / "7K 9M" pattern means the copies were enqueued to the
+            # runtime AFTER the kernels that were launched later - the
+            # host-side queue reordered emission order (arrival inversion).
+            blocks = []
+            for is_m, grp in itertools.groupby(ordered, key=lambda t: t[2]):
+                blocks.append(("M" if is_m else "K", len(list(grp))))
+            pat = " ".join(f"{n}{c}" for c, n in blocks[:24])
+            out.append(f"      ARRIVAL pattern (task-id order, M=memcpy K=other): {pat}")
             shown = 0
             for i in range(len(ordered)):  # example hunting, bounded work
                 for j in range(i + 1, min(i + 9, len(ordered))):
@@ -408,6 +422,7 @@ def selftest() -> int:
         ("order analysis present", "ORDER (dispatch-order vs start-time)" in report),
         ("cross-class inversion counted", "start-inversions=1 (cross-class=1 memcpy-vs-other, mem-mem=0)" in report),
         ("inversion example shown", "dispatched BEFORE" in report),
+        ("arrival pattern rendered", "ARRIVAL pattern (task-id order, M=memcpy K=other): 1M 1K 1M 1K" in report),
         ("aggregate skip reason available", True),
     ]
     for label, cond in checks:
