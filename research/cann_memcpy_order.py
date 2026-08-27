@@ -205,35 +205,70 @@ def run(args) -> int:
 
     miss = 0
     stale_lags: dict = {}
+
+    # dispatch topology: torch_npu issues BOTH memcpys and kernels from its
+    # task-queue consumer thread (OpCommand::RunOpApiV2 enqueues EXECUTE_OPAPI_V2
+    # too), while the USER thread performs the fences (stream/event sync - the
+    # host queue is drained before them). --dispatch threaded reproduces that
+    # topology faithfully: a worker thread executes the H2D copies AND the D2H
+    # readback in strict FIFO order; the main thread waits until everything is
+    # submitted (queue.join, mirroring the host-queue drain), then
+    # synchronizes the stream and compares. A stale read under THIS shape
+    # means same-stream ordering depends on which thread submitted the work -
+    # a runtime defect form direct submission cannot expose.
+    import queue as queue_mod
+    import threading
+
+    work_q: queue_mod.Queue = queue_mod.Queue()
+    h2d_failed: list = []
+
+    def submit(dst: int, src: int, nbytes: int, kind: int, what: str) -> None:
+        if args.dispatch == "direct":
+            acl.chk(acl.lib.aclrtMemcpyAsync(dst, nbytes, src, nbytes, kind, stream), what)
+        else:
+            work_q.put((dst, src, nbytes, kind, what))
+
+    def worker() -> None:
+        while True:
+            item = work_q.get()
+            if item is None:
+                work_q.task_done()
+                return
+            dst, src, nbytes, kind, what = item
+            try:
+                err = acl.lib.aclrtMemcpyAsync(dst, nbytes, src, nbytes, kind, stream)
+                if err != ACL_ERROR_NONE:
+                    h2d_failed.append(f"{what}: aclError={err}")
+            except Exception as e:  # noqa: BLE001
+                h2d_failed.append(f"{what}: {e}")
+            work_q.task_done()
+
+    worker_thread = None
+    if args.dispatch == "threaded":
+        worker_thread = threading.Thread(target=worker, daemon=True)
+        worker_thread.start()
+
     t0 = time.monotonic()
     for step in range(1, args.steps + 1):
         src_view[0] = step  # host write: this step's value
 
         if bg_dev is not None:
             for _ in range(args.bg):
-                acl.chk(
-                    acl.lib.aclrtMemcpyAsync(
-                        bg_dev,
-                        args.bg_elems * 4,
-                        bg_pin,
-                        args.bg_elems * 4,
-                        ACL_MEMCPY_HOST_TO_DEVICE,
-                        stream,
-                    ),
-                    "bg aclrtMemcpyAsync",
-                )
+                submit(bg_dev, bg_pin, args.bg_elems * 4, ACL_MEMCPY_HOST_TO_DEVICE, "bg aclrtMemcpyAsync")
 
         if args.mode == "racy":
-            acl.chk(
-                acl.lib.aclrtMemcpyAsync(dev, payload_b, src_ptr, payload_b, ACL_MEMCPY_HOST_TO_DEVICE, stream),
-                "test aclrtMemcpyAsync",
-            )
+            submit(dev, src_ptr, payload_b, ACL_MEMCPY_HOST_TO_DEVICE, "test aclrtMemcpyAsync")
         else:  # sync control: synchronous aclrtMemcpy, no stream involved
             acl.chk(
                 acl.lib.aclrtMemcpy(dev, payload_b, src_ptr, payload_b, ACL_MEMCPY_HOST_TO_DEVICE),
                 "aclrtMemcpy",
             )
 
+        # fences mirror torch_npu: NPUStream::synchronize() drains the host
+        # queue BEFORE waiting, so under threaded dispatch the worker must
+        # have submitted everything first (join), then the fence runs.
+        if args.fence != "none" and args.dispatch == "threaded":
+            work_q.join()
         if args.fence == "stream_sync":
             acl.chk(acl.lib.aclrtSynchronizeStream(stream), "aclrtSynchronizeStream")
         elif args.fence == "event_sync":
@@ -243,11 +278,13 @@ def run(args) -> int:
             acl.chk(acl.lib.aclrtRecordEvent(event, stream), "aclrtRecordEvent")
             acl.chk(acl.lib.aclrtStreamWaitEvent(stream, event), "aclrtStreamWaitEvent")
 
-        # consumer: async D2H on the same stream, then a hard sync
-        acl.chk(
-            acl.lib.aclrtMemcpyAsync(pin_back, payload_b, dev, payload_b, ACL_MEMCPY_DEVICE_TO_HOST, stream),
-            "readback aclrtMemcpyAsync",
-        )
+        # consumer: async D2H on the same stream; under threaded dispatch it
+        # goes through the worker AFTER all H2Ds of this step (strict FIFO),
+        # exactly like kernels follow the copy in torch_npu's host queue.
+        submit(pin_back, dev, payload_b, ACL_MEMCPY_DEVICE_TO_HOST, "readback aclrtMemcpyAsync")
+
+        if args.dispatch == "threaded":
+            work_q.join()  # everything submitted (host-queue drain equivalent)
         acl.chk(acl.lib.aclrtSynchronizeStream(stream), "final aclrtSynchronizeStream")
 
         got = as_i32(pin_back, args.payload)[0]
@@ -257,6 +294,11 @@ def run(args) -> int:
             stale_lags[lag] = stale_lags.get(lag, 0) + 1
 
     wall = time.monotonic() - t0
+    if worker_thread is not None:
+        work_q.put(None)
+        worker_thread.join(timeout=30)
+        if h2d_failed:
+            print(f"worker-thread ACL errors: {h2d_failed[:3]}")
 
     # cleanup
     if bg_dev is not None:
@@ -271,14 +313,23 @@ def run(args) -> int:
 
     bg_desc = f"{args.bg}x{args.bg_elems * 4 // 1024}KiB" if args.bg else "off"
     print(
-        f"mode={args.mode} fence={args.fence} host_mem={args.host_mem} steps={args.steps} "
-        f"payload={payload_b}B bg={bg_desc} wall={wall:.2f}s ({wall / args.steps * 1e6:.1f}us/step)"
+        f"mode={args.mode} fence={args.fence} dispatch={args.dispatch} host_mem={args.host_mem} "
+        f"steps={args.steps} payload={payload_b}B bg={bg_desc} "
+        f"wall={wall:.2f}s ({wall / args.steps * 1e6:.1f}us/step)"
     )
     stale = ", ".join(f"lag={k}:{v}" for k, v in sorted(stale_lags.items())[:4])
     print(f"miss={miss} ({100.0 * miss / args.steps:.2f}% of steps)" + (f" stale: {stale}" if stale else ""))
 
-    if args.mode == "sync":
+    if h2d_failed:
+        verdict = "ABORTED: worker-thread H2D errors (see above)"
+    elif args.mode == "sync":
         verdict = "PASS (sync memcpy ordered)" if miss == 0 else "UNEXPECTED: even synchronous memcpy misreads"
+    elif miss > 0 and args.dispatch == "threaded":
+        verdict = (
+            "CROSS-THREAD REPRODUCTION: memcpys submitted from another thread are not ordered"
+            " with / not observed by the main thread's same-stream consumer and stream sync -"
+            " matches torch_npu's task-queue topology"
+        )
     elif miss > 0 and args.fence in ("none", "event_sync", "event_wait"):
         verdict = (
             "PURE-CANN REPRODUCTION: same-stream H2D->D2H read stale data (completion not joined into stream order)"
@@ -289,8 +340,8 @@ def run(args) -> int:
         )
     elif miss == 0:
         verdict = (
-            "NOT reproduced at pure-CANN level (raise --bg/--steps; if still clean,"
-            " suspicion returns to torch_npu task queue)"
+            "NOT reproduced at pure-CANN level (raise --bg/--steps, try --dispatch threaded;"
+            " if still clean, suspicion returns to torch_npu task queue internals)"
         )
     print(f"verdict: {verdict}")
     print(
@@ -306,6 +357,13 @@ def run(args) -> int:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--device", type=int, default=0)
+    ap.add_argument(
+        "--dispatch",
+        choices=["direct", "threaded"],
+        default="direct",
+        help="direct: all ACL calls from the main thread; threaded: H2D memcpys from a"
+        " worker thread (mirrors torch_npu's task-queue consumer), D2H/sync from main",
+    )
     ap.add_argument("--mode", choices=["racy", "sync"], default="racy")
     ap.add_argument("--fence", choices=["none", "stream_sync", "event_sync", "event_wait"], default="none")
     ap.add_argument(
