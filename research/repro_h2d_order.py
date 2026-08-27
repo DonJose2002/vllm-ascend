@@ -50,15 +50,19 @@ Faithfulness map (repro element <-> original prepare_next_token_ids_padded):
                             orthogonal host-write-vs-inflight-read confounder.
 
 Modes:
-  racy   copy_(non_blocking=True)                 expected: miss > 0
-  fix    copy_(non_blocking=False)                expected: miss == 0 (the PR)
-  event  copy on a side stream + host-side        expected: see the fence
-         stream.synchronize() (production         ladder in the code - the
-         workaround shape)                        event mechanism provably
-                                                  fails to observe this copy
-                                                  on torch_npu (both
-                                                  wait_event and a host-waited
-                                                  recorded event miss)
+  racy   copy_(non_blocking=True)   expected miss>0; rate grows with --bg
+                                    (0.7% calm -> ~100% under backlog, server
+                                    measured) mirroring the engine-side
+                                    4K-occasional / 16K-deterministic split
+  fix    copy_(non_blocking=False)  expected miss==0 (the PR fix) - the ONLY
+                                    local synchronization that works
+  event  copy on a side stream +    expected miss>0: server-measured fence
+         stream.synchronize()       ladder - wait_event, host-waited recorded
+                                    event, and whole-stream synchronize ALL
+                                    miss with wall-times proving no wait
+                                    happened: the copy is OFF-STREAM (an
+                                    internal SDMA channel invisible to the
+                                    stream/event apparatus on this stack)
 
 A miss==0 under racy does NOT invalidate the bug (see PR evidence); it means
 these parameters did not open the window - raise --bg / --steps / --bg-elems.
@@ -167,9 +171,15 @@ def run(args) -> int:
     if args.device == "cpu":
         expected_zero = True  # cpu copies are synchronous by construction
     else:
-        expected_zero = args.mode in ("fix", "event")
+        expected_zero = args.mode == "fix"
     if expected_zero:
         verdict = "PASS (ordered as expected)" if miss_n == 0 else "UNEXPECTED miss>0"
+    elif args.mode == "event":
+        verdict = (
+            "OFF-STREAM COPY CONFIRMED (fence cannot observe it; blocking is the only local sync)"
+            if miss_n > 0
+            else "stream sync covered the copy (contradicts the off-stream finding)"
+        )
     else:
         verdict = (
             "RACE REPRODUCED (unordered copy observed)"
