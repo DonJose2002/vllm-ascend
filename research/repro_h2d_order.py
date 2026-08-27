@@ -82,17 +82,49 @@ Usage (server, inside the v0.23.0 container, no serve needed):
   python3 research/repro_h2d_order.py --mode fix
   python3 research/repro_h2d_order.py --mode racy --bg 0      # calm control
   python3 research/repro_h2d_order.py --device cpu --mode racy # logic selftest
+  python3 research/repro_h2d_order.py --mode racy --steps 50 \
+      --profile /tmp/reprof        # torch_npu profiler (msprof Text export),
+                                   # then auto-audits memcpy vs compute stream
+                                   # ownership via research/stream_audit.py
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
 
 import torch
 
 SENTINEL = -1  # upstream get_token_id()'s uncommitted-position sentinel
+
+
+def make_profiler(out_dir: str):
+    """torch_npu profiler with the SAME construction as vllm-ascend's
+    TorchNPUProfilerWrapper (Level1, msprof Text export) so the export layout
+    matches what research/profile_step_breakdown.py + stream_audit.py expect."""
+    import torch_npu.profiler as prof
+
+    experimental_config = prof._ExperimentalConfig(
+        export_type=prof.ExportType.Text,
+        profiler_level=prof.ProfilerLevel.Level1,
+        msprof_tx=False,
+        aic_metrics=prof.AiCMetrics.PipeUtilization,
+        l2_cache=False,
+        op_attr=False,
+        data_simplification=True,
+        record_op_args=False,
+        gc_detect_threshold=None,
+    )
+    return prof.profile(
+        activities=[prof.ProfilerActivity.CPU, prof.ProfilerActivity.NPU],
+        with_stack=False,
+        profile_memory=False,
+        with_modules=False,
+        experimental_config=experimental_config,
+        on_trace_ready=prof.tensorboard_trace_handler(out_dir, worker_name="repro_h2d"),
+    )
 
 
 def run(args) -> int:
@@ -102,6 +134,10 @@ def run(args) -> int:
         import torch_npu  # noqa: F401
 
     pin = is_npu  # pinned memory only meaningful on the npu path
+    profiling = bool(getattr(args, "profile", None))
+    if profiling and not is_npu:
+        print("--profile is npu-only (msprof export); dropping it for the cpu selftest")
+        profiling = False
 
     def buf(n: int, fill: int = 0, dtype=torch.int32):
         return torch.full((n,), fill, dtype=dtype, pin_memory=pin)
@@ -124,37 +160,46 @@ def run(args) -> int:
 
     copy_stream = torch.npu.Stream() if (args.mode == "event" and is_npu) else None
 
+    import contextlib
+
+    if profiling and args.steps > 200:
+        print(f"note: --profile with steps={args.steps} makes a heavy export; consider --steps 50-200")
+
     t0 = time.monotonic()
-    for step in range(1, args.steps + 1):
-        slot = cpu_a if step % 2 == 1 else cpu_b
-        slot.fill_(step)  # host write: this step's "real token id"
+    ctx = make_profiler(args.profile) if profiling else contextlib.nullcontext()
+    with ctx as prof_obj:
+        for step in range(1, args.steps + 1):
+            slot = cpu_a if step % 2 == 1 else cpu_b
+            slot.fill_(step)  # host write: this step's "real token id"
 
-        if bg_gpu is not None:
-            for _ in range(args.bg):
-                bg_gpu.copy_(bg_cpu, non_blocking=True)
+            if bg_gpu is not None:
+                for _ in range(args.bg):
+                    bg_gpu.copy_(bg_cpu, non_blocking=True)
 
-        if args.mode == "racy":
-            gpu.copy_(slot, non_blocking=True)
-        elif args.mode == "fix":
-            gpu.copy_(slot, non_blocking=False)
-        else:  # event: fence the async copy on a side stream, host-side wait
-            with torch.npu.stream(copy_stream):
+            if args.mode == "racy":
                 gpu.copy_(slot, non_blocking=True)
-            # Fences tried in the order the server evidence forced:
-            #   a) current_stream().wait_event(fence) -> MISSES (08-26 run)
-            #   b) fence.record(copy_stream) + fence.synchronize() -> MISSES
-            #      (08-27 run): wall-time shows the wait returned immediately
-            #      - the event never observed the copy at all
-            #   c) copy_stream.synchronize() (the in-tree production
-            #      workaround, cpu_offload_connector.py:318 + its TODO) ->
-            #      drains the WHOLE stream, so it distinguishes "event
-            #      mechanism broken" from "copy not on the stream at all".
-            copy_stream.synchronize()
+            elif args.mode == "fix":
+                gpu.copy_(slot, non_blocking=False)
+            else:  # event: fence the async copy on a side stream, host-side wait
+                with torch.npu.stream(copy_stream):
+                    gpu.copy_(slot, non_blocking=True)
+                # Fences tried in the order the server evidence forced:
+                #   a) current_stream().wait_event(fence) -> MISSES (08-26 run)
+                #   b) fence.record(copy_stream) + fence.synchronize() -> MISSES
+                #      (08-27 run): wall-time shows the wait returned immediately
+                #      - the event never observed the copy at all
+                #   c) copy_stream.synchronize() (the in-tree production
+                #      workaround, cpu_offload_connector.py:318 + its TODO) ->
+                #      drains the WHOLE stream, so it distinguishes "event
+                #      mechanism broken" from "copy not on the stream at all".
+                copy_stream.synchronize()
 
-        # Consumer on the compute stream (zero host sync until the very end).
-        counter += 1
-        miss += (gpu[0] != counter).to(torch.int64)
-        esc += (gpu[0] == SENTINEL).to(torch.int64)
+            # Consumer on the compute stream (zero host sync until the very end).
+            counter += 1
+            miss += (gpu[0] != counter).to(torch.int64)
+            esc += (gpu[0] == SENTINEL).to(torch.int64)
+            if profiling:
+                prof_obj.step()
 
     wall = time.monotonic() - t0
     miss_n = int(miss)
@@ -187,6 +232,17 @@ def run(args) -> int:
             else "no race under these parameters - raise --bg/--steps/--bg-elems"
         )
     print(f"verdict: {verdict}")
+
+    if profiling:
+        # on_trace_ready fires on context exit; audit whatever landed (the
+        # msprof Text export writes PROF_* subtrees under args.profile).
+        try:
+            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            import stream_audit
+
+            print(stream_audit.audit([args.profile]))
+        except Exception as e:  # noqa: BLE001 - audit is best-effort reporting
+            print(f"profile audit failed ({e}); rerun later: python3 research/stream_audit.py {args.profile}")
     return 0 if (miss_n == 0) == expected_zero else 1
 
 
@@ -194,7 +250,7 @@ def selftest() -> int:
     """Logic check on cpu: both modes must run clean and report zero misses."""
     ok = True
     for mode in ("racy", "fix"):
-        args = argparse.Namespace(device="cpu", mode=mode, steps=500, payload=16, bg=2, bg_elems=1024)
+        args = argparse.Namespace(device="cpu", mode=mode, steps=500, payload=16, bg=2, bg_elems=1024, profile=None)
         print(f"--- selftest {mode} ---")
         if run(args) != 0:
             ok = False
@@ -212,6 +268,12 @@ def main() -> int:
     )
     ap.add_argument("--bg", type=int, default=8, help="background large H2D copies per step (0 = calm-window control)")
     ap.add_argument("--bg-elems", type=int, default=262144, help="int32 elements of each background copy (1MiB)")
+    ap.add_argument(
+        "--profile",
+        default=None,
+        metavar="DIR",
+        help="npu-only: enable torch_npu profiler, msprof Text export into DIR, then auto-audit stream ownership",
+    )
     args = ap.parse_args()
     if args.device == "cpu" and args.mode == "event":
         print("event mode is npu-only (cross-stream fence); use racy/fix on cpu")
