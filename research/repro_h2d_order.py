@@ -105,6 +105,7 @@ Usage (server, inside the v0.23.0 container, no serve needed):
 from __future__ import annotations
 
 import argparse
+import ctypes
 import os
 import sys
 import time
@@ -141,12 +142,20 @@ def make_profiler(out_dir: str):
     )
 
 
-def acl_direct_copy_factory(is_npu: bool):
+def acl_direct_copy_factory(is_npu: bool, with_query: bool = False):
     """Return f(dst_tensor, src_tensor, nbytes) that submits ONE
     aclrtMemcpyAsync (H2D) on the CURRENT torch.npu stream from this (main)
     thread, bypassing torch_npu's copy_ path entirely. Reuses the lib
     discovery/binding from cann_memcpy_order; returns None if unavailable
-    (caller falls back to torch copy_ with a loud notice)."""
+    (caller falls back to torch copy_ with a loud notice).
+
+    with_query=True additionally mirrors torch_npu's copy_ epilogue: right
+    after the memcpy, process_non_blocking_copy calls aclrtPointerGetAttributes
+    on the host pointer (CachingHostAllocator.cpp:1356) before returning. If
+    that incidental runtime call acts as an implicit flush/barrier, adding it
+    here should drop the miss rate back to torch copy_'s level - pinning the
+    true self-healing mechanism of the torch path (record_event itself is
+    pure bookkeeping, CachingHostAllocator.cpp:689-719)."""
     if not is_npu:
         return None
     try:
@@ -155,6 +164,26 @@ def acl_direct_copy_factory(is_npu: bool):
 
         acl = cann_memcpy_order.Acl(cann_memcpy_order.find_lib())
         stream_handle = torch.npu.current_stream().npu_stream
+
+        query = None
+        if with_query:
+
+            class PtrAttrs(ctypes.Structure):
+                _fields_ = [
+                    ("id", ctypes.c_uint32),
+                    ("type", ctypes.c_int32),  # aclrtMemLocationType enum
+                    ("pageSize", ctypes.c_uint32),
+                    ("rsv", ctypes.c_uint32 * 4),
+                ]
+
+            acl.lib.aclrtPointerGetAttributes.argtypes = [ctypes.c_void_p, ctypes.POINTER(PtrAttrs)]
+            acl.lib.aclrtPointerGetAttributes.restype = ctypes.c_int32
+
+            def query(src_ptr: int) -> None:
+                attrs = PtrAttrs()
+                err = acl.lib.aclrtPointerGetAttributes(ctypes.c_void_p(src_ptr), ctypes.byref(attrs))
+                if err != 0:
+                    raise RuntimeError(f"aclrtPointerGetAttributes failed: aclError={err}")
 
         def f(dst, src, nbytes: int) -> None:
             err = acl.lib.aclrtMemcpyAsync(
@@ -167,6 +196,8 @@ def acl_direct_copy_factory(is_npu: bool):
             )
             if err != 0:
                 raise RuntimeError(f"aclrtMemcpyAsync direct submit failed: aclError={err}")
+            if query is not None:
+                query(src.data_ptr())
 
         return f
     except Exception as e:  # noqa: BLE001 - fallback path must stay loud
@@ -207,7 +238,9 @@ def run(args) -> int:
 
     copy_stream = torch.npu.Stream() if (args.mode == "event" and is_npu) else None
 
-    acl_direct = acl_direct_copy_factory(is_npu) if getattr(args, "copy_mode", "torch") == "acl-direct" else None
+    acl_direct = None
+    if getattr(args, "copy_mode", "torch") != "torch":
+        acl_direct = acl_direct_copy_factory(is_npu, with_query=args.copy_mode == "acl-direct-query")
 
     import contextlib
 
@@ -331,10 +364,11 @@ def main() -> int:
     )
     ap.add_argument(
         "--copy-mode",
-        choices=["torch", "acl-direct"],
+        choices=["torch", "acl-direct", "acl-direct-query"],
         default="torch",
         help="tested copy channel: torch = Tensor.copy_ (host task queue); acl-direct = ctypes"
-        " aclrtMemcpyAsync from the main thread on the current torch.npu stream (channel-matrix attribution)",
+        " aclrtMemcpyAsync from the main thread on the current torch.npu stream; acl-direct-query"
+        " additionally mirrors torch copy_'s aclrtPointerGetAttributes epilogue (barrier test)",
     )
     args = ap.parse_args()
     if args.device == "cpu" and args.mode == "event":
