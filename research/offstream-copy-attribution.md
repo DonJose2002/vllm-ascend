@@ -358,8 +358,11 @@ TASK_QUEUE_ENABLE=0 治愈 ⇒ 队列机制肇因实锤(与 ASCEND_LAUNCH_BLOCKI
 - **torch_npu 侧次要问题**:TQ=1 拓扑(算子由 consumer 异步提交)放大窗口
   至必然级(99.9%),是暴露面而非根因;
 - **#14922 fix(blocking)正确且必要**:同步 aclrtMemcpy 不经 SDMA 异步通道;
-- 仍开放(可选):格 2 无 profile 加压(bg=16×4MiB / steps=5000)验证
-  "TQ=0+torch 的 0% 是巧合"→ miss>0 则统一模型完全闭环。
+- ~~仍开放(可选):格 2 无 profile 加压验证~~ **✅ 已实证(2026-08-27 夜)**:
+  `TQ=0 + torch copy_ + bg=16×4MiB(64MiB/步积压), steps=5000` →
+  **miss=4997/5000 = 99.94%**——"TQ=0+torch 的 0% 是巧合"定谳,统一模型
+  完全闭环:**没有任何 torch_npu 提交路径是安全的**,窗口开度唯一由
+  SDMA 积压量 vs 算子提交延迟的赛跑决定(64MiB 积压 >> epilogue 微差)。
 
 ### issue 方向(重写)
 
