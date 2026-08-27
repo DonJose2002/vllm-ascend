@@ -310,3 +310,60 @@ TASK_QUEUE_ENABLE=0 治愈 ⇒ 队列机制肇因实锤(与 ASCEND_LAUNCH_BLOCKI
       --steps 50 --bg 8 --copy-mode acl-direct --profile /tmp/reprof_g4
   python3 research/stream_audit.py /tmp/reprof_g4 | grep -E "MEMCPY|ARRIVAL|tasks="
   ```
+
+## 13. 第六轮 + 终判(2026-08-27 夜,[M])
+
+### 第六轮数据
+
+- 格 2(TQ=0+torch,profile):miss=0,**memcpy=450(被测 64B 有 task)**;
+- 格 4(TQ=0+acl-direct,profile):**miss=0(!)**,memcpy=450;
+- 两者 ARRIVAL 均 9M7K、零逆序、零 mem-kernel 重叠。
+
+### 判读
+
+1. **H-channel 出局**:两条路 64B 都产生 SDMA task(450=9×50),无通道分流;
+2. **观察者效应实锤**:无 profile 的格 4 miss=47%,加 profiler(119ms/步税)
+   → 0%——算子提交被拖慢远超 SDMA 消化时间,窗口关闭;
+3. 格 2 与格 4 无 profile 时 wall 几乎相同(415 vs 438us/步),miss 0% vs 47%
+   ——差别只在 memcpy 提交后的 epilogue 微差(query+记账 vs 直接返回)。
+
+### 终判:统一竞态窗口模型(六格全收敛)
+
+**缺陷 = SDMA memcpy 完成后,数据对同流后续 AI core 任务的可见性不被流序
+保证;窗口开度由提交时序微差决定(连续谱,非语义屏障)。**
+
+| 配置 | miss | 窗口 |
+|---|---|---|
+| TQ=1(算子 consumer 异步提交) | 99.90% | 全开 |
+| TQ=1+ctypes+query | 4.65% | 微开(query 阻塞+consumer 拖延) |
+| TQ=0+ctypes(最快提交) | 46.95% | 半开 |
+| TQ=0+ctypes+query | 52.65% | 半开(query 非屏障) |
+| TQ=0+torch(epilogue 略长) | 0% | 碰巧关 |
+| 任意路径+profiler 税 | 0% | 强关 |
+
+支撑证据:
+- **reprof_racy(TQ=1,同 run miss 94%)时间线:零逆序+零重叠+串行** = 执行序
+  正确(拷贝先完成、算子后启动)但读到旧值 → **可见性缺口的直接时间线证据**;
+- 0%↔47% 随 profiler 开关/epilogue 微差摆动 → 不是语义保证;
+- 纯 CANN D2H(SDMA 读)全绿 → 缺口特定于 **AI core 读路径**(SDMA 写→
+  AI core 读的一致性窗口);
+- TQ/env 的全部效应均可归因于提交时序(窗口开度),无一处需要"队列重排/
+  通道分流/屏障"假设。
+
+### 归因定稿
+
+- **层次**:CANN runtime/硬件——SDMA 写→AI core 读的跨引擎可见性未纳入
+  流序(aclrtMemcpyAsync 完成语义对后续 kernel 不蕴含数据可见);
+  torch_npu 各路径均为受害者(不同路径改变窗口开度,不提供保证);
+- **torch_npu 侧次要问题**:TQ=1 拓扑(算子由 consumer 异步提交)放大窗口
+  至必然级(99.9%),是暴露面而非根因;
+- **#14922 fix(blocking)正确且必要**:同步 aclrtMemcpy 不经 SDMA 异步通道;
+- 仍开放(可选):格 2 无 profile 加压(bg=16×4MiB / steps=5000)验证
+  "TQ=0+torch 的 0% 是巧合"→ miss>0 则统一模型完全闭环。
+
+### issue 方向(重写)
+
+标题形态:probabilistic stale read by same-stream kernels after
+aclrtMemcpyAsync H2D (SDMA completion not visibility-ordered for AI-core
+consumers; window modulated by submission timing)。证据 = 六格矩阵 +
+profiler 开关效应 + reprof_racy 时间线(执行序正确+可见性缺失)。
