@@ -286,3 +286,27 @@ TASK_QUEUE_ENABLE=0 治愈 ⇒ 队列机制肇因实锤(与 ASCEND_LAUNCH_BLOCKI
    `nm -D <libopapi.so> | grep -c aclnnInplaceCopy`(0=回落老路径实锤)
 2. dispatch 日志(ASCEND_SLOG_PRINT_TO_STDOUT=1 ASCEND_GLOBAL_LOG_LEVEL=1,
    --steps 3):直接看 copy_ 的 op 名与队列消息序。
+
+## 12. 第五轮结果 + 第六轮设计(2026-08-27 深夜续)
+
+- `nm -D libopapi.so | grep -c aclnnInplaceCopy` = **2** → opapi 路径生效,
+  "老路径回落"(W2)出局;dispatch 日志被 init 噪声淹没(需精准 grep)。
+- 日志金矿线索:`H2DCopyMgr: alloc h2d copy buff success, policy 2/1`
+  (runtime h2d_copy_mgr.cc)——CANN runtime 的 H2D 搬运有**多物理通道**:
+  PCIE_BAR(CPU 直写,`size <= PCIE_BAR_COPY_SIZE` 时)/ ASYNC_PCIE_DMA(SDMA)
+  / SYNC / UB(h2d_copy_mgr.hpp:27-32, Init :99-104)。该 Mgr 本身是算子
+  参数搬运池(ut 名 argAllocator),但揭示了通道分流的实现模式。
+- **格 2 vs 4/5a 的新候选(H-channel)**:torch copy_ 的 64B 与 ctypes 的
+  64B 走了**不同物理通道**(torch→BAR/CPU直写=立即可见=0%;ctypes→SDMA
+  task=完成≠可见=47%)。裁决手段 = **profile 数 memcpy task**:fix 模式已
+  证同步路径无 async task(400=8×50);若格 2(TQ=0+torch)的 memcpy 计数
+  也是 400(缺被测 50 个)→ 通道分歧实锤;若 450 → 通道相同,另寻差异。
+- 第六轮命令:
+  ```
+  TASK_QUEUE_ENABLE=0 python3 research/repro_h2d_order.py --mode racy \
+      --steps 50 --bg 8 --profile /tmp/reprof_g2
+  python3 research/stream_audit.py /tmp/reprof_g2 | grep -E "MEMCPY|ARRIVAL|tasks="
+  TASK_QUEUE_ENABLE=0 python3 research/repro_h2d_order.py --mode racy \
+      --steps 50 --bg 8 --copy-mode acl-direct --profile /tmp/reprof_g4
+  python3 research/stream_audit.py /tmp/reprof_g4 | grep -E "MEMCPY|ARRIVAL|tasks="
+  ```
