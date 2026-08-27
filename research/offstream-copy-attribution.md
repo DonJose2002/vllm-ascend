@@ -253,3 +253,36 @@ PER_STREAM_QUEUE=1 python3 research/repro_h2d_order.py --mode racy --bg 8    # p
 TASK_QUEUE_ENABLE=0 治愈 ⇒ 队列机制肇因实锤(与 ASCEND_LAUNCH_BLOCKING
 治愈同机制不同步,分辨率更高);三种 env 的组合结果可与 threaded 结果
 交叉验证 H-dispatch。
+
+## 10. 第三/四轮:通道矩阵 + query 屏障(2026-08-27 深夜,[M])
+
+六格矩阵(bg=8,被测 64B pinned H2D,消费=同流算子):
+
+| # | 被测拷贝 | 算子通道(TQ) | query epilogue | miss |
+|---|---|---|---|---|
+| 1 | torch copy_(队列) | 队列(=1) | torch 内置 | 99.90% |
+| 2 | torch copy_(直发) | 直发(=0) | torch 内置 | **0%** |
+| 3 | acl-direct(主线程) | 队列(=1) | 无 | 99.90% |
+| 4 | acl-direct(主线程) | 直发(=0) | 无 | 46.95% |
+| 5a | acl-direct(主线程) | 直发(=0) | 有(ctypes) | 52.65% |
+| 5b | acl-direct(主线程) | 队列(=1) | 有(ctypes) | **4.65%** |
+
+判读:
+- **query 非屏障**(4 vs 5a 无差);"TQ=0 治愈"= 假象(4 仍 47%);
+- 5b 的 4.65% 候选机制:query 阻塞主线程 → 算子消息入队延迟 → consumer(被
+  bg 消息拖住)发算子时数据已落地 —— 时序窗口效应,非语义保证;
+- **格 2 vs 5a 无解矛盾**:同为 TQ=0、bg 同 torch、epilogue 同 query,仅被测
+  拷贝 torch vs ctypes,0% vs 52.65%。剩余唯一系统性解释:**torch copy_
+  运行时未走 opapi 路径**(DO_COMPATIBILITY 回落老 CopyKernel.cpp,其
+  H2D non_blocking 行为不同,可能含额外同步)—— W2(dispatch 路径未运行时
+  实证)复活并升级为头号;
+- 纯 CANN direct(D2H 读者)全绿 与 格 4(AI core 读者)47% 并存 →
+  "SDMA 写→AI core 读可见性窗口"仍是缺陷核心形态的候选,但格 2 的自愈
+  机制必须在定稿前钉死(否则任何归因都可能被该隐藏变量污染)。
+
+## 11. 第五轮(待执行):路径实证两条
+
+1. libopapi 符号检查(判 DO_COMPATIBILITY 回落):
+   `nm -D <libopapi.so> | grep -c aclnnInplaceCopy`(0=回落老路径实锤)
+2. dispatch 日志(ASCEND_SLOG_PRINT_TO_STDOUT=1 ASCEND_GLOBAL_LOG_LEVEL=1,
+   --steps 3):直接看 copy_ 的 op 名与队列消息序。
