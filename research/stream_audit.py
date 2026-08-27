@@ -166,11 +166,22 @@ def audit_file(path: str) -> list[str]:
 
 
 def timeline_stats(rows: list[dict], stream_col: str, name_col: str | None, type_col: str | None) -> list[str]:
-    """Per-stream interval-overlap audit; [] when the table lacks usable times."""
+    """Per-stream interval-overlap + dispatch-vs-execution order audit.
+
+    Two invariants of CUDA stream semantics (which torch_npu mirrors):
+    (a) same-stream tasks execute serially -> intervals pairwise disjoint;
+    (b) same-stream tasks execute in dispatch order -> a later-dispatched
+        task (larger task id) never STARTS before an earlier one. A start
+    inversion involving a MEMCPY is direct evidence that stream ordering
+    does not govern the copy (e.g. consumer kernel dispatched after the
+    copy but executed before it - exactly the observed stale read).
+    [] when the table lacks usable times.
+    """
     headers = rows[0].keys()
     start_col = find_col(list(headers), ("start",), forbid=("wait",))
     stop_col = find_col(list(headers), ("stop", "end"))
     dur_col = find_col(list(headers), ("duration",)) or find_col(list(headers), ("time",), forbid=("start", "wait"))
+    tid_col = find_col(list(headers), ("taskid",))
     if start_col is None or (stop_col is None and dur_col is None):
         return []
 
@@ -180,7 +191,7 @@ def timeline_stats(rows: list[dict], stream_col: str, name_col: str | None, type
         except (ValueError, TypeError):
             return None
 
-    # stream -> list of (start, stop, is_memcpy, label)
+    # stream -> list of (start, stop, is_memcpy, label, task_id or None)
     per_stream: dict[str, list] = {}
     for r in rows:
         s = to_f(r.get(start_col))
@@ -195,21 +206,22 @@ def timeline_stats(rows: list[dict], stream_col: str, name_col: str | None, type
         name = " ".join(str(r.get(c, "") or "") for c in (name_col, type_col) if c).strip()
         sid = (r.get(stream_col) or "?").strip() or "?"
         label = (name or "<anon>")[:40]
-        per_stream.setdefault(sid, []).append((s, e, bool(MEM_RE.search(name)), label))
+        tid = to_f(r.get(tid_col)) if tid_col is not None else None
+        per_stream.setdefault(sid, []).append((s, e, bool(MEM_RE.search(name)), label, tid))
 
     out = ["  TIMELINE (per-stream interval overlap; serial-stream invariant):"]
     for sid, tasks in sorted(per_stream.items()):
         mem_n = sum(1 for t in tasks if t[2])
         if mem_n == 0 or len(tasks) < 2:
             continue
-        tasks.sort(key=lambda t: t[0])
+        by_start = sorted(tasks, key=lambda t: t[0])
         overlap_pairs = 0
         mem_overlap_pairs = 0
         max_depth = 0
         approx = False
         active: list = []  # (stop, is_memcpy, label) of tasks still open
         examples = []
-        for s, e, is_m, label in tasks:
+        for s, e, is_m, label, _tid in by_start:
             active = [a for a in active if a[0] > s]
             if len(active) > 512:  # pathological fan-out: count is already damning
                 approx = True
@@ -241,7 +253,82 @@ def timeline_stats(rows: list[dict], stream_col: str, name_col: str | None, type
                 "      OVERLAPS PRESENT: same-stream tasks executed concurrently"
                 " -> stream ordering not enforced (CUDA semantics require serial)"
             )
+
+        # (b) dispatch-vs-execution order: count start inversions per stream.
+        # A pair (A, B) dispatched A-before-B (tid_A < tid_B) is inverted when
+        # B started strictly before A. Cross-class = one side memcpy, other not
+        # (the copy-vs-consumer shape); mem-mem inversions (SDMA reordering)
+        # counted separately as same-engine reordering.
+        ordered = [(t[4], t[0], t[2], t[3]) for t in tasks if t[4] is not None]
+        if len(ordered) >= 2:
+            ordered.sort(key=lambda t: t[0])  # dispatch order
+            inv_total, inv_cross, inv_memmem = _count_inversions(ordered)
+            out.append(
+                f"      ORDER (dispatch-order vs start-time): tasks-with-tid={len(ordered)},"
+                f" start-inversions={inv_total} (cross-class={inv_cross} memcpy-vs-other,"
+                f" mem-mem={inv_memmem})"
+            )
+            shown = 0
+            for i in range(len(ordered)):  # example hunting, bounded work
+                for j in range(i + 1, min(i + 9, len(ordered))):
+                    if ordered[j][1] < ordered[i][1]:  # later-dispatched started earlier
+                        out.append(
+                            f"        inversion example: tid={ordered[i][0]:.0f} [{ordered[i][3]}]"
+                            f" start={ordered[i][1]:.1f} dispatched BEFORE tid={ordered[j][0]:.0f}"
+                            f" [{ordered[j][3]}] start={ordered[j][1]:.1f}, but executed AFTER it"
+                        )
+                        shown += 1
+                        break
+                if shown >= 3:
+                    break
+            if inv_cross == 0 and inv_total == 0:
+                out.append("      no start inversions: execution follows dispatch order on this stream")
     return out
+
+
+def _count_inversions(ordered: list[tuple[float, float, bool, str]]) -> tuple[int, int, int]:
+    """Merge-sort inversion count over start times of dispatch-ordered tasks.
+
+    Returns (total, cross_class, mem_mem) inversion-pair counts. Equal starts
+    are NOT inversions (us-resolution ties are common).
+    """
+
+    def sort_rec(lo: list) -> tuple[list, int, int, int]:
+        if len(lo) <= 1:
+            return lo, 0, 0, 0
+        mid = len(lo) // 2
+        left, tl, cl, ml = sort_rec(lo[:mid])
+        right, tr, cr, mr = sort_rec(lo[mid:])
+        merged: list = []
+        inv = cross = memmem = 0
+        li = ri = 0
+        # class counts of the not-yet-merged left tail (cheap cross-class math)
+        tail_mem = sum(1 for t in left if t[2])
+        tail_non = len(left) - tail_mem
+        while li < len(left) and ri < len(right):
+            if right[ri][1] < left[li][1]:
+                # right element starts before EVERY remaining left element
+                inv += tail_mem + tail_non
+                if right[ri][2]:
+                    cross += tail_non
+                    memmem += tail_mem
+                else:
+                    cross += tail_mem
+                merged.append(right[ri])
+                ri += 1
+            else:
+                if left[li][2]:
+                    tail_mem -= 1
+                else:
+                    tail_non -= 1
+                merged.append(left[li])
+                li += 1
+        merged.extend(left[li:])
+        merged.extend(right[ri:])
+        return merged, inv + tl + tr, cross + cl + cr, memmem + ml + mr
+
+    _, total, cross, memmem = sort_rec(ordered)
+    return total, cross, memmem
 
 
 def audit(paths: list[str]) -> str:
@@ -297,8 +384,11 @@ def selftest() -> int:
         )
         w.writerow([0, "", "Memcpy", "42", 1, 100, 1000, 1100])  # copy [1000,1100]
         w.writerow([0, "Equal", "AI CORE", "42", 2, 10, 1050, 1060])  # kernel inside the copy -> overlap
-        w.writerow([0, "", "Memcpy", "42", 3, 5, 1100, 1105])  # back-to-back: NOT an overlap
-        w.writerow([0, "Where", "AI CORE", "9", 4, 5, 100, 105])  # other stream, must not mix in
+        w.writerow([0, "", "Memcpy", "42", 3, 5, 1200, 1205])  # copy dispatched 3rd, starts at 1200
+        w.writerow(
+            [0, "Where", "AI CORE", "42", 4, 5, 1150, 1155]
+        )  # tid4 after tid3 but starts earlier -> ORDER inversion
+        w.writerow([0, "Other", "AI CORE", "9", 5, 5, 100, 105])  # other stream, must not mix in
 
     report = audit([tmp])
     print(report)
@@ -315,6 +405,9 @@ def selftest() -> int:
         ("overlap detected (1 pair, memcpy-involved)", "overlapping pairs>=1 (involving-memcpy=1, 100%)" in report),
         ("back-to-back not an overlap", "max concurrency=2" in report),
         ("serial verdict line present", "OVERLAPS PRESENT" in report),
+        ("order analysis present", "ORDER (dispatch-order vs start-time)" in report),
+        ("cross-class inversion counted", "start-inversions=1 (cross-class=1 memcpy-vs-other, mem-mem=0)" in report),
+        ("inversion example shown", "dispatched BEFORE" in report),
         ("aggregate skip reason available", True),
     ]
     for label, cond in checks:
