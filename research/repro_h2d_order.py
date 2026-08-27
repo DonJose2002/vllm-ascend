@@ -52,7 +52,12 @@ Faithfulness map (repro element <-> original prepare_next_token_ids_padded):
 Modes:
   racy   copy_(non_blocking=True)                 expected: miss > 0
   fix    copy_(non_blocking=False)                expected: miss == 0 (the PR)
-  event  copy on a dedicated stream + event fence expected: miss == 0 (alt)
+  event  copy on a side stream + event fence      expected: miss == 0, but the
+         with a HOST-side wait (synchronize)      fence must be host-waited:
+         device-side cross-stream waits do not reliably cover this copy path
+         on torch_npu (in-tree cpu_offload_connector.py:317 TODO + its
+         synchronize() workaround; an earlier wait_event()-based build of
+         this repro measured misses under the fence).
 
 A miss==0 under racy does NOT invalidate the bug (see PR evidence); it means
 these parameters did not open the window - raise --bg / --steps / --bg-elems.
@@ -128,18 +133,19 @@ def run(args) -> int:
             gpu.copy_(slot, non_blocking=True)
         elif args.mode == "fix":
             gpu.copy_(slot, non_blocking=False)
-        else:  # event: explicit cross-stream dependency instead of blocking
+        else:  # event: fence the async copy instead of making it blocking
             with torch.npu.stream(copy_stream):
                 gpu.copy_(slot, non_blocking=True)
             fence.record(copy_stream)
-            try:
-                torch.npu.current_stream().wait_event(fence)
-            except AttributeError:
-                # wait_event not exposed on this torch_npu build: fall back to
-                # a host-side wait (same ordering guarantee, less elegant).
-                if step == 1:
-                    print("# note: current_stream().wait_event unavailable, falling back to fence.synchronize()")
-                fence.synchronize()
+            # Device-side cross-stream waits (current_stream().wait_event /
+            # wait_stream) do NOT reliably cover this copy path on torch_npu:
+            # the in-tree cpu_offload_connector.py wait_for_layer_load carries
+            # an explicit TODO to switch to wait_stream "after fixing the bug"
+            # and currently host-synchronizes instead - for the same shape of
+            # side-stream non_blocking H2D copies. Mirror that production
+            # posture (host-side event wait); an earlier build of this repro
+            # used wait_event() and showed misses, consistent with that TODO.
+            fence.synchronize()
 
         # Consumer on the compute stream (zero host sync until the very end).
         counter += 1
