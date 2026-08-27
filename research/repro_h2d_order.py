@@ -86,6 +86,20 @@ Usage (server, inside the v0.23.0 container, no serve needed):
       --profile /tmp/reprof        # torch_npu profiler (msprof Text export),
                                    # then auto-audits memcpy vs compute stream
                                    # ownership via research/stream_audit.py
+
+  # attribution rounds (2026-08-27): decouple the tested copy's submission
+  # channel from the consumer kernels' channel. --copy-mode acl-direct issues
+  # the tested copy via ctypes -> libascendcl aclrtMemcpyAsync from the MAIN
+  # thread (bypassing torch_npu's host task queue entirely); the bg copies and
+  # the consumer kernels keep their usual channels. Combined with the
+  # TASK_QUEUE_ENABLE env this fills the missing cell of the channel matrix:
+    TASK_QUEUE_ENABLE=1 python3 research/repro_h2d_order.py --mode racy \
+        --copy-mode acl-direct --bg 8
+    # copy=main-thread-direct, kernels=queue-consumer-thread
+    #   miss>0 -> mixed-thread submission to one stream is the trigger
+    #             (pure-CANN single-thread FIFO was clean)
+    #   miss=0 -> the copy must go through torch_npu's queue to misbehave;
+    #             the queue's memcpy submission itself is implicated
 """
 
 from __future__ import annotations
@@ -127,6 +141,39 @@ def make_profiler(out_dir: str):
     )
 
 
+def acl_direct_copy_factory(is_npu: bool):
+    """Return f(dst_tensor, src_tensor, nbytes) that submits ONE
+    aclrtMemcpyAsync (H2D) on the CURRENT torch.npu stream from this (main)
+    thread, bypassing torch_npu's copy_ path entirely. Reuses the lib
+    discovery/binding from cann_memcpy_order; returns None if unavailable
+    (caller falls back to torch copy_ with a loud notice)."""
+    if not is_npu:
+        return None
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import cann_memcpy_order
+
+        acl = cann_memcpy_order.Acl(cann_memcpy_order.find_lib())
+        stream_handle = torch.npu.current_stream().npu_stream
+
+        def f(dst, src, nbytes: int) -> None:
+            err = acl.lib.aclrtMemcpyAsync(
+                dst.data_ptr(),
+                nbytes,
+                src.data_ptr(),
+                nbytes,
+                cann_memcpy_order.ACL_MEMCPY_HOST_TO_DEVICE,
+                stream_handle,
+            )
+            if err != 0:
+                raise RuntimeError(f"aclrtMemcpyAsync direct submit failed: aclError={err}")
+
+        return f
+    except Exception as e:  # noqa: BLE001 - fallback path must stay loud
+        print(f"note: acl-direct unavailable ({e}); falling back to torch copy_")
+        return None
+
+
 def run(args) -> int:
     dev = torch.device(args.device)
     is_npu = args.device.startswith("npu")
@@ -160,6 +207,8 @@ def run(args) -> int:
 
     copy_stream = torch.npu.Stream() if (args.mode == "event" and is_npu) else None
 
+    acl_direct = acl_direct_copy_factory(is_npu) if getattr(args, "copy_mode", "torch") == "acl-direct" else None
+
     import contextlib
 
     if profiling and args.steps > 200:
@@ -177,7 +226,10 @@ def run(args) -> int:
                     bg_gpu.copy_(bg_cpu, non_blocking=True)
 
             if args.mode == "racy":
-                gpu.copy_(slot, non_blocking=True)
+                if acl_direct is not None:
+                    acl_direct(gpu, slot, args.payload * 4)
+                else:
+                    gpu.copy_(slot, non_blocking=True)
             elif args.mode == "fix":
                 gpu.copy_(slot, non_blocking=False)
             else:  # event: fence the async copy on a side stream, host-side wait
@@ -206,8 +258,9 @@ def run(args) -> int:
     esc_n = int(esc)
 
     bg_desc = f"{args.bg}x{args.bg_elems * 4 // 1024}KiB" if args.bg else "off"
+    copy_desc = "torch" if acl_direct is None else "acl-direct(ctypes)"
     print(
-        f"mode={args.mode} device={args.device} steps={args.steps} "
+        f"mode={args.mode} device={args.device} copy={copy_desc} steps={args.steps} "
         f"payload={args.payload * 4}B bg={bg_desc} wall={wall:.2f}s "
         f"({wall / args.steps * 1e6:.1f}us/step)"
     )
@@ -250,7 +303,9 @@ def selftest() -> int:
     """Logic check on cpu: both modes must run clean and report zero misses."""
     ok = True
     for mode in ("racy", "fix"):
-        args = argparse.Namespace(device="cpu", mode=mode, steps=500, payload=16, bg=2, bg_elems=1024, profile=None)
+        args = argparse.Namespace(
+            device="cpu", mode=mode, steps=500, payload=16, bg=2, bg_elems=1024, profile=None, copy_mode="torch"
+        )
         print(f"--- selftest {mode} ---")
         if run(args) != 0:
             ok = False
@@ -273,6 +328,13 @@ def main() -> int:
         default=None,
         metavar="DIR",
         help="npu-only: enable torch_npu profiler, msprof Text export into DIR, then auto-audit stream ownership",
+    )
+    ap.add_argument(
+        "--copy-mode",
+        choices=["torch", "acl-direct"],
+        default="torch",
+        help="tested copy channel: torch = Tensor.copy_ (host task queue); acl-direct = ctypes"
+        " aclrtMemcpyAsync from the main thread on the current torch.npu stream (channel-matrix attribution)",
     )
     args = ap.parse_args()
     if args.device == "cpu" and args.mode == "event":
