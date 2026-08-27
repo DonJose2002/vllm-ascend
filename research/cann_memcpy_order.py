@@ -229,10 +229,27 @@ def run(args) -> int:
             work_q.put((dst, src, nbytes, kind, what))
 
     def worker() -> None:
+        # ACL contexts are PER-THREAD: torch_npu's queue consumer calls
+        # SetDevice first (StartConsume, NPUQueue.cpp:795) - without this the
+        # first memcpy returns 107002 ACL_ERROR_RT_CONTEXT_NULL (observed on
+        # the server, 2026-08-27). Mirror the production topology exactly.
+        try:
+            err = acl.lib.aclrtSetDevice(args.device)
+            if err != ACL_ERROR_NONE:
+                h2d_failed.append(f"worker aclrtSetDevice: aclError={err}")
+                # drain the queue and bail out without submitting anything
+                while True:
+                    item = work_q.get()
+                    work_q.task_done()
+                    if item is None:
+                        return
+        except Exception as e:  # noqa: BLE001
+            h2d_failed.append(f"worker aclrtSetDevice: {e}")
         while True:
             item = work_q.get()
             if item is None:
                 work_q.task_done()
+                acl.lib.aclrtResetDevice(args.device)
                 return
             dst, src, nbytes, kind, what = item
             try:
