@@ -26,6 +26,29 @@ deep SDMA backlog of a chunked-prefill boundary step (16K = 8 chunks of
 metadata H2D ahead of the small copy). --bg reproduces that condition with
 inert background copies; --bg 0 is the calm-window control.
 
+Faithfulness map (repro element <-> original prepare_next_token_ids_padded):
+
+  slot.fill_(step)          host write of token ids into the pinned buffer
+                            (per-step real value = the ~1% gate-open steps of
+                            the bug, promoted to 100% to strip the request-
+                            boundary confounder and maximize hits)
+  gpu.copy_(slot, nb=True)  backup_next_token_ids.gpu.copy_(cpu, nb=True)
+                            - literally the same call, same payload scale
+  counter+=1; miss+=(...)   torch.where consuming backup.gpu: same position
+                            (first compute-stream op after the copy), same
+                            stream, same kind of buffer read -> identical
+                            sensitivity to "has the copy landed". The read
+                            value is compared against the stream-side counter
+                            (expected value generated ON the compute stream -
+                            host-side expectations would need their own H2D
+                            and pollute the timeline); miss = read of a stale
+                            previous value, esc = read of the initial -1
+                            sentinel = the original escape event, counted
+                            instead of crashed into gather(-1).
+  --bg / double-buffered    environment reconstruction only: SDMA backlog
+  slots                     (the 16K-always condition) / removal of the
+                            orthogonal host-write-vs-inflight-read confounder.
+
 Modes:
   racy   copy_(non_blocking=True)                 expected: miss > 0
   fix    copy_(non_blocking=False)                expected: miss == 0 (the PR)
