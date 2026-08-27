@@ -1,10 +1,11 @@
 # Off-stream copy 归因文档:当前判断、依据来源、薄弱点与判别实验
 
 > 2026-08-27,#14922 流外拷贝调查的归因存档。本文件的直接动因:维护者/读者对
-> "问题在 CANN 层"表示怀疑。这个怀疑是**方法论上合法的**——本判断链存在四处
-> 未闭合的推断(见 §3),其中至少一处(task queue 延迟下发 + profiler 时间戳
-> 假象的复合假说)能完整解释全部现有观测而不需要 CANN 缺陷。§5 的纯 CANN
-> 判别脚本(`research/cann_memcpy_order.py`)就是为分辨这一点设计的。
+> "问题在 CANN 层"表示怀疑。**怀疑已被第一轮判别实验证实一半:纯 CANN 直发
+> 全绿(§8),CANN 的单线程流序无辜;嫌疑收窄到 torch_npu 的下发拓扑(跨线程
+> 提交)。第二轮实验(--dispatch threaded)已备好,见 §9。**
+> 本文档保留完整推理史(包括被推翻的中间结论),以供复盘;**当前有效结论
+> 以 §8/§9 为准,§1-§7 中与 §8 冲突处已被 §8 勘误覆盖**。
 >
 > 证据标注约定:**[M]**=服务器实测(measured);**[S]**=源码静态阅读(static);
 > **[I]**=推断(inference,未实测/未逐字节验证)。
@@ -188,6 +189,67 @@ dlopen `libascendcl.so`,只用 ACL C API:
 
 - 行为层仪器:`research/repro_h2d_order.py`(fork research/v0.23.0@4c01ab16b)
 - profiling 分析器:`research/stream_audit.py`(同上)
-- **本判别脚本:`research/cann_memcpy_order.py`**
-- issue 草稿(终稿待 §5 结果修正):`notes/upstream/ascend-pytorch-issue-off-stream-copy.md`
+- **判别脚本:`research/cann_memcpy_order.py`**(direct 模式 @870c7aa13;threaded 模式 @90a4b4791)
+- issue 草稿(终稿待判别结果修正):`notes/upstream/ascend-pytorch-issue-off-stream-copy.md`
 - 上游 PR:#14922(其 fix = blocking,无论归因如何都正确且必要)
+
+## 8. 第一轮判别结果(2026-08-27 晚,[M]):CANN 直发无辜,W1 部分证实
+
+`cann_memcpy_order.py --dispatch direct` 服务器全矩阵(500 步,bg=8×1MiB):
+
+| 配置 | miss |
+|---|---|
+| racy + fence=none + pinned | **0** |
+| racy + fence=stream_sync | 0 |
+| racy + fence=event_sync | 0 |
+| racy + fence=event_wait | 0 |
+| racy + fence=none + plain(pageable) | 0 |
+| sync(负对照) | 0 |
+
+**判读**:libascendcl 的 `aclrtMemcpyAsync`(H2D, pinned, 64B)在**调用线程
+直发**时,与同流 D2H 消费完全有序,SDMA 积压下也如此。§1 的"CANN 层"
+判断**在直发拓扑下被证伪**;缺陷层次回到 torch_npu 内部。用户怀疑成立。
+
+**同时勘误 §2.3-C5(判读错误,被 W1 命中)**:ORDER 分析假设 task_id =
+Python 发射序,推出"消费 kernel 在拷贝后执行"。实际上 **task_id 是任务
+到达 runtime 的序**:若消费 kernel 先于拷贝到达 runtime(跨通道下发时序),
+task_id(kernel) < task_id(copy),执行序跟随 task_id,全程"有序"——
+但相对 Python 语义序是颠倒的。profile 的"串行+有序"与"kernel 先到达、
+拷贝后到达"完全自洽,C5 推断不成立。task_time.csv 的 memcpy 时间戳语义
+问题(W1 后半)也随之不再是必要假设——需要的只是 task_id 语义修正。
+
+## 9. 第二轮判别:下发线程拓扑(`--dispatch threaded`,@90a4b4791)
+
+**候选机制(H-dispatch)**:torch_npu 的 host task queue 拓扑中,memcpy 与
+算子由 **consumer 线程**下发(`AsyncCopyTask::LaunchCopyTask` 入队 ASYNC_MEMCPY;
+算子 `OpCommand::RunOpApiV2` 也入队 EXECUTE_OPAPI_V2——EXEC_NPU_CMD V1 宏
+尾部同样走 RunOpApiV2,op_api_common.h:358),栅栏由**用户线程**执行
+(`NPUStream::synchronize` 先 MakeSureQueueEmpty 再 aclrtSynchronizeStream)。
+若 CANN runtime 的流序/流同步对"**由不同线程提交的任务**"记账不同
+(per-thread stream submission list 形态),则:consumer 提交的 memcpy 与
+(consumer 或用户线程提交的)消费任务/栅栏之间无顺序保证 → 全部观测
+(A1 乱序/A3 栅栏空转/时间线"有序但颠倒")可解,且与纯 CANN 直发全绿
+(§8)不矛盾。
+
+**实验**:`--dispatch threaded` 忠实镜像该拓扑——worker 线程按严格 FIFO
+执行 H2D 们 + D2H 消费(= host queue),主线程 queue.join(= 排空)后执行
+栅栏与最终同步;fence 前同样先 join(= torch_npu fence 的 MakeSureQueueEmpty)。
+
+预期矩阵:
+
+| 结果 | 定性 |
+|---|---|
+| threaded miss>0 而 direct miss=0 | **跨线程提交是触发条件**:runtime 的流序对提交线程敏感 → 缺陷形态="CANN runtime 对跨线程提交的流序/流同步语义"+ torch_npu 的队列设计踩中它(责任两侧:文档未言明 + 设计假设);issue 面向两者 |
+| threaded 也 miss=0 | CANN 拓扑无关 → 嫌疑收窄到 torch_npu 队列内部(消息顺序/复制时序/paramStream 传递),下一步 repro + TASK_QUEUE_ENABLE=0/2、PER_STREAM_QUEUE=1 对照 |
+
+辅助实验(与 threaded 同批跑,均为一条 env):
+
+```bash
+TASK_QUEUE_ENABLE=0 python3 research/repro_h2d_order.py --mode racy --bg 8   # 关队列:若 miss=0,队列是肇因
+TASK_QUEUE_ENABLE=2 python3 research/repro_h2d_order.py --mode racy --bg 8   # V2/poll 路径
+PER_STREAM_QUEUE=1 python3 research/repro_h2d_order.py --mode racy --bg 8    # per-stream 队列
+```
+
+TASK_QUEUE_ENABLE=0 治愈 ⇒ 队列机制肇因实锤(与 ASCEND_LAUNCH_BLOCKING
+治愈同机制不同步,分辨率更高);三种 env 的组合结果可与 threaded 结果
+交叉验证 H-dispatch。
