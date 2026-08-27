@@ -140,7 +140,20 @@ def find_lib() -> str:
     cands = list(LIB_CANDIDATES)
     if os.environ.get("ACL_LIB"):
         cands.insert(0, os.environ["ACL_LIB"])
-    cands += sorted(glob.glob("/usr/local/Ascend/**/libascendcl.so", recursive=True))
+    found = glob.glob("/usr/local/Ascend/**/libascendcl.so", recursive=True)
+
+    def rank(p: str) -> tuple[int, str]:
+        # lexicographic order would hand us devlib (debug/symbol variants)
+        # before the real runtime lib, and possibly a cross-compile x86_64
+        # copy on an aarch64 host (server layout: cann-9.1.0/aarch64-linux/...)
+        badness = 0
+        if "devlib" in p:
+            badness += 2
+        if "x86_64" in p:
+            badness += 1
+        return (badness, p)
+
+    cands += sorted(found, key=rank)
     for c in cands:
         if c and os.path.isfile(c):
             return c
