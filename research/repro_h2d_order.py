@@ -34,6 +34,16 @@ Modes:
 A miss==0 under racy does NOT invalidate the bug (see PR evidence); it means
 these parameters did not open the window - raise --bg / --steps / --bg-elems.
 
+NPU-API provenance (everything NPU-specific mirrors vllm-ascend production
+usage, so no untested API shapes on the hot path): pinned allocation via the
+pin_memory ctor kwarg (upstream CpuGpuBuffer / platform.is_pin_memory_available),
+`with torch.npu.stream(...)` (weight_transfer/packed_tensor.py), Event.record()
+(kv_transfer mooncake connector); only current_stream().wait_event() lacks an
+in-tree precedent and carries a synchronize() fallback. The racy/fix modes use
+no NPU-specific API at all beyond the pinned ctor. Locally verified on cpu
+(synchronous-copy semantics: both modes must report miss=0); the first npu run
+IS the measurement.
+
 Usage (server, inside the v0.23.0 container, no serve needed):
   python3 research/repro_h2d_order.py --mode racy
   python3 research/repro_h2d_order.py --mode fix
@@ -99,7 +109,14 @@ def run(args) -> int:
             with torch.npu.stream(copy_stream):
                 gpu.copy_(slot, non_blocking=True)
             fence.record(copy_stream)
-            torch.npu.current_stream().wait_event(fence)
+            try:
+                torch.npu.current_stream().wait_event(fence)
+            except AttributeError:
+                # wait_event not exposed on this torch_npu build: fall back to
+                # a host-side wait (same ordering guarantee, less elegant).
+                if step == 1:
+                    print("# note: current_stream().wait_event unavailable, falling back to fence.synchronize()")
+                fence.synchronize()
 
         # Consumer on the compute stream (zero host sync until the very end).
         counter += 1
