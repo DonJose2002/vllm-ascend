@@ -320,6 +320,7 @@ self.backup_next_token_ids.gpu[:num_reqs].copy_(
 |---|---|
 | `VLLM_ASCEND_SD_REVIVE_RACE=1` | 拷贝点复活原始竞态路径(`CpuGpuBuffer.copy_to_gpu()`,整缓冲 non_blocking);默认关 = blocking 修复生效 |
 | `VLLM_ASCEND_SD_COUNTERS=1` | 启用 c1/c2/c3 计数(steps 为 host 侧纯计数,计数 kernel 与 clamp 探针同为保时序 device 归约) |
+| `VLLM_ASCEND_SD_STAGED_COPY=<N≥2>`(2026-08-28) | 复活竞态下,拷贝前把单页 backup.cpu 快照进 N 页私有 pinned 环,异步拷贝只读自己的页——**机制 (b) 判别实验**(文首横幅);判读矩阵与命令见 `offstream-copy-attribution.md` §14 第七轮 |
 
 两开关独立是**故意的**:Run 0 只复活竞态不加计数,对照"计数 kernel 自身治愈竞态"的混淆(clamp_next 教训)。
 

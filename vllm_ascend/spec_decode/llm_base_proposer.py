@@ -109,6 +109,29 @@ def _env_flag(name: str) -> bool:
 _SD_REVIVE_RACE = _env_flag("VLLM_ASCEND_SD_REVIVE_RACE")
 _SD_COUNTERS = _env_flag("VLLM_ASCEND_SD_COUNTERS")
 
+# [research instrumentation 2026-08-28] staged-copy discriminating experiment
+# for the engine mechanism (attribution doc s14 rounds 1-6): with the platform
+# layers exonerated (pure-CANN same-stream copy->kernel ordering and visibility
+# are correct; the repro's "stale reads" were host-slot-overwrite artifacts),
+# the leading engine hypothesis (b) is: the SINGLE pinned backup.cpu page is
+# REWRITTEN every step while a previously issued async H2D copy has not
+# executed yet - the late copy then delivers a LATER step's content (at a
+# request boundary, the -1 sentinel rows) even though stream order is perfect.
+#   VLLM_ASCEND_SD_STAGED_COPY=<N>=2..  before the async copy, snapshot
+#                                 backup.cpu[:num_reqs] into a private pinned
+#                                 ring page (host memcpy, <1KB); the async H2D
+#                                 reads that page, which the host will not
+#                                 touch again for N steps.
+# Verdict (only meaningful together with VLLM_ASCEND_SD_REVIVE_RACE=1):
+#   racy single-page crashes + staged stays green (c3=0 with counters)
+#     -> mechanism (b) closed: poison entered via the rewritten source page
+#   staged still crashes (try N=64 before concluding)
+#     -> (a)/(c): a correctly-sourced copy still yielded -1 downstream =
+#       device-side ordering/visibility issue at engine level
+_SD_STAGED_COPY = int(os.getenv("VLLM_ASCEND_SD_STAGED_COPY", "0"))
+if _SD_STAGED_COPY == 1:
+    logger.warning("[SD-staged-copy] depth 1 gives no protection, ignoring (use >=2)")
+
 
 class _RaceCounters:
     """Persistent on-device accumulators for the H2D-race probes.
@@ -1000,7 +1023,12 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                     if _oob or _mx >= _vocab or _mn < 0:
                         logger.warning(
                             "[SD-debug] %s BAD range [%d, %d] oob=%d vocab=%d numel=%d",
-                            _name, _mn, _mx, _oob, _vocab, _t.numel(),
+                            _name,
+                            _mn,
+                            _mx,
+                            _oob,
+                            _vocab,
+                            _t.numel(),
                         )
                     else:
                         logger.info("[SD-debug] %s ok range [%d, %d] numel=%d", _name, _mn, _mx, _t.numel())
@@ -1794,9 +1822,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             qsl_num_reqs = cad.query_start_loc.numel() - 1
             bt_num_rows = cad.block_table_tensor.shape[0]
             if bt_num_rows > qsl_num_reqs:
-                slot_cad = cad.replace(
-                    block_table_tensor=cad.block_table_tensor[:qsl_num_reqs]
-                )
+                slot_cad = cad.replace(block_table_tensor=cad.block_table_tensor[:qsl_num_reqs])
             else:
                 slot_cad = cad
 
@@ -2046,6 +2072,30 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
 
         return common_attn_metadata, attn_metadata
 
+    def _sd_stage_next_page(self) -> torch.Tensor:
+        """[research instrumentation 2026-08-28] lazy ring of private pinned
+        pages for the staged-copy experiment; see the _SD_STAGED_COPY comment
+        at module top. Rotation: strictly one page per step, depth N."""
+        state = getattr(self, "_sd_stage_state", None)
+        if state is None:
+            src = self.backup_next_token_ids.cpu
+            # CpuGpuBuffer allocates under inference_mode(False); mirror it so
+            # the pages stay normal tensors across steps.
+            with torch.inference_mode(False):
+                state = {
+                    "pages": [torch.zeros(src.shape, dtype=src.dtype, pin_memory=True) for _ in range(_SD_STAGED_COPY)],
+                    "turn": 0,
+                }
+            self._sd_stage_state = state
+            logger.info(
+                "[SD-staged-copy] engaged: %d private pinned pages (shape %s)",
+                _SD_STAGED_COPY,
+                tuple(src.shape),
+            )
+        page = state["pages"][state["turn"] % _SD_STAGED_COPY]
+        state["turn"] += 1
+        return page
+
     def prepare_next_token_ids_padded(
         self,
         sampled_token_ids: torch.Tensor,
@@ -2083,7 +2133,16 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             # research-only: the exact original racy path (full-buffer pinned
             # non_blocking H2D via CpuGpuBuffer.copy_to_gpu). Default off;
             # the blocking fix below stays active.
-            self.backup_next_token_ids.copy_to_gpu()
+            if _SD_STAGED_COPY >= 2:
+                page = self._sd_stage_next_page()
+                # host-side snapshot (pinned->pinned memcpy, num_reqs int32
+                # <1KB): this step's async copy reads a page the host will not
+                # rewrite for another _SD_STAGED_COPY steps - everything else
+                # about the racy timing shape is unchanged
+                page[:num_reqs].copy_(self.backup_next_token_ids.cpu[:num_reqs])
+                self.backup_next_token_ids.gpu[:num_reqs].copy_(page[:num_reqs], non_blocking=True)
+            else:
+                self.backup_next_token_ids.copy_to_gpu()
         else:
             # [fix 2026-08-24] CpuGpuBuffer.copy_to_gpu uses non_blocking=True; on
             # torch_npu the pinned H2D rides the SDMA engine whose ordering w.r.t.

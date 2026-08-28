@@ -632,3 +632,35 @@ CONFIRMED",已失效)。CPU 自测 2 模式×2 槽 4/4 绿。
 **#14922 更正评论终稿**:`notes/upstream/pr-14922-mechanism-correction.md`
 (中英双版,撤回栅栏叙事/归因/六格证据,保留 engine 事实 + fix 跨机制稳健
 论证,含第 6 条栅栏复核实测),交用户粘贴。
+
+### 第七轮(2026-08-28):staged-copy 引擎判别实验(机制 (b) vs (a)/(c))
+
+**设计**:拷贝点(env `VLLM_ASCEND_SD_STAGED_COPY=<N≥2>`,仅在
+`VLLM_ASCEND_SD_REVIVE_RACE=1` 下生效):每步先把单页
+`backup.cpu[:num_reqs]` 快照进**私有 pinned 环形分页**(host memcpy,<1KB),
+异步拷贝只读自己的页——host 要过 N 步才会再碰该页;**其余竞态时序形状原样
+保留**(仍是 non_blocking H2D + 同流 where)。`_sd_stage_next_page` 惰性分配
+(inference_mode(False) 镜像 CpuGpuBuffer),engagement 行镜像 counters 风格;
+本地 UT `research/test_staged_copy.py`(ast 抽真实方法 + pin-free torch stub,
+验证轮转/单次分配/状态持久)通过;ruff/mypy 零新增。
+
+**判读矩阵**(L2082 拷贝点,`run_baseline_npu.sh eagle3` 16K 复现配置):
+
+| 结果 | 定性 |
+|---|---|
+| 单页崩 + 分页绿(计数格 c3=0) | **(b) 定谳**:毒经 host 源页改写进入,流序全程无辜 |
+| 分页也崩(先试 N=64) | (b) 出局:来源正确的拷贝仍送出 -1 → (a)/(c) 引擎层设备侧问题 |
+| 单页对照不崩 | 复现条件漂移,停止判读 |
+
+```bash
+# A 阳性对照:复活竞态,单页(预期崩;不崩=条件漂移停)
+VLLM_ASCEND_SD_REVIVE_RACE=1 TIERS=16384 CONCS=1 NPUS=<id> \
+  bash research/run_baseline_npu.sh eagle3 8021
+# B 判别:复活竞态 + 8 私有页
+VLLM_ASCEND_SD_REVIVE_RACE=1 VLLM_ASCEND_SD_STAGED_COPY=8 TIERS=16384 CONCS=1 NPUS=<id> \
+  bash research/run_baseline_npu.sh eagle3 8022
+# C 判别+计数:绿则读数直接可读(预期 c2~7、c3=0;SUMMARY 自动带 counters 行)
+VLLM_ASCEND_SD_REVIVE_RACE=1 VLLM_ASCEND_SD_STAGED_COPY=8 VLLM_ASCEND_SD_COUNTERS=1 \
+  TIERS=16384 CONCS=1 NPUS=<id> bash research/run_baseline_npu.sh eagle3 8023
+# B/C 崩则加深复跑:VLLM_ASCEND_SD_STAGED_COPY=64(端口递增)
+```
