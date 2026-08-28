@@ -1,13 +1,48 @@
 # 复盘:eagle 系投机解码 16K 崩溃(pinned H2D 异步竞态)
 
-> 2026-08-24 | 修复 commit:research 线 `62533dafa`(v0.23.0 容器验证)/ PR 分支 `pr/bugfix-eagle-h2d-race`(`56f262aa1`,基于 origin/main `1a086ce8a`)| 环境:vllm-ascend v0.23.0 = fixes,910B3,Qwen3-8B + Tengyunw/qwen3_8b_eagle3(eagle3 头,1 层,draft_vocab 32000),K=5
+> 2026-08-24 初稿 | 2026-08-25 三计数器终判 | **2026-08-28 终审增补(见下)** | 修复 commit:research 线 `62533dafa`(v0.23.0 容器验证)/ PR 分支 `pr/bugfix-eagle-h2d-race`(`56f262aa1`,基于 origin/main `1a086ce8a`)| 环境:vllm-ascend v0.23.0 = fixes,910B3,Qwen3-8B + Tengyunw/qwen3_8b_eagle3(eagle3 头,1 层,draft_vocab 32000),K=5
 > 姊妹篇:`eagle-h2d-race-journey.md`(人话版,给同事)
+
+> ⚠️ **2026-08-28 终审增补:本文的平台层定性已被后续审计推翻,引擎机制重开。**
+>
+> **存活(全部 engine 级事实)**:16K 无 fix 确定性崩溃 / 4K 偶发;三计数器
+> Run 0-4 全部读数;唯一逃逸值 = -1 哨兵(`esc=[-1,-1]`,`c1x=0`);fix(阻塞
+> 拷贝)9/9 实效,且对 host 槽设计不敏感(2026-08-28 复验)。
+>
+> **推翻(平台层叙事)**:"SDMA 拷贝与计算 kernel 先后顺序没有保证""深队列
+> =竞态窗口""CUDA 有序 / NPU 无序"。纯 CANN 探针(libascendcl + libopapi
+> 两段式,同流拷贝→AI core 算子,含 64MiB/步满环压力,单线程/跨线程)
+> **全部有序且可见**;repro 的 0.7%~99.94% miss 谱系经同二进制配对
+> (unique 槽 0% vs 旧双槽 99.9%,全 future 方向)证实为**探针自身的 host
+> 槽复用伪影**——host 在 ~2048 任务 FIFO 提交环内领先 100-200+ 步,晚执行
+> 的拷贝读到已被改写的槽,把"未来值"送上设备,方向盲的 miss 计数全数收账。
+>
+> **机制候选重开**:**(b,当前领先)** 持久 pinned 单缓冲(backup.cpu)逐
+> token 改写 × 深提交环——晚执行的拷贝读到后续门关步写入的 -1 并**亲自送
+> 上设备**(c1=836+1 算术与之吻合:-1 在拷贝后第一个检查点已可见);CUDA
+> 不崩可与此共存(逐步采样依赖压住 host 跑前,同构风险不落地)。**(a)**
+> torch_npu 引擎态提交序破坏;**(c)** 图重放互作。判别实验 = backup.cpu
+> 逐步双缓冲(env 门控),崩溃消失即 (b) 定谳。
+>
+> 完整推理史:`offstream-copy-attribution.md` §14(第 1-6 轮);对外更正:
+> `notes/upstream/pr-14922-mechanism-correction.md`(#14922,fix 不受影响且
+> 跨机制稳健)。本文其余内容保留为历史推理记录。
 
 ## 0. 一句话
 
 `prepare_next_token_ids_padded` 把一批"兜底 token id"用 pinned **非阻塞** H2D 拷贝送上 NPU;torch_npu 上这类拷贝走 SDMA 引擎,与发射流上后续计算 kernel 的先后顺序**没有保证**——输掉竞态时 `torch.where` 读到未初始化内存(0xa5a5a5a5,CANN 毒化标记),垃圾 id 混进 drafter 的 input_ids,词表规模的 embedding gather 拿垃圾当索引,越界读 GM,aivec 硬件异常,引擎死亡。
 
+> ❌ **2026-08-28**:本段"先后顺序没有保证"的平台层定性已被推翻——纯 CANN
+> 同流拷贝→kernel **有序且可见**(见文首横幅)。engine 级结果(崩溃/逃逸值
+> -1/fix 实效)不变;当前机制首选 (b):晚执行的拷贝读到 host 已改写的
+> backup.cpu(内含门关步的 -1),把 -1 亲自送上设备。
+
 > **终判(2026-08-25,Run 4 定谳)**:三计数器实验闭合此案为**值故事**,逃逸值实测为 **stale 的 -1 哨兵**(`esc=[-1,-1]`,`c1x=0` 证明 0xa5a5 从未进入值路径)——门开步(7/843,请求边界)racy 拷贝未落地,`where` 读到该行旧值 -1 流出(c3=1)即引擎死亡事件;clamp_next 的治愈实为值消毒而非时序屏障;fix 下 c3=0(Run 3)。**c1≈99% 是上游 `get_token_id` 的 -1 哨兵底噪,非竞态信号**(同日勘误)。详见 §2.7.1 与 §7.4-7.6。
+>
+> ⚠️ **2026-08-28 增补**:计数器读数全部有效,但"拷贝未落地 → where 读设备侧
+> 旧值"是机制 (a) 形态;机制 (b)(晚执行的拷贝读到 host 已改写的 -1 并亲自
+> 送达)与全部读数同样相容——c1=836+1 表明 -1 在拷贝后第一个检查点即已可见,
+> 两形态都解释得通。(a)/(b) 待 backup.cpu 双缓冲判别实验裁决(文首横幅)。
 
 ## 1. 现象与误判
 
@@ -154,6 +189,13 @@ MTE invalid GM address → aivec 异常 → EE9999 → 引擎死亡
 
 上游 GPU 的同型代码也用 `CpuGpuBuffer.copy_to_gpu`(non_blocking=True),但 **CUDA 的 `cudaMemcpyAsync` 入队到 stream 后,与同 stream 的后续 kernel 严格有序**——异步只是"不阻塞 host",顺序由流语义保证。torch_npu 的 pinned H2D 走 SDMA 引擎,与发射流(launch stream)上后续计算 kernel 的先后**没有等价保证**。一句话:**代码相同,后端流语义不同;NPU 移植不能默认继承 CUDA 的流序直觉**。
 
+> ❌ **2026-08-28**:本节对照已被推翻——纯 CANN 层同流拷贝→kernel 有序且
+> 可见,NPU 与 CUDA 在这一点上**等价**。CUDA 不崩 vs NPU 崩的真正候选解释
+> (机制 (b) 下):两边同构存在"host 改写 pinned 缓冲 × 拷贝晚执行"风险,
+> 但 CUDA 引擎每步被采样结果依赖压住 host 跑前,风险不落地;NPU 的深提交环
+> (~2048 任务)让 host 领先 100-200+ 步,晚拷贝真能读到改写后的内容
+> (含门关步的 -1)。详见文首横幅与归因文档 §14。
+
 ### 3.2 为什么只有 eagle 系触发?(暴露矩阵)
 
 调用归属(按上游 `SpeculativeConfig`:`use_eagle()` = `{"eagle","eagle3","mtp","dflash","dspark"}`,`uses_draft_model()` = `{"draft_model"}`;`model_runner` 的 `use_padded_batch` 分派):
@@ -189,6 +231,19 @@ MTE invalid GM address → aivec 异常 → EE9999 → 引擎死亡
   表 B(where 执行)= 计算队列积压(采样尾巴的 kernel)
 逃逸 ⟺ 表 B < 表 A(拷贝输)∧ 该步门开(cond=false)
 ```
+
+> ⚠️ **2026-08-28 终审改写(机制 (b) 口径)**:where 在提交环内 FIFO 有序
+> 跟在拷贝之后,**不再是赛跑方**。新窗口定义:
+>
+> ```
+> 窗口 = [拷贝入队] → [拷贝实际执行(SDMA)] vs [host 改写 backup.cpu]
+> 逃逸 ⟺ 拷贝执行时读到的已是后续步写入的内容(门关步 = -1)
+>        ∧ 该步门开(-1 被消费)
+> ```
+>
+> 下文"SDMA 稳态积压差"候选机制可**整体平移**(积压越深 → 拷贝越晚 →
+> 越可能读到改写后的 -1);"方法/长度差异全在窗口内"的结构性论证不受
+> 影响。原 (a) 口径(拷贝 vs where 赛跑)保留待双缓冲判别实验裁决。
 
 两个结构性事实:
 
