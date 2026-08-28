@@ -256,6 +256,12 @@ Tensor.copy_(non_blocking=True)
 
 ## 7. issue 素材清单(下会话写作用)
 
+> ⛔ **2026-08-28:本节整体作废,勿引用。**全部核心证据(六格矩阵/窗口谱/
+> 时间线/加压闭环/观察者效应)经第五轮 alt2 配对闭案证实为探针伪影
+> (见文首横幅);issue 计划冻结——没有层被证明存在可外报缺陷。翻案后
+> 的对外动作改为 #14922 机制更正评论(`notes/upstream/
+> pr-14922-mechanism-correction.md`)。以下原文仅存档。
+
 - 标题方向:probabilistic stale read by same-stream kernels after
   `aclrtMemcpyAsync` H2D(pinned)——SDMA completion not visibility-ordered
   for AI-core consumers; window modulated by submission timing。
