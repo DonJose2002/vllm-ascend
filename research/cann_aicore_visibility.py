@@ -34,17 +34,28 @@ exact value family that escaped into the vocab gather in the original bug).
 Verdict matrix (print at the end; complete by also running --fence
 stream_sync / event_sync / event_wait, --mode sync, --bg 0):
 
-  racy miss>0 (fence=none)          -> PURE-CANN AI-CORE REPRODUCTION
-  + fence=stream_sync still miss>0  -> STRONGEST: aclrtSynchronizeStream returned
+  stale>0 or esc>0 (fence=none)     -> PURE-CANN AI-CORE REPRODUCTION (the
+                                       kernel read data OLDER than its
+                                       stream-preceding copy)
+  + fence=stream_sync still stale   -> STRONGEST: aclrtSynchronizeStream returned
                                        but the next kernel still saw stale data
-  + fence=event_* still miss>0      -> FENCE-BLIND: event apparatus cannot
+  + fence=event_* still stale       -> FENCE-BLIND: event apparatus cannot
                                        observe/inherit the copy's visibility
-  mode=sync miss==0                 -> negative control (blocking copy ordered)
-  miss==0 everywhere                -> not reproduced at these parameters; raise
-                                       --bg/--bg-elems/--steps (the pressure
-                                       recipe that reached 99.94% through torch:
-                                       --bg 16 --bg-elems 1048576 --steps 5000)
-                                       and/or try --dispatch threaded
+  future>0 only                     -> KERNEL-DISPATCH LAG: the aclnn kernel
+                                       executed AFTER later same-stream copies
+                                       (read FUTURE values) - the AI-core launch
+                                       path defers execution under a busy
+                                       submitting thread (~150-200ms pipeline,
+                                       server-observed 2026-08-28). Such a run
+                                       CANNOT adjudicate copy->kernel visibility;
+                                       the decisive cell is the pressure recipe
+                                       (--mode racy --bg 16 --bg-elems 1048576,
+                                       where SDMA lag must dominate) and the
+                                       mechanism probe ASCEND_LAUNCH_BLOCKING=1.
+  mode=sync miss==0                 -> negative control (blocking copy ordered);
+                                       sync miss>0 = PROBE-INVALID run (pipeline
+                                       distorted) - never cite it as evidence
+  miss==0 everywhere                -> not reproduced at these parameters
 
 API provenance (no untested shapes on the hot path): the aclnn two-stage
 pattern, aclCreateTensor 9-arg form, aclCreateScalar and the
@@ -387,23 +398,37 @@ def run(args) -> int:
 
     # analyze only the steps whose consumer kernel was actually launched
     # (after an abort, later hist slots hold unwritten device memory)
-    miss = esc = garbage = 0
+    #
+    # stale-vs-future split is the whole game (server lesson 2026-08-28):
+    #  - STALE (src older than its step)  = the visibility-gap signature
+    #  - FUTURE (src newer than its step)  = the kernel executed AFTER later
+    #    same-stream copies - a launch/dispatch-pipeline artifact that says
+    #    NOTHING about copy->kernel visibility and must never be cited as a
+    #    reproduction (the first server matrix hit exactly this: ~200-step
+    #    future lag in every non-fence run, negative control included)
+    miss = esc = garbage = stale = future = 0
     lags: dict[int, int] = {}
+    future_lags: dict[int, int] = {}
     examples: list[str] = []
     for k in range(1, steps_done + 1):
         out0 = hist_host[(k - 1) * args.payload]
         if out0 == k + 1:
             continue
         miss += 1
+        src_saw = out0 - 1
         if out0 == 0:  # read SENTINEL: src never overwritten for this step's reader
             esc += 1
-        elif out0 < 2 or out0 > args.steps + 1:
+        elif src_saw == 0 or src_saw > args.steps:
             garbage += 1
+        elif src_saw > k:
+            future += 1
+            future_lags[k - src_saw] = future_lags.get(k - src_saw, 0) + 1
         else:
-            lag = k - (out0 - 1)
-            lags[lag] = lags.get(lag, 0) + 1
+            stale += 1
+            lags[k - src_saw] = lags.get(k - src_saw, 0) + 1
         if len(examples) < 4:
-            examples.append(f"step={k} kernel_saw_src={out0 - 1} (want {k})")
+            kind = "FUTURE" if src_saw > k else ("SENTINEL" if out0 == 0 else "STALE")
+            examples.append(f"step={k} kernel_saw_src={src_saw} (want {k}) [{kind}]")
 
     # cleanup
     opapi.cleanup()
@@ -427,11 +452,13 @@ def run(args) -> int:
         f"wall={wall:.2f}s ({wall / args.steps * 1e6:.1f}us/step)"
     )
     lag_desc = ", ".join(f"lag={k}:{v}" for k, v in sorted(lags.items())[:4])
+    fl = ", ".join(f"lag={k}:{v}" for k, v in sorted(future_lags.items())[:4])
     print(
         f"miss={miss} ({100.0 * miss / max(steps_done, 1):.2f}% of {steps_done} measured steps)"
-        f" sentinel-escapes={esc}"
+        f" stale={stale} future={future} sentinel-escapes={esc}"
         + (f" garbage={garbage}" if garbage else "")
-        + (f" stale: {lag_desc}" if lag_desc else "")
+        + (f" | stale-lags: {lag_desc}" if lag_desc else "")
+        + (f" | future-lags: {fl}" if fl else "")
     )
     for e in examples:
         print(f"  {e}")
@@ -439,25 +466,41 @@ def run(args) -> int:
     if copy_errors:
         verdict = "ABORTED: worker-thread ACL errors (see above)"
     elif args.mode == "sync":
-        verdict = "PASS (sync memcpy ordered)" if miss == 0 else "UNEXPECTED: even synchronous memcpy misreads"
-    elif miss > 0 and args.fence == "stream_sync":
         verdict = (
-            "STRONGEST: aclrtSynchronizeStream returned, yet the next same-stream"
-            " AI-core kernel still read stale data - visibility not covered by full stream sync"
+            "PASS (sync memcpy ordered)"
+            if miss == 0
+            else "PROBE-INVALID RUN: sync-mode negative control must be green - the pipeline was"
+            " distorted (see stale/future split); never cite this run as evidence"
         )
-    elif miss > 0 and args.fence in ("event_sync", "event_wait"):
-        verdict = "FENCE-BLIND: event fences completed, yet the AI-core kernel still read stale data"
-    elif miss > 0 and args.fence == "none":
+    elif stale == 0 and esc == 0 and future > 0:
         verdict = (
-            "PURE-CANN AI-CORE REPRODUCTION: same-stream aclnn kernel read stale"
-            " data after aclrtMemcpyAsync (H2D) - visibility gap reproduced with"
-            " ZERO torch/torch_npu in the loop"
+            "KERNEL-DISPATCH LAG: AI-core kernels executed AFTER later same-stream copies"
+            " (future reads, dominant lag above) - the aclnn launch path defers execution"
+            " under a busy submitting thread (~150-200ms pipeline, server 2026-08-28)."
+            " This run CANNOT adjudicate copy->kernel visibility. Decisive cell:"
+            " --mode racy --bg 16 --bg-elems 1048576 (SDMA lag must dominate the kernel"
+            " dispatch lag); mechanism probes: --bg 0, ASCEND_LAUNCH_BLOCKING=1."
         )
+    elif stale > 0 or esc > 0:
+        extra = f" (mixed with {future} future reads - dispatch lag present, see split)" if future else ""
+        if args.fence == "stream_sync":
+            verdict = (
+                "STRONGEST: aclrtSynchronizeStream returned, yet the next same-stream"
+                f" AI-core kernel still read stale data - visibility not covered by full stream sync{extra}"
+            )
+        elif args.fence in ("event_sync", "event_wait"):
+            verdict = f"FENCE-BLIND: event fences completed, yet the AI-core kernel still read stale data{extra}"
+        else:
+            verdict = (
+                "PURE-CANN AI-CORE REPRODUCTION: same-stream aclnn kernel read data older"
+                " than its stream-preceding aclrtMemcpyAsync (H2D) - ordering/visibility gap"
+                f" reproduced with ZERO torch/torch_npu in the loop{extra}"
+            )
     else:
         verdict = (
-            "NOT reproduced at these parameters - raise --bg/--bg-elems/--steps"
-            " (pressure recipe: --bg 16 --bg-elems 1048576 --steps 5000),"
-            " try --dispatch threaded, and keep --mode sync / --bg 0 controls green"
+            "NOT reproduced at these parameters - the decisive pressure cell is"
+            " --mode racy --bg 16 --bg-elems 1048576 --steps 5000 (SDMA lag dominating"
+            " kernel dispatch lag); keep --mode sync / --bg 0 controls green"
         )
     print(f"verdict: {verdict}")
     print(
@@ -536,6 +579,12 @@ def selftest() -> int:
             {"ACLMOCK_LANDING": "lag1", "ACLMOCK_SYNC_BLIND": "1"},
             ["--fence", "stream_sync", "--steps", "50"],
             ("miss=50", "STRONGEST"),
+        ),
+        (
+            "dispatch-lag model: future-only reads (never a visibility claim)",
+            {"ACLMOCK_LANDING": "immediate", "ACLMOCK_EXEC_DELAY": "1"},
+            ["--steps", "50"],
+            ("miss=49", "future=49", "stale=0", "KERNEL-DISPATCH LAG"),
         ),
     ]
     ok = True

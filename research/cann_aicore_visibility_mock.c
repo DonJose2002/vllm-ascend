@@ -16,7 +16,14 @@
  *   - ACLMOCK_SYNC_BLIND=1  : aclrtSynchronizeStream returns WITHOUT landing
  *     the pending copy (models "sync does not carry visibility");
  *   - ACLMOCK_EVENT_BLIND=1 : aclrtSynchronizeEvent returns WITHOUT landing
- *     (models fence-blind events).
+ *     (models fence-blind events);
+ *   - ACLMOCK_EXEC_DELAY=1  : aclnnAdd STAGES the kernel instead of running
+ *     it; staged kernels execute (drain) on the next GetWorkspaceSize call
+ *     or any host-blocking runtime call (sync memcpy / SynchronizeStream /
+ *     SynchronizeEvent). Models the server-observed lazy AI-core dispatch
+ *     (2026-08-28: busy-loop runs read FUTURE values ~200 steps ahead,
+ *     fence runs read current) - lets the selftest verify the probe's
+ *     stale-vs-future classifier and the KERNEL-DISPATCH-LAG verdict.
  *
  * Single-threaded by design: the selftest exercises --dispatch direct only.
  * Build: gcc -shared -fPIC -O2 -o mock_cann.so cann_aicore_visibility_mock.c
@@ -47,6 +54,9 @@ typedef struct Pending {
 } Pending;
 
 static Pending g_pending = {NULL, NULL, 0, 0};
+
+/* staged-kernel drain point (impl lives in the libopapi section with MockExec) */
+static void drain_staged(void);
 
 static int env_flag(const char *name, const char *value)
 {
@@ -108,6 +118,7 @@ int aclrtSynchronizeEvent(void *event)
 {
     (void)event;
     if (!env_flag("ACLMOCK_EVENT_BLIND", "1")) {
+        drain_staged();
         apply_pending();
     }
     return ACL_SUCCESS;
@@ -123,6 +134,7 @@ int aclrtSynchronizeStream(void *stream)
 {
     (void)stream;
     if (!env_flag("ACLMOCK_SYNC_BLIND", "1")) {
+        drain_staged();
         apply_pending();
     }
     return ACL_SUCCESS;
@@ -173,7 +185,8 @@ int aclrtMemcpy(void *dst, size_t dp, const void *src, size_t sp, int32_t kind)
     (void)dp;
     (void)sp;
     (void)kind;
-    apply_pending(); /* synchronous copy semantics: everything landed first */
+    drain_staged(); /* synchronous call semantics: staged kernels run first */
+    apply_pending(); /* ... then everything landed, then the copy itself */
     memmove(dst, src, sp);
     return ACL_SUCCESS;
 }
@@ -265,13 +278,35 @@ int aclDestroyScalar(const void *scalar)
 }
 
 /* out = self + alpha * other (int32 elementwise), executed against the
- * LANDED memory state -- the whole point of the model: whether the pending
+ * LANDED memory state - the whole point of the model: whether the pending
  * tested copy has landed decides what the "kernel" observes. */
 static void exec_add(MockExec *e)
 {
     for (int64_t i = 0; i < e->n; i++) {
         e->out[i] = e->src[i] + (int32_t)(e->alpha * e->other[i]);
     }
+}
+
+/* ACLMOCK_EXEC_DELAY=1: the launch is STAGED (lazy AI-core dispatch model) and
+ * drained on the next GetWorkspaceSize / host-blocking runtime call; a drained
+ * kernel reads whatever has landed by THEN - future values in a busy loop. */
+typedef struct StagedExec {
+    MockExec e;
+    struct StagedExec *next;
+} StagedExec;
+
+static StagedExec *g_staged_head = NULL;
+static StagedExec *g_staged_tail = NULL;
+
+static void drain_staged(void)
+{
+    while (g_staged_head != NULL) {
+        StagedExec *s = g_staged_head;
+        g_staged_head = s->next;
+        exec_add(&s->e);
+        free(s);
+    }
+    g_staged_tail = NULL;
 }
 
 int aclnnAddGetWorkspaceSize(const void *self, const void *other, const void *alpha,
@@ -287,6 +322,7 @@ int aclnnAddGetWorkspaceSize(const void *self, const void *other, const void *al
     if (ts->dtype != 3 || to->dtype != 3 || tout->dtype != 3) {
         return 2; /* probe uses int32 only */
     }
+    drain_staged(); /* a new op launch drains previously staged kernels */
     MockExec *e = (MockExec *)calloc(1, sizeof(MockExec));
     e->src = (const int32_t *)ts->dev_ptr;
     e->other = (const int32_t *)to->dev_ptr;
@@ -305,6 +341,19 @@ int aclnnAdd(void *workspace, uint64_t workspace_size, void *executor, void *str
     (void)stream;
     if (!executor) {
         return 1;
+    }
+    if (env_flag("ACLMOCK_EXEC_DELAY", "1")) {
+        StagedExec *s = (StagedExec *)calloc(1, sizeof(StagedExec));
+        s->e = *(MockExec *)executor;
+        s->next = NULL;
+        if (g_staged_tail != NULL) {
+            g_staged_tail->next = s;
+        } else {
+            g_staged_head = s;
+        }
+        g_staged_tail = s;
+        free(executor);
+        return ACL_SUCCESS;
     }
     exec_add((MockExec *)executor);
     free(executor);

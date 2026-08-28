@@ -449,3 +449,50 @@ python3 research/cann_aicore_visibility.py --bg 16 --bg-elems 1048576 --steps 50
    通过。防御:case 1 加 mock 路径正向断言。
 
 修复后 selftest 6/6 复验通过,ruff 全绿。
+
+### 第一轮服务器结果(2026-08-28,910B3 容器):负对照红 → 判读全面修正
+
+| 配置 | miss | lag 形态 | 初版 verdict | 修正后定性 |
+|---|---|---|---|---|
+| **sync(负对照)** | **99.90%** | **future(-227)** | UNEXPECTED | **PROBE-INVALID:负对照必须绿** |
+| racy direct bg=8 | 99.85% | future(-204) | (声称复现) | **无效:dispatch lag 伪影** |
+| racy threaded | 99.75% | future(-204) | (声称复现) | 无效(同上) |
+| fence=event_wait | 99.80% | future(-170) | FENCE-BLIND | 无效(同上) |
+| fence=stream_sync bg=8 | 0% | — | — | 绿(及时+有序) |
+| fence=stream_sync 64MiB×5000 | 0% | — | — | 绿 |
+| fence=event_sync 64MiB×5000 | 0% | — | — | 绿 |
+
+**修正逻辑**:①阻塞拷贝按定义有序,sync 格红 = 该形态下管线被扭曲,
+全部"复现"作废(外部审查"负对照必须绿"原则在此应验);②lag 全负且
+巨大 = kernel 读到**未来 ~200 步的值**(step2 读到 src=4)——可见性缺口
+只能产生**旧的**值(stale,lag>0),future 不可能由"拷贝不可见"产生。
+
+**新模型(全 8 格自洽)**:纯 CANN 两段式 aclnn launch 的 AI core 任务
+在忙碌提交线程下**延迟派发 ~150-200ms**( ramp 后稳定 ~204 步定深管线;
+sync 格 -227/racy -204/event_wait -170/threaded -204 同量级);SDMA
+拷贝即时派发;**host 阻塞类调用(SynchronizeStream/Event)强制清空派发
+管线**(故 fence 格全绿:kernel 及时且有序);event_wait(设备侧)与阻塞
+memcpy 都不清空(故红)。这本身是重大机制发现——**同一条流上
+"拷贝→kernel"的执行序在忙碌直发拓扑下不成立**,方向与 torch_npu 侧
+(kernel 及时、拷贝落地晚→stale)相反,是同一"跨引擎序列化缺失"硬币
+的两面;且可能与 ASCEND_LAUNCH_BLOCKING=1 治愈原 eagle 竞态的机制直接
+相关(launch 同步化=派发及时化)。
+
+**探针已修**(同日):stale/future/esc/garbage 四分类 + verdict 分支
+(future-only → KERNEL-DISPATCH LAG,明确"不可裁决可见性";sync 红 →
+PROBE-INVALID);mock 增 ACLMOCK_EXEC_DELAY(排队派发模型),selftest
+7 分支全过。
+
+**决定性待跑格子**(初版命令漏了最关键的一格——压力+无栅栏):
+```bash
+python3 research/cann_aicore_visibility.py --mode racy --bg 16 --bg-elems 1048576 --steps 5000
+# SDMA 延迟(64MiB/步,数百 ms)必须压过 kernel 派发延迟(~180ms):
+#   stale>0  → 纯 CANN 排序/可见性缺陷实锤(kernel 读到流序在前的拷贝之前的旧值)
+#   miss=0   → 依赖已插入且可见 → 纯 CANN 直发安全 → 缺陷需 torch_npu 拓扑 → 落回 Ascend/pytorch
+#   future 仍主导 → 再加大 bg-elems
+python3 research/cann_aicore_visibility.py --mode racy --bg 16 --bg-elems 1048576 --steps 5000 --dispatch threaded
+# 机制探针(可选,每条 ~1 分钟):
+python3 research/cann_aicore_visibility.py --mode racy --bg 0 --steps 2000   # 无拷贝时 kernel 是否仍滞后
+python3 research/cann_aicore_visibility.py --mode racy --steps 200          # lag 爬坡形状(定深 vs 定时延)
+ASCEND_LAUNCH_BLOCKING=1 python3 research/cann_aicore_visibility.py --mode racy --steps 200  # 同步 launch=派发及时化?
+```
