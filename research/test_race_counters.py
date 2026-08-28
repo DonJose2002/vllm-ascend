@@ -87,6 +87,9 @@ def _make_namespace() -> dict:
         "DeviceOperator": _DeviceOperatorStub,
         "_SD_COUNTERS": False,
         "_SD_REVIVE_RACE": False,
+        # staged-copy experiment (2026-08-28): default off in these scenarios;
+        # the real prepare() references the module global in its revive branch
+        "_SD_STAGED_COPY": 0,
         "_RACE_COUNTERS": None,
     }
     return ns
