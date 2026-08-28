@@ -425,3 +425,27 @@ python3 research/cann_aicore_visibility.py --dispatch threaded # 跨线程格
 # 若全绿,加压配方:
 python3 research/cann_aicore_visibility.py --bg 16 --bg-elems 1048576 --steps 5000
 ```
+
+### 外部审查回应(2026-08-28,红绿判读前)
+
+另一 AI 对脚本提 4 条"数据失真"质疑,逐条核查(不照单全收):
+
+1. **"join() 不保证硬件入队→假阴性"——方向误**。join() 保证的是
+   aclrtMemcpyAsync 调用序先于 kernel launch(**必要前提;缺失才是假
+   正向**——kernel 先于拷贝提交)。若拷贝硬件入队被推迟:同流执行序仍
+   保证拷贝先于 kernel,而缺陷恰是"拷贝已完成仍读旧值"(reprof_racy
+   时间线),推迟制造不出干净通过,只会移动提交时序谱上的点(窗口模型
+   §4 本义)。防御:文档钉死 **direct=裁决主格**(无队列中介),threaded
+   =探索格(继承报告格 3 的混合线程混淆警示)。
+2. **"as_i32 越界写→假阳性"——不成立**。两处调用点的 ctypes 视图长度
+   ==分配长度(payload×4 == payload_b)且只写 [0];无越界路径。防御:
+   assert payload≥1 + 注释钉死构造等式。
+3. **"worker 初始化失败静默丢弃→esc=100% 误判"——半误**。copy_errors
+   在 verdict 链第一优先(原版即 ABORTED,对方漏看);但数字行确实会打
+   误导性 100%。防御:threaded 每步 join 后检测即中断 + 分析只覆盖
+   steps_done(未测步不再入统计)。
+4. **"selftest 环境传递缺漏"——不成立**。find_lib/find_opapi_lib 均
+   env 优先(insert(0));且误跑真硬件会让 lag1 分支响亮 FAIL 而非静默
+   通过。防御:case 1 加 mock 路径正向断言。
+
+修复后 selftest 6/6 复验通过,ruff 全绿。

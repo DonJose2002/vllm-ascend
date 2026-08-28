@@ -310,7 +310,12 @@ def run(args) -> int:
         worker_thread.start()
 
     t0 = time.monotonic()
+    steps_done = 0
     for step in range(1, args.steps + 1):
+        # host write: the ctypes view below spans EXACTLY the allocation
+        # (payload int32 == payload_b bytes at both call sites) and only
+        # element [0] is stored - no out-of-bounds path exists by construction
+        assert args.payload >= 1, "payload must cover at least one int32"
         slot_ptr = src_ptrs[(step - 1) % 2]
         cann_memcpy_order.as_i32(slot_ptr, args.payload)[0] = step  # host write
 
@@ -323,11 +328,25 @@ def run(args) -> int:
         else:  # sync control: blocking aclrtMemcpy, no stream involved
             h2d_sync(dev_src, slot_ptr, payload_b, "test aclrtMemcpy(sync)")
 
-        # threaded: guarantee every copy of this step reached the runtime
-        # BEFORE the kernel launch (submission-order requirement, mirroring
-        # the host-queue drain torch_npu's fences rely on)
+        # threaded: work_q.join() guarantees the aclrtMemcpyAsync CALLS have
+        # returned in FIFO order before the kernel launch - the API-level
+        # submission-order precondition (without it the kernel could be
+        # submitted before the tested copy: a FALSE POSITIVE). It does NOT
+        # (and cannot, without a stream sync that would destroy the window)
+        # guarantee hardware-level enqueue; deferred enqueue only moves this
+        # run along the submission-timing spectrum of the window model
+        # (report section 4) - it cannot turn a real defect into a clean
+        # pass, because same-stream execution still orders copy before
+        # kernel and the defect is precisely "completed copy, stale read".
+        # The DECISIVE arm for red/green is --dispatch direct (no queue
+        # indirection at all); threaded is the exploratory cross-thread
+        # topology point, conflation caveat as in grid 3 of the report.
         if args.dispatch == "threaded":
             work_q.join()
+            if copy_errors:
+                print(f"worker-thread ACL errors: {copy_errors[:3]}")
+                print(f"ABORT at step {step}: copies were dropped, remaining steps not measured")
+                break
         if args.fence == "stream_sync":
             acl.chk(acl.lib.aclrtSynchronizeStream(stream), "aclrtSynchronizeStream")
         elif args.fence == "event_sync":
@@ -343,6 +362,7 @@ def run(args) -> int:
         out_t = opapi.tensor(hist + (step - 1) * payload_b, args.payload)
         alpha_s = opapi.scalar(1)
         opapi.launch_add(src_t, ones_t, alpha_s, out_t, stream)
+        steps_done = step
 
     wall = time.monotonic() - t0
 
@@ -365,10 +385,12 @@ def run(args) -> int:
         "final D2H aclrtMemcpy",
     )
 
+    # analyze only the steps whose consumer kernel was actually launched
+    # (after an abort, later hist slots hold unwritten device memory)
     miss = esc = garbage = 0
     lags: dict[int, int] = {}
     examples: list[str] = []
-    for k in range(1, args.steps + 1):
+    for k in range(1, steps_done + 1):
         out0 = hist_host[(k - 1) * args.payload]
         if out0 == k + 1:
             continue
@@ -398,14 +420,16 @@ def run(args) -> int:
     acl.lib.aclrtResetDevice(args.device)
 
     bg_desc = f"{args.bg}x{args.bg_elems * 4 // 1024}KiB" if args.bg else "off"
+    steps_desc = f"{steps_done}/{args.steps}" if steps_done != args.steps else f"{args.steps}"
     print(
         f"mode={args.mode} fence={args.fence} dispatch={args.dispatch} host_mem={args.host_mem} "
-        f"steps={args.steps} payload={payload_b}B bg={bg_desc} "
+        f"steps={steps_desc} payload={payload_b}B bg={bg_desc} "
         f"wall={wall:.2f}s ({wall / args.steps * 1e6:.1f}us/step)"
     )
     lag_desc = ", ".join(f"lag={k}:{v}" for k, v in sorted(lags.items())[:4])
     print(
-        f"miss={miss} ({100.0 * miss / args.steps:.2f}% of steps) sentinel-escapes={esc}"
+        f"miss={miss} ({100.0 * miss / max(steps_done, 1):.2f}% of {steps_done} measured steps)"
+        f" sentinel-escapes={esc}"
         + (f" garbage={garbage}" if garbage else "")
         + (f" stale: {lag_desc}" if lag_desc else "")
     )
@@ -479,7 +503,9 @@ def selftest() -> int:
             "clean (immediate landing)",
             {},
             ["--steps", "50"],
-            ("miss=0 (0.00%", "sentinel-escapes=0", "NOT reproduced"),
+            # "mock_cann.so" needle proves the subprocess really routed to the
+            # mock via ACL_LIB/OPAPI_LIB (guards against a silent hardware run)
+            ("mock_cann.so", "miss=0 (0.00%", "sentinel-escapes=0", "NOT reproduced"),
         ),
         (
             "clean (sync mode control)",
