@@ -83,6 +83,19 @@ static Alloc *find_alloc(const void *ptr)
     return NULL;
 }
 
+/* interior-pointer lookup: the probe hands (base + offset) addresses into a
+ * big per-step slot allocation; validate the RANGE instead of exact base */
+static Alloc *find_alloc_range(const void *ptr, size_t n)
+{
+    for (Alloc *a = g_allocs; a; a = a->next) {
+        const char *p = (const char *)ptr;
+        if (p >= (const char *)a->ptr && p + n <= (const char *)a->ptr + a->size) {
+            return a;
+        }
+    }
+    return NULL;
+}
+
 static void apply_pending(void)
 {
     if (g_pending.live) {
@@ -196,7 +209,7 @@ int aclrtMemcpyAsync(void *dst, size_t dp, const void *src, size_t sp, int32_t k
     (void)dp;
     (void)kind;
     (void)stream;
-    if (!find_alloc(dst) || !find_alloc(src)) {
+    if (!find_alloc_range(dst, sp) || !find_alloc_range(src, sp)) {
         return 100000;
     }
     if (env_flag("ACLMOCK_LANDING", "lag1")) {

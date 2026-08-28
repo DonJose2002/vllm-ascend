@@ -41,17 +41,20 @@ stream_sync / event_sync / event_wait, --mode sync, --bg 0):
                                        but the next kernel still saw stale data
   + fence=event_* still stale       -> FENCE-BLIND: event apparatus cannot
                                        observe/inherit the copy's visibility
-  future>0 only                     -> KERNEL-DISPATCH LAG: the aclnn kernel
-                                       executed AFTER later same-stream copies
-                                       (read FUTURE values) - the AI-core launch
-                                       path defers execution under a busy
-                                       submitting thread (~150-200ms pipeline,
-                                       server-observed 2026-08-28). Such a run
-                                       CANNOT adjudicate copy->kernel visibility;
-                                       the decisive cell is the pressure recipe
-                                       (--mode racy --bg 16 --bg-elems 1048576,
-                                       where SDMA lag must dominate) and the
-                                       mechanism probe ASCEND_LAUNCH_BLOCKING=1.
+  future>0 only                     -> FUTURE-READ ANOMALY: the kernel read
+                                       values from LATER steps. Two known
+                                       mechanisms, neither of which is a
+                                       visibility verdict: (a) v1/v2 probes
+                                       (2026-08-28): host runs ahead inside a
+                                       ~2048-task FIFO submission ring and a
+                                       late copy read an OVERWRITTEN host slot
+                                       - parity fingerprint: dominant lags even
+                                       (slot rewrite period 2); fixed in v3 by
+                                       unique per-step slots; (b) consumer
+                                       kernel dispatched after later copies.
+                                       The ring fingerprint: 2048/tasks_per_step
+                                       predicted every server-measured lag to
+                                       +-1 across five shapes.
   mode=sync miss==0                 -> negative control (blocking copy ordered);
                                        sync miss>0 = PROBE-INVALID run (pipeline
                                        distorted) - never cite it as evidence
@@ -247,18 +250,27 @@ def run(args) -> int:
             what,
         )
 
-    pin_a = host_pin(payload_b)
-    pin_b = host_pin(payload_b)
+    # v3: UNIQUE per-step slots (the round-2 server lesson, 2026-08-28).
+    # v2 used two alternating slots; under the ~2048-task FIFO submission
+    # ring the host runs 100-200+ steps ahead (backpressured only when the
+    # ring fills), so a late-executing tested copy read an ALREADY-OVERWRITTEN
+    # slot and delivered a FUTURE value - parity fingerprint: every racy-mode
+    # dominant lag was even (= slot rewrite period 2), and 2048/tasks_per_step
+    # matched all five measured lags to +-1. One slot per step, written once:
+    # whatever a copy delivers is exactly its own step's value, regardless of
+    # when the ring gets around to executing it.
+    slots_b = args.steps * payload_b
+    pin = host_pin(slots_b)
     dev_src = dev_buf(payload_b)
     dev_ones = dev_buf(payload_b)
     hist = dev_buf(args.steps * payload_b)
     keep_plain = None
     if args.host_mem == "plain":
-        # pageable source, single buffer (the confounder arm, as in cann_memcpy_order)
-        keep_plain = ctypes.create_string_buffer(payload_b)
-        src_ptrs = [ctypes.addressof(keep_plain)] * 2
+        # pageable source: one big buffer, same per-step addressing
+        keep_plain = ctypes.create_string_buffer(slots_b)
+        slots_base = ctypes.addressof(keep_plain)
     else:
-        src_ptrs = [pin_a, pin_b]
+        slots_base = pin
     bg_pin = bg_dev = None
     if args.bg > 0:
         bg_b = args.bg_elems * 4
@@ -323,11 +335,12 @@ def run(args) -> int:
     t0 = time.monotonic()
     steps_done = 0
     for step in range(1, args.steps + 1):
-        # host write: the ctypes view below spans EXACTLY the allocation
-        # (payload int32 == payload_b bytes at both call sites) and only
-        # element [0] is stored - no out-of-bounds path exists by construction
+        # host write into THIS STEP'S OWN slot: the ctypes view spans exactly
+        # one payload (payload int32 == payload_b bytes) inside the per-step
+        # slot region, and only element [0] is stored - no out-of-bounds path
+        # exists by construction; written exactly once, never rewritten.
         assert args.payload >= 1, "payload must cover at least one int32"
-        slot_ptr = src_ptrs[(step - 1) % 2]
+        slot_ptr = slots_base + (step - 1) * payload_b
         cann_memcpy_order.as_i32(slot_ptr, args.payload)[0] = step  # host write
 
         if bg_dev is not None:
@@ -438,8 +451,7 @@ def run(args) -> int:
     acl.lib.aclrtFree(hist)
     acl.lib.aclrtFree(dev_ones)
     acl.lib.aclrtFree(dev_src)
-    acl.lib.aclrtFreeHost(pin_a)
-    acl.lib.aclrtFreeHost(pin_b)
+    acl.lib.aclrtFreeHost(pin)
     acl.lib.aclrtDestroyEvent(event)
     acl.lib.aclrtDestroyStream(stream)
     acl.lib.aclrtResetDevice(args.device)
@@ -474,12 +486,14 @@ def run(args) -> int:
         )
     elif stale == 0 and esc == 0 and future > 0:
         verdict = (
-            "KERNEL-DISPATCH LAG: AI-core kernels executed AFTER later same-stream copies"
-            " (future reads, dominant lag above) - the aclnn launch path defers execution"
-            " under a busy submitting thread (~150-200ms pipeline, server 2026-08-28)."
-            " This run CANNOT adjudicate copy->kernel visibility. Decisive cell:"
-            " --mode racy --bg 16 --bg-elems 1048576 (SDMA lag must dominate the kernel"
-            " dispatch lag); mechanism probes: --bg 0, ASCEND_LAUNCH_BLOCKING=1."
+            "FUTURE-READ ANOMALY (post-v3 = unexpected): the AI-core kernel read values from steps"
+            " LATER than its own. With unique per-step slots (this version) a late copy can no longer"
+            " deliver overwritten values, so this indicates the consumer kernel executed after later"
+            " same-stream copies (kernel-side dispatch lag) - still NOT a copy->kernel visibility"
+            " verdict. Compare against the 2026-08-28 ring fingerprint: the runtime stages ~2048"
+            " tasks in a FIFO submission ring (2048/tasks_per_step predicted every measured lag"
+            " to +-1), so host run-ahead is structural. Decisive cell stays:"
+            " --mode racy --bg 16 --bg-elems 1048576 --steps 5000."
         )
     elif stale > 0 or esc > 0:
         extra = f" (mixed with {future} future reads - dispatch lag present, see split)" if future else ""
@@ -584,7 +598,7 @@ def selftest() -> int:
             "dispatch-lag model: future-only reads (never a visibility claim)",
             {"ACLMOCK_LANDING": "immediate", "ACLMOCK_EXEC_DELAY": "1"},
             ["--steps", "50"],
-            ("miss=49", "future=49", "stale=0", "KERNEL-DISPATCH LAG"),
+            ("miss=49", "future=49", "stale=0", "FUTURE-READ ANOMALY"),
         ),
     ]
     ok = True

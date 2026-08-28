@@ -496,3 +496,35 @@ python3 research/cann_aicore_visibility.py --mode racy --bg 0 --steps 2000   # �
 python3 research/cann_aicore_visibility.py --mode racy --steps 200          # lag 爬坡形状(定深 vs 定时延)
 ASCEND_LAUNCH_BLOCKING=1 python3 research/cann_aicore_visibility.py --mode racy --steps 200  # 同步 launch=派发及时化?
 ```
+
+### 第二轮服务器结果(2026-08-28 续):"派发延迟"模型也被推翻 → 2048 任务 FIFO 提交环 + 探针槽复用 bug
+
+| 配置 | miss | 主导 lag | 每步 ring 任务数 | 2048/任务数 预测 |
+|---|---|---|---|---|
+| racy bg=8×1MiB(一轮) | 99.85% | **-204** | 8bg+1copy+1add=10 | **204.8** ✓ |
+| sync bg=8(一轮) | 99.90% | **-227** | 8bg+1add=9(阻塞拷贝不入环) | **227.6** ✓ |
+| event_wait bg=8(一轮) | 99.80% | **-170** | 10+record+wait=12 | **170.7** ✓ |
+| **racy bg=16×4MiB 5000 步** | 99.94% | **-114** | 16+1+1=18 | **113.8** ✓ |
+| threaded 同上 | 99.94% | **-114** | 18 | **113.8** ✓ |
+| **racy --bg 0** | **0%** | — | — | 环浅,无覆盖 ✓ |
+| ASCEND_LAUNCH_BLOCKING=1 steps=200 | 98.5% | 平坦 ~-130s | — | 环行为与 launch 模式无关 ✓ |
+
+**五形态 ±1 精确命中 → 终模型**:CANN 提交管线 = **~2048 任务的 FIFO 环形队列**,host 领先跑满环后被背压限速(64MiB/步时 host 速率 = SDMA 线速 ~20GB/s)。没有"kernel 特殊延迟派发"——一切任务 FIFO 有序。
+
+**future 读的真因 = 探针 v1/v2 自身的槽复用 bug**:双槽交替(改写周期 2),host 领先 114-227 步,被测拷贝**晚执行时读到的 host 槽已被未来步覆盖**,把未来值搬上设备。铁证 = **奇偶指纹**:racy 系全部主导 lag 为偶数(204/114/170,周期 2 的签名),sync 模式(阻塞拷贝不经槽)是奇数 227。前两轮全部"复现"判读作废(含我 08-28 写入本文档的"派发延迟"模型——连同 §14 首轮小节一并按本节为准);**纯 CANN 直发目前零缺陷证据**。
+
+**v3 修复**(`cecbdb49c` 后续 commit):每步独占槽(steps×64B pinned,写一次永不改写)——拷贝无论何时执行,搬运的就是自己那步的值。判读分支改名 FUTURE-READ ANOMALY(v3 后出现 = kernel 侧真滞后,仍非可见性判读)。mock find_alloc 改范围匹配(块内偏移指针),selftest 7/7。
+
+**连带警示(入 issue 前必须审计)**:`repro_h2d_order.py`(torch 侧)的 miss 计数同样**从未区分 stale/future**,且用同款双槽(host 领先时同样可能被覆盖)——其 racy miss 数字引用前需加 stale/future 分解复核;**仍站得住的 torch 侧证据**:engine 三计数器 esc=[-1,-1](真·旧值,-1 只存在于设备初始/门关步,不可能由槽覆盖产生)+ msprof 时间线(拷贝 task_stop < kernel start 仍读旧值)+ clamp 消毒实验。
+
+**~2048 环本身的工程意义**(独立于本案,值得单独记档):host 可领先设备 2000 任务意味着任何"host 写 pinned 缓冲 → async 拷贝"模式都有 ~2000 任务深的覆盖窗口——正是 CUDA CachingHostAllocator record_event 保护、而 torch_npu 侧(见 §源码链 CachingHostAllocator 分析)假设流序成立才安全的那类风险的定量版。
+
+**v3 重跑清单**(全矩阵,共 ~1 分钟):
+```bash
+python3 research/cann_aicore_visibility.py                                # racy bg=8:预期 miss=0(环有序+独占槽)
+python3 research/cann_aicore_visibility.py --mode sync                    # 负对照:预期绿
+python3 research/cann_aicore_visibility.py --bg 0                         # 平静对照:预期绿
+python3 research/cann_aicore_visibility.py --fence event_wait             # 设备侧栅栏:stale>0 才是缺陷
+python3 research/cann_aicore_visibility.py --bg 16 --bg-elems 1048576 --steps 5000  # 满环压力:stale>0 才是缺陷
+python3 research/cann_aicore_visibility.py --bg 16 --bg-elems 1048576 --steps 5000 --dispatch threaded
+```
