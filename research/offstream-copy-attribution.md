@@ -370,3 +370,58 @@ TASK_QUEUE_ENABLE=0 治愈 ⇒ 队列机制肇因实锤(与 ASCEND_LAUNCH_BLOCKI
 aclrtMemcpyAsync H2D (SDMA completion not visibility-ordered for AI-core
 consumers; window modulated by submission timing)。证据 = 六格矩阵 +
 profiler 开关效应 + reprof_racy 时间线(执行序正确+可见性缺失)。
+
+## 14. 第七轮(2026-08-28):纯 CANN AI core 消费者复现探针
+
+**动机**:终判指向 CANN runtime 层,但当时的纯 CANN 探针
+(`cann_memcpy_order.py`)消费者是 D2H 读回 = SDMA 引擎读 = 终判中
+"本就不受影响"的路径——全绿与终判自洽,却留下一块短板:**没有自包含
+的纯 CANN 红 repro**(红的最小复现依赖 torch_npu 提供消费 kernel)。
+据此落 issue 到 cann/runtime 时会被"请先隔离 torch"一轮打回。另:重复
+检索(2026-08-28,`notes/upstream/issue-duplicate-search-20260828.md`)
+确认 gitcode cann/runtime#873(D2H/event 方向)是最近近亲、无重复 issue,
+而该仓受理的正是 runtime 语义类问题。
+
+**探针**:`research/cann_aicore_visibility.py`(+ mock
+`cann_aicore_visibility_mock.c`)——零 torch/零 torch_npu:
+libascendcl(ctypes)+ libopapi 两段式 `aclnnAdd`(真 AI core/vector
+kernel,API 形态逐项镜像 op-plugin 生产用法:9 参 `aclCreateTensor`、
+create → GetWorkspaceSize → run → destroy 顺序、ACL_DT_INT32=3/
+ACL_FORMAT_ND=2 经 cann-runtime 头文件核实)。证据协议同
+`repro_h2d_order.py`:消费者把 `out = src + 1` 落进 device 侧历史缓冲,
+结尾一次 sync D2H 判读(**零逐步 host 同步**,规避观察者效应);esc 计
+初始 -1 哨兵读(原 bug 逃逸值族);lag 直方图。
+
+时间线(每步):host 写 slot → K×bg 1MiB async H2D(SDMA 积压)→ 被测
+64B async H2D → [fence: none|stream_sync|event_sync|event_wait] →
+同流 `aclnnAdd` 消费 → 末尾统一 synchronize + D2H。
+
+**判读矩阵**(脚本自打 verdict):
+- racy miss>0 → **纯 CANN AI core 复现**(defect 完全低于 torch 层);
+- +stream_sync 仍 miss>0 → STRONGEST(sync 返回但后续 kernel 读旧值);
+- +event_* 仍 miss>0 → FENCE-BLIND;
+- mode=sync / bg=0 = 负对照,应全绿;
+- 全绿 → 加压配方 `--bg 16 --bg-elems 1048576 --steps 5000`
+  (torch 侧 99.94% 的同款)+ `--dispatch threaded`。
+
+**本地验证**:`--selftest` 用 gcc 编译 mock(单 .so 同时导出两库子集;
+pending-落地内存模型,ACLMOCK_LANDING/SYNC_BLIND/EVENT_BLIND 三旋钮)
+跑 6 分支全过:clean×2 / lag1(racy miss=100%、esc=1、lag=1 数值精确)/
+fence 救 / event 盲 / sync 盲——判读逻辑与计数管线端到端核实;
+ruff check+format 全绿。
+
+**意义(判读后)**:
+- 红 → issue 证据链升级为自包含纯 CANN repro,落 cann/runtime 无软肋;
+- 绿(加压后仍绿)→ 终判需修正:AI core 消费经 aclnn 直发拓扑安全,
+  窗口需要 torch_npu 提交拓扑参与 → issue 落回 Ascend/pytorch
+  (torch_npu),按暴露面定性。**红绿两路都是决定性信息。**
+
+**服务器命令**(容器内,无 torch 依赖,~1-2 分钟/条):
+```bash
+python3 research/cann_aicore_visibility.py                     # 主格:racy bg=8
+python3 research/cann_aicore_visibility.py --mode sync         # 负对照
+python3 research/cann_aicore_visibility.py --fence stream_sync # 栅栏格
+python3 research/cann_aicore_visibility.py --dispatch threaded # 跨线程格
+# 若全绿,加压配方:
+python3 research/cann_aicore_visibility.py --bg 16 --bg-elems 1048576 --steps 5000
+```

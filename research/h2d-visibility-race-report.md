@@ -247,8 +247,14 @@ Tensor.copy_(non_blocking=True)
 - 三问:①acl_rt.h 的"完成"语义是否蕴含对后续同流任务的可见性?②有没有
   正确的 async + 流序 + 可见性的写法(API/flag)?③若为 runtime 缺陷可否
   转交 CANN 团队?
+- **落仓决策依赖第七轮探针(§14 of offstream-copy-attribution.md)**:
+  `cann_aicore_visibility.py`(纯 CANN + aclnnAdd AI core 消费者)红 →
+  自包含 repro,落 **gitcode cann/runtime**(最近近亲 #873 亦在该仓,
+  重复检索见笔记 `notes/upstream/issue-duplicate-search-20260828.md`);
+  绿(加压后仍绿)→ 落回 Ascend/pytorch(torch_npu)。红绿两路都定仓。
 - 附件:`repro_h2d_order.py`(含 --copy-mode/--profile)、`cann_memcpy_order.py`
-  (direct/threaded)、`stream_audit.py`;fork research/v0.23.0 @ 339e44c4e。
+  (direct/threaded)、`cann_aicore_visibility.py`(纯 CANN AI core 消费者)、
+  `stream_audit.py`;fork research/v0.23.0(红/绿定仓后回填 commit)。
 
 ## 8. 工件索引
 
@@ -256,8 +262,10 @@ Tensor.copy_(non_blocking=True)
 |---|---|
 | torch_npu repro(三模式 + copy-mode + profile) | `research/repro_h2d_order.py` |
 | 纯 CANN 探针(direct/threaded,fence 矩阵) | `research/cann_memcpy_order.py` |
+| 纯 CANN AI core 消费者探针(aclnnAdd + mock 自测) | `research/cann_aicore_visibility.py`(+ `_mock.c`) |
 | msprof 审计(stream/TIMELINE/ORDER/ARRIVAL) | `research/stream_audit.py` |
 | 推理史/审计日志(13 轮原始记录) | `research/offstream-copy-attribution.md` |
 | 人话版 | `research/h2d-visibility-race-journey.md` |
 | issue 草稿(待重写) | 笔记仓库 `notes/upstream/ascend-pytorch-issue-off-stream-copy.md` |
+| 重复检索结论(2026-08-28,gitcode/Gitee/GitHub 全扫) | 笔记仓库 `notes/upstream/issue-duplicate-search-20260828.md` |
 | 上游 PR(fix) | vllm-ascend #14922 |
