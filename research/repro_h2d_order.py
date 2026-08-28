@@ -220,12 +220,18 @@ def run(args) -> int:
     def buf(n: int, fill: int = 0, dtype=torch.int32):
         return torch.full((n,), fill, dtype=dtype, pin_memory=pin)
 
-    # Two host slots, alternating per step: the host write of step N must not
-    # race the in-flight SDMA read of step N-1 (a host-side concern orthogonal
-    # to the device-side ordering under test - the original buffer is written
-    # every step too, so double-buffering only removes a confounder).
-    cpu_a = buf(args.payload)
-    cpu_b = buf(args.payload)
+    # v2 audit (2026-08-28): UNIQUE per-step host slots + stale/future split.
+    # The pure-CANN rounds proved the runtime stages ~2048 tasks in a FIFO
+    # submission ring, so the host can run 100-200+ steps ahead; the old
+    # two alternating slots were being OVERWRITTEN before late copies read
+    # them, delivering FUTURE values that the miss counter silently counted
+    # as hits. One slot row per step (written exactly once) kills that
+    # confounder; the new device-side `fut` counter (gpu[0] > counter)
+    # separates future reads (host-run-ahead / shared-buffer artifacts) from
+    # genuine stale reads (gpu[0] < counter, incl. the -1 sentinel esc) -
+    # only stale+esc constitute defect evidence. The DEVICE buffer stays
+    # shared on purpose: it mirrors the engine's shared backup buffer.
+    cpu_slots = torch.full((args.steps, args.payload), SENTINEL, dtype=torch.int32, pin_memory=pin)
     gpu = torch.full((args.payload,), SENTINEL, dtype=torch.int32, device=dev)
 
     # Background backlog: inert large copies queued ahead of the tested one.
@@ -235,6 +241,7 @@ def run(args) -> int:
     counter = torch.zeros((), dtype=torch.int32, device=dev)
     miss = torch.zeros((), dtype=torch.int64, device=dev)
     esc = torch.zeros((), dtype=torch.int64, device=dev)
+    fut = torch.zeros((), dtype=torch.int64, device=dev)
 
     copy_stream = torch.npu.Stream() if (args.mode == "event" and is_npu) else None
 
@@ -251,7 +258,7 @@ def run(args) -> int:
     ctx = make_profiler(args.profile) if profiling else contextlib.nullcontext()
     with ctx as prof_obj:
         for step in range(1, args.steps + 1):
-            slot = cpu_a if step % 2 == 1 else cpu_b
+            slot = cpu_slots[step - 1]  # this step's OWN row, written once below
             slot.fill_(step)  # host write: this step's "real token id"
 
             if bg_gpu is not None:
@@ -283,12 +290,15 @@ def run(args) -> int:
             counter += 1
             miss += (gpu[0] != counter).to(torch.int64)
             esc += (gpu[0] == SENTINEL).to(torch.int64)
+            fut += (gpu[0] > counter).to(torch.int64)
             if profiling:
                 prof_obj.step()
 
     wall = time.monotonic() - t0
     miss_n = int(miss)
     esc_n = int(esc)
+    fut_n = int(fut)
+    stale_n = max(miss_n - esc_n - fut_n, 0)
 
     bg_desc = f"{args.bg}x{args.bg_elems * 4 // 1024}KiB" if args.bg else "off"
     copy_desc = "torch" if acl_direct is None else "acl-direct(ctypes)"
@@ -297,26 +307,38 @@ def run(args) -> int:
         f"payload={args.payload * 4}B bg={bg_desc} wall={wall:.2f}s "
         f"({wall / args.steps * 1e6:.1f}us/step)"
     )
-    print(f"miss={miss_n} ({100.0 * miss_n / args.steps:.2f}% of steps) sentinel-escapes={esc_n}")
+    print(
+        f"miss={miss_n} ({100.0 * miss_n / args.steps:.2f}% of steps)"
+        f" | stale={stale_n} future={fut_n} sentinel-escapes={esc_n}"
+    )
+    print(
+        "note: only stale+esc are defect evidence; future = host-run-ahead"
+        " artifact (~2048-task submission ring) or shared-gpu-buffer overwrite"
+        " - see research/cann_aicore_visibility.py v3/v4 and attribution s14"
+    )
 
     if args.device == "cpu":
         expected_zero = True  # cpu copies are synchronous by construction
     else:
         expected_zero = args.mode == "fix"
     if expected_zero:
-        verdict = "PASS (ordered as expected)" if miss_n == 0 else "UNEXPECTED miss>0"
+        ok_clean = miss_n == 0
+        verdict = "PASS (ordered as expected)" if ok_clean else "UNEXPECTED miss>0"
     elif args.mode == "event":
         verdict = (
             "OFF-STREAM COPY CONFIRMED (fence cannot observe it; blocking is the only local sync)"
             if miss_n > 0
             else "stream sync covered the copy (contradicts the off-stream finding)"
         )
-    else:
+    elif stale_n > 0 or esc_n > 0:
+        verdict = "RACE REPRODUCED, stale-side (unordered copy observed: kernel read older data)"
+    elif fut_n > 0:
         verdict = (
-            "RACE REPRODUCED (unordered copy observed)"
-            if miss_n > 0
-            else "no race under these parameters - raise --bg/--steps/--bg-elems"
+            "FUTURE-only: host-run-ahead / shared-buffer artifact, NOT a stale-read verdict"
+            " (2048-task ring; see cann_aicore_visibility v3/v4)"
         )
+    else:
+        verdict = "no race under these parameters - raise --bg/--steps/--bg-elems"
     print(f"verdict: {verdict}")
 
     if profiling:

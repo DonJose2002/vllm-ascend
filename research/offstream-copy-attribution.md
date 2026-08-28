@@ -528,3 +528,28 @@ python3 research/cann_aicore_visibility.py --fence event_wait             # 设�
 python3 research/cann_aicore_visibility.py --bg 16 --bg-elems 1048576 --steps 5000  # 满环压力:stale>0 才是缺陷
 python3 research/cann_aicore_visibility.py --bg 16 --bg-elems 1048576 --steps 5000 --dispatch threaded
 ```
+
+### 第三轮服务器结果(2026-08-28 终):纯 CANN 直发全绿 → 归因层改判
+
+| 配置 | 结果 |
+|---|---|
+| racy bg=8 / bg=0 / event_wait | miss=0 全绿 |
+| **racy 满环压力 64MiB×5000(direct + threaded)** | **miss=0, stale=0 —— 决定性格绿** |
+| sync 负对照 | future=-227 红 = **控制组设计伪影**(见下) |
+
+**结论**:独占槽下,**纯 CANN(libascendcl async 拷贝 + libopapi 两段式算子,同流,单/跨线程)排序与可见性全部正确,零缺陷证据**。08-27 终判的归因层"CANN runtime/硬件 SDMA 写→AI core 读可见性缺口"**被推翻**——该缺口在纯 CANN 直发拓扑下不存在;缺陷必须依赖 torch_npu 层(其任务队列 consumer 拓扑/拷贝路径/pinned 管理)才暴露。engine 级证据(-1 哨兵逃逸+崩溃、#14922 fix 实效)不受影响,但机制归属回到 torch_npu 侧待裁。
+
+**sync 伪影机制**:阻塞拷贝绕过 ring 立即执行,host 领先 ~227 步(=2048/9,又一指纹命中)时,后续阻塞拷贝把**共享 dev_src** 覆盖成未来值,ring 里排队的 Add_k 晚读到——设备侧缓冲复用隐患(与 host 槽覆盖同类,CUDA 下同样属于用户责任)。
+
+**v4(同日)**:被测拷贝与消费者改**每步独占设备切片**(初始化 SENTINEL,单拷贝写、单 kernel 读)——跨步值流彻底归零:miss 只能以 esc(拷贝未落地/不可见)呈现,future 结构性不可能;负对照恢复必须绿。mock lag1 用例改 esc=50 断言;EXEC_DELAY 用例改"晚 kernel 必须仍然全绿"断言;selftest 7/7。
+
+**repro_h2d_order.py 审计补丁(v2,同日)**:①独占 host 槽(steps×payload,写一次);②device 侧 future 计数器(`fut += gpu[0] > counter`)+ 输出分解 stale/future/esc——**torch 侧 99.9%/47%/99.94% 的"窗口谱"数字在此次审计前全部冻结不可引用**(其 miss 从未分方向,双槽同款覆盖隐患;msprof 时间线"拷贝完成<kernel 启动+读错值"同样不区分 stale/future)。设备缓冲保持共享(镜像 engine 的共享 backup 缓冲,这是 bug 的原始形态)。
+
+**torch 层裁决格**(审计后重跑):
+```bash
+python3 research/repro_h2d_order.py --mode racy                      # TQ=1 默认:stale 还是 future 主导?
+python3 research/repro_h2d_order.py --mode racy --bg 0               # 平静对照
+python3 research/repro_h2d_order.py --mode racy --bg 16 --bg-elems 1048576 --steps 5000   # 满环压力
+TASK_QUEUE_ENABLE=0 python3 research/repro_h2d_order.py --mode racy --copy-mode acl-direct --bg 8   # 格4复刻
+```
+判读:**stale/esc 主导 = torch_npu 层缺陷实锤**(issue 落 Ascend/pytorch,机制=其提交拓扑);**future 主导 = repro 数字此前全是 host-run-ahead 伪影**,缺陷只剩 engine 级 -1 逃逸单点,issue 重写为窄口径。

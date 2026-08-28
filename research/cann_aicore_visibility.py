@@ -250,18 +250,20 @@ def run(args) -> int:
             what,
         )
 
-    # v3: UNIQUE per-step slots (the round-2 server lesson, 2026-08-28).
-    # v2 used two alternating slots; under the ~2048-task FIFO submission
-    # ring the host runs 100-200+ steps ahead (backpressured only when the
-    # ring fills), so a late-executing tested copy read an ALREADY-OVERWRITTEN
-    # slot and delivered a FUTURE value - parity fingerprint: every racy-mode
-    # dominant lag was even (= slot rewrite period 2), and 2048/tasks_per_step
-    # matched all five measured lags to +-1. One slot per step, written once:
-    # whatever a copy delivers is exactly its own step's value, regardless of
-    # when the ring gets around to executing it.
+    # v4: per-step UNIQUE device slices (round-3 lesson, 2026-08-28). v3 made
+    # host slots unique but kept ONE shared dev_src; that residual sharing is
+    # why the sync-mode control stayed red: a blocking copy bypasses the ring
+    # and executes immediately, so with the host ~227 steps ahead the later
+    # blocking copies OVERWROTE dev_src before the ring-queued Add_k of an
+    # earlier step ran (future reads, lag -227 = 2048/9 exactly). With one
+    # device slice per step - initialized to SENTINEL, written by exactly one
+    # copy, read by exactly one kernel - no cross-step value flow exists at
+    # all: a miss can only manifest as esc (copy not landed / not visible
+    # when its kernel ran) or garbage. future becomes structurally
+    # impossible; the negative control must be green again.
     slots_b = args.steps * payload_b
     pin = host_pin(slots_b)
-    dev_src = dev_buf(payload_b)
+    dev_slices = dev_buf(slots_b)
     dev_ones = dev_buf(payload_b)
     hist = dev_buf(args.steps * payload_b)
     keep_plain = None
@@ -278,12 +280,13 @@ def run(args) -> int:
         bg_dev = dev_buf(bg_b)
         ctypes.memset(bg_pin, 0, bg_b)
 
-    # init: ones = 1, dev_src = SENTINEL (a stale read of the very first step
-    # surfaces as out==0 - the sentinel-escape counter of the original bug)
+    # init: ones = 1; every device slice = SENTINEL (a copy that has not
+    # landed / not become visible when its kernel runs surfaces as out==0 -
+    # the sentinel-escape counter of the original bug)
     ones_host = (ctypes.c_int32 * args.payload)(*([1] * args.payload))
-    sent_host = (ctypes.c_int32 * args.payload)(*([SENTINEL] * args.payload))
+    sent_all = (ctypes.c_int32 * (args.steps * args.payload))(*([SENTINEL] * (args.steps * args.payload)))
     h2d_sync(dev_ones, ones_host, payload_b, "init ones aclrtMemcpy")
-    h2d_sync(dev_src, sent_host, payload_b, "init sentinel aclrtMemcpy")
+    h2d_sync(dev_slices, sent_all, slots_b, "init sentinel aclrtMemcpy")
 
     import queue as queue_mod
     import threading
@@ -348,9 +351,9 @@ def run(args) -> int:
                 submit(bg_dev, bg_pin, args.bg_elems * 4, "bg aclrtMemcpyAsync")
 
         if args.mode == "racy":
-            submit(dev_src, slot_ptr, payload_b, "test aclrtMemcpyAsync")
+            submit(dev_slices + (step - 1) * payload_b, slot_ptr, payload_b, "test aclrtMemcpyAsync")
         else:  # sync control: blocking aclrtMemcpy, no stream involved
-            h2d_sync(dev_src, slot_ptr, payload_b, "test aclrtMemcpy(sync)")
+            h2d_sync(dev_slices + (step - 1) * payload_b, slot_ptr, payload_b, "test aclrtMemcpy(sync)")
 
         # threaded: work_q.join() guarantees the aclrtMemcpyAsync CALLS have
         # returned in FIFO order before the kernel launch - the API-level
@@ -381,7 +384,7 @@ def run(args) -> int:
             acl.chk(acl.lib.aclrtStreamWaitEvent(stream, event), "aclrtStreamWaitEvent")
 
         # consumer: AI-core kernel on the same stream; verdict lands in hist
-        src_t = opapi.tensor(dev_src, args.payload)
+        src_t = opapi.tensor(dev_slices + (step - 1) * payload_b, args.payload)
         ones_t = opapi.tensor(dev_ones, args.payload)
         out_t = opapi.tensor(hist + (step - 1) * payload_b, args.payload)
         alpha_s = opapi.scalar(1)
@@ -450,7 +453,7 @@ def run(args) -> int:
         acl.lib.aclrtFreeHost(bg_pin)
     acl.lib.aclrtFree(hist)
     acl.lib.aclrtFree(dev_ones)
-    acl.lib.aclrtFree(dev_src)
+    acl.lib.aclrtFree(dev_slices)
     acl.lib.aclrtFreeHost(pin)
     acl.lib.aclrtDestroyEvent(event)
     acl.lib.aclrtDestroyStream(stream)
@@ -571,10 +574,10 @@ def selftest() -> int:
             ("miss=0", "PASS"),
         ),
         (
-            "lag-1 stale: racy miss=100%, esc=1, lag=1",
+            "lag-1 stale: racy esc=100% (copy never landed before kernel)",
             {"ACLMOCK_LANDING": "lag1"},
             ["--steps", "50"],
-            ("miss=50 (100.00%", "sentinel-escapes=1", "lag=1:49", "PURE-CANN AI-CORE REPRODUCTION"),
+            ("miss=50 (100.00%", "sentinel-escapes=50", "stale=0", "PURE-CANN AI-CORE REPRODUCTION"),
         ),
         (
             "lag-1 + stream_sync fence saves",
@@ -595,10 +598,10 @@ def selftest() -> int:
             ("miss=50", "STRONGEST"),
         ),
         (
-            "dispatch-lag model: future-only reads (never a visibility claim)",
+            "dispatch-lag with unique slices: late kernels must stay clean",
             {"ACLMOCK_LANDING": "immediate", "ACLMOCK_EXEC_DELAY": "1"},
             ["--steps", "50"],
-            ("miss=49", "future=49", "stale=0", "FUTURE-READ ANOMALY"),
+            ("miss=0", "NOT reproduced"),
         ),
     ]
     ok = True
