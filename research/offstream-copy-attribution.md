@@ -723,7 +723,7 @@ esc=[-1,-1]`。**唯一变量 = 拷贝源是私有快照页还是被逐步重写
 TIERS=16384 CONCS=1 NPUS=<id> bash research/run_baseline_npu.sh eagle3 8024
 cp experiments/out/serve-npu-bf16-eagle3-k5.log  experiments/out/serve-rund-fix-blocking.log
 cp experiments/out/baseline-npu-qwen3-8b-npu-bf16-eagle3-k5.json experiments/out/rund-fix-blocking.json
-grep -c "SD-staged-copy engaged" experiments/out/serve-rund-fix-blocking.log || true   # 预期 0
+grep -cF "[SD-staged-copy] engaged" experiments/out/serve-rund-fix-blocking.log || true   # 预期 0(实际日志行带右括号,须 -F 整串匹配)
 
 # 排水(脚本不杀 serve;共享服务器纪律,防双引擎重叠):
 pkill -TERM -f "vllm serve.*--port 8024"; sleep 30
@@ -734,7 +734,7 @@ VLLM_ASCEND_SD_REVIVE_RACE=1 VLLM_ASCEND_SD_STAGED_COPY=8 \
   TIERS=16384 CONCS=1 NPUS=<id> bash research/run_baseline_npu.sh eagle3 8025
 cp experiments/out/serve-npu-bf16-eagle3-k5.log  experiments/out/serve-rund-staged8.log
 cp experiments/out/baseline-npu-qwen3-8b-npu-bf16-eagle3-k5.json experiments/out/rund-staged8.json
-grep "SD-staged-copy engaged" experiments/out/serve-rund-staged8.log   # 预期 8 pages 行
+grep -F "[SD-staged-copy] engaged" experiments/out/serve-rund-staged8.log   # 预期 "8 private pinned pages" 行
 ```
 
 注意:两 run 的 TAG 同为 `npu-bf16-eagle3-k5`,serve log/JSON 会互相覆盖,
@@ -752,3 +752,24 @@ engaged 行 + 归档文件名区分。
 | 两 run accept 差 >0.1 | 数据可疑(机制上只差拷贝方式,不影响采样),复跑确认 |
 
 数据回传:两份 SUMMARY 块(含 ITL/accept/out-s)+ 两行 grep 结果即可。
+
+#### Run D 结果(2026-08-28 执行,@a357c7cc2):第一格命中,staged 优坐实
+
+| 格 | 配置 | ITL p50 | out/s | accept(C/B) | TTFT p50 | ok |
+|---|---|---|---|---|---|---|
+| D1 | 默认 blocking(NPU3,grep=0 自证默认路径) | 33.7ms | 66.13 | 2.4824 / 2.4734 | 209.3ms | 8/8 |
+| D2 | REVIVE+STAGED=8(NPU2,engaged 行在) | **25.7ms** | **84.29** | 2.4824 / 2.4645 | 195.9ms | 8/8 |
+
+- **判读 = 第一格**:差 8.0ms ≫ 2ms 阈值;out/s **+27.5%**;accept(counters)
+  逐位一致 2.4824(机制自洽:只差拷贝方式,不触采样)。
+- **卡间差异排除**:首对 D1/D3 落在不同卡(auto-pick 3 vs 2,用户漏带
+  NPUS 参数),用户同卡补测结果一致。
+- **跨日复现**:staged 三跑 25.8(B 轮 08-28 晨)/ 25.7(D2)高度稳定;
+  blocking 今日 33.7 vs 历史矩阵 ~31 同量级。**blocking 同步税 ≈8ms/步**,
+  与机制预言吻合(每步 aclrtSynchronizeStream 排空管线,run-ahead 流水
+  化被拆掉)。
+- **上游素材成立**:follow-up 方向 = 写入时轮转(省掉快照 memcpy)或
+  CpuGpuBuffer 层环(模式级修复覆盖所有调用点);N 安全界仍为开放问题
+  (N=8 三跑全绿为实证,生产建议大余量 N 或页复用前 event 守卫)。
+- 执行注记:手册原 grep 模式漏了 `]`(实际日志行 `[SD-staged-copy]
+  engaged: ...`),已改 `-F` 整串匹配。
