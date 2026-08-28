@@ -317,10 +317,14 @@ def run(args) -> int:
                 copy_stream.synchronize()
 
             # Consumer on the compute stream (zero host sync until the very end).
+            # `sample` snapshots gpu[0] ONCE (server lesson 2026-08-28: three
+            # separate gpu[0] reads let a copy land between them and produced
+            # inconsistent counters - miss=8 vs future=11 in one run).
             counter += 1
-            miss += (gpu[0] != counter).to(torch.int64)
-            esc += (gpu[0] == SENTINEL).to(torch.int64)
-            fut += (gpu[0] > counter).to(torch.int64)
+            sample = gpu[0].clone()
+            miss += (sample != counter).to(torch.int64)
+            esc += (sample == SENTINEL).to(torch.int64)
+            fut += (sample > counter).to(torch.int64)
             if profiling:
                 prof_obj.step()
 
@@ -355,11 +359,15 @@ def run(args) -> int:
         ok_clean = miss_n == 0
         verdict = "PASS (ordered as expected)" if ok_clean else "UNEXPECTED miss>0"
     elif args.mode == "event":
-        verdict = (
-            "OFF-STREAM COPY CONFIRMED (fence cannot observe it; blocking is the only local sync)"
-            if miss_n > 0
-            else "stream sync covered the copy (contradicts the off-stream finding)"
-        )
+        if stale_n > 0 or esc_n > 0:
+            verdict = "FENCE-BLIND (stale-side): fence completed yet the consumer read older data"
+        elif miss_n > 0:
+            verdict = (
+                "fence held; residual miss is future-direction (host-run-ahead artifact),"
+                " not a fence failure - see stale/future split"
+            )
+        else:
+            verdict = "stream sync covered the copy (clean)"
     elif stale_n > 0 or esc_n > 0:
         verdict = "RACE REPRODUCED, stale-side (unordered copy observed: kernel read older data)"
     elif fut_n > 0:

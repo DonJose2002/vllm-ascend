@@ -6,8 +6,10 @@
 > **探针槽覆盖伪影**(host 在 ~2048 任务 FIFO 提交环内领先 100-200+ 步,双槽
 > 被改写,晚拷贝送 future 值;同二进制 unique 槽 = 0%);②纯 CANN 探针
 > (libascendcl+libopapi,含满环压力,direct/threaded)**全绿** = 同流
-> 拷贝→kernel 排序与可见性在纯 CANN 层正确;③"栅栏盲/流外拷贝"叙事待
-> unique 槽复跑,大概率同为伪影。**仍然成立的只有 engine 级经验事实**:
+> 拷贝→kernel 排序与可见性在纯 CANN 层正确;③**"栅栏盲/流外拷贝"叙事亦已
+> 终审死亡**(event+unique 复跑 miss=0,stream 同步正常覆盖拷贝;旧 event
+> miss 在 alt2 槽下复现且全为 future 方向 = 启动瞬态伪影)。**仍然成立的
+> 只有 engine 级经验事实**:
 > eagle3 16K 无 fix 确定性崩溃、唯一逃逸值 -1(三计数器 Run 4)、fix 实效。
 > 缺陷机制重开(候选:host 单缓冲 pinned 改写 × 深环 / torch_npu 引擎态提交序 /
 > 图重放互作),现行有效推理史见 `offstream-copy-attribution.md` §14。

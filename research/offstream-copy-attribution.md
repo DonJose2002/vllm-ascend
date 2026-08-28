@@ -614,3 +614,21 @@ python3 research/repro_h2d_order.py --mode racy --slot-mode alt2 --bg 16 --bg-el
 
 - **#14922 机制叙事需更正评论**:已交维护者的回复(中/英)构建于被推翻的"流外拷贝/栅栏盲/可见性缺口"故事上;**fix 本身跨机制稳健,不受影响**,但机制段必须更正——诚实义务,尽快补评。
 - **外部 issue 计划冻结**:目前没有任何层被证明存在可外报缺陷;重复检索/两份 issue 草稿归档备用。~2048 环行为学(深度、背压、run-ahead 定量)可作独立的文档型贡献候选(低优先级)。
+
+### 第六轮(2026-08-28 收尾):栅栏叙事终审闭环 + 更正评论定稿
+
+验证三命令结果(M]:①`event + unique` = **miss=0/2000**(脚本自打 verdict:
+"stream sync covered the copy")——**"栅栏盲/流外拷贝"叙事终审死亡**,
+旧的 wall 时间推断(740us<996us ⇒ "没等")作废;②`event + alt2` =
+miss 0.4%,**全 future 方向**(启动瞬态 host 跑前,与同步行为无关);
+③`fix + alt2` = miss=0(fix 对 host 槽设计不敏感,跨机制稳健再证)。
+
+**顺带修复(探针卫生)**:该轮 event+alt2 出现 miss=8 < future=11 的
+计数矛盾——三个谓词各自重读 `gpu[0]`,拷贝在两次读之间落地即不一致;
+已改 `sample = gpu[0].clone()` 单次快照后再谓词;event 模式 verdict 分支
+同步改为按 stale/future 分向(旧分支 miss>0 即打 "OFF-STREAM COPY
+CONFIRMED",已失效)。CPU 自测 2 模式×2 槽 4/4 绿。
+
+**#14922 更正评论终稿**:`notes/upstream/pr-14922-mechanism-correction.md`
+(中英双版,撤回栅栏叙事/归因/六格证据,保留 engine 事实 + fix 跨机制稳健
+论证,含第 6 条栅栏复核实测),交用户粘贴。
