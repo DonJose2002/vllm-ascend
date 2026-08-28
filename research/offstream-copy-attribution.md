@@ -553,3 +553,25 @@ python3 research/repro_h2d_order.py --mode racy --bg 16 --bg-elems 1048576 --ste
 TASK_QUEUE_ENABLE=0 python3 research/repro_h2d_order.py --mode racy --copy-mode acl-direct --bg 8   # 格4复刻
 ```
 判读:**stale/esc 主导 = torch_npu 层缺陷实锤**(issue 落 Ascend/pytorch,机制=其提交拓扑);**future 主导 = repro 数字此前全是 host-run-ahead 伪影**,缺陷只剩 engine 级 -1 逃逸单点,issue 重写为窄口径。
+
+### 第四轮(2026-08-28 续):torch 审计首跑全绿 → 三读法与 alt2 阳性对照
+
+审计四格(TQ=1 默认 / bg=0 / 满环 64MiB×5000 / TQ=0+acl-direct)**全部 miss=0 stale=0 future=0 esc=0**(wall 320/302/2499/513us/步)。全绿有三种读法,未裁决前不得采信任何一种:
+
+- **A(槽覆盖伪影,模型预言)**:旧 miss 质量本就是"host 领先 ~204 步 + 双槽被覆盖 → future 计 miss",独占槽一改归零——纯 CANN 两轮的同款剧本。若 A 成立:**torch repro 层面竞态不存在**,缺陷收窄到 engine 级 -1 逃逸单点(旧 99.9%/47%/99.94% 全部作废)。
+- **B(补丁致哑,必须排除)**:`cpu_slots[step-1]` 是大 pinned 张量的**行视图**——若 torch_npu 视其为非 pinned,`copy_(non_blocking=True)` 静默退化阻塞拷贝,竞态被结构性消灭,全绿无意义。
+- **C(环境漂移,必须排除)**:当日日志出现 `LD_PRELOAD detected` 警告(此前未见记录);旧红可能根本不可复现。
+
+**判别设计(已实现)**:`--slot-mode alt2` = 原样复刻旧双槽交替(阳性对照,同二进制配对跑);启动时打印 `pinned_whole/pinned_row`(B 的直接观测)。判读矩阵:
+
+| alt2 bg=8 结果 | 定性 |
+|---|---|
+| ~99.9% 且 future 主导,unique 同参 0% | **A 实锤**:伪影机制成立 + async 路径完好 + 环境稳定,三读法一次全闭 |
+| 0% | B 或 C——先查 pinned_row 输出;仍绿则 git 回退旧版脚本复跑二分 |
+| unique 出现 esc/stale(任何格) | 真缺陷信号(意外,升格处理) |
+
+```bash
+python3 research/repro_h2d_order.py --mode racy --slot-mode alt2            # 阳性对照主格
+python3 research/repro_h2d_order.py --mode racy --slot-mode alt2 --bg 0     # 对照的平静格
+python3 research/repro_h2d_order.py --mode racy --slot-mode alt2 --bg 16 --bg-elems 1048576 --steps 5000  # 99.94% 锚点复刻
+```

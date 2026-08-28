@@ -231,8 +231,35 @@ def run(args) -> int:
     # genuine stale reads (gpu[0] < counter, incl. the -1 sentinel esc) -
     # only stale+esc constitute defect evidence. The DEVICE buffer stays
     # shared on purpose: it mirrors the engine's shared backup buffer.
-    cpu_slots = torch.full((args.steps, args.payload), SENTINEL, dtype=torch.int32, pin_memory=pin)
+    #
+    # --slot-mode alt2 is the POSITIVE CONTROL: the exact old double-buffer
+    # alternation (two small buffers, rewritten every 2 steps). Paired runs
+    # in one binary adjudicate the all-green ambiguity:
+    #   alt2 ~99.9% future-dominant + unique 0%  -> old miss mass was the
+    #     slot-overwrite artifact, async path intact, environment stable
+    #   alt2 also 0% -> either the environment drifted (LD_PRELOAD warning
+    #     today) or this patch silenced the repro - bisect via git checkout
+    #   unique shows esc/stale -> genuine defect signal (unexpected)
+    cpu_slots = None
+    cpu_a = cpu_b = None
+    if getattr(args, "slot_mode", "unique") == "alt2":
+        cpu_a = buf(args.payload)
+        cpu_b = buf(args.payload)
+    else:
+        cpu_slots = torch.full((args.steps, args.payload), SENTINEL, dtype=torch.int32, pin_memory=pin)
     gpu = torch.full((args.payload,), SENTINEL, dtype=torch.int32, device=dev)
+
+    # pinned-ness guard (the silencing risk): if the row views of the big
+    # pinned tensor are not treated as pinned, copy_(non_blocking=True)
+    # silently degrades toward synchronous behavior and any all-green is
+    # meaningless. Print, don't assert - a loud record beats a crash.
+    if is_npu:
+        try:
+            whole = bool(cpu_slots.is_pinned()) if cpu_slots is not None else bool(cpu_a.is_pinned())
+            row = bool(cpu_slots[0].is_pinned()) if cpu_slots is not None else whole
+            print(f"slots: slot_mode={args.slot_mode} pinned_whole={whole} pinned_row={row}")
+        except Exception as e:  # noqa: BLE001 - diagnostic only
+            print(f"slots: pinned check unavailable ({e})")
 
     # Background backlog: inert large copies queued ahead of the tested one.
     bg_cpu = buf(args.bg_elems) if args.bg > 0 else None
@@ -258,7 +285,10 @@ def run(args) -> int:
     ctx = make_profiler(args.profile) if profiling else contextlib.nullcontext()
     with ctx as prof_obj:
         for step in range(1, args.steps + 1):
-            slot = cpu_slots[step - 1]  # this step's OWN row, written once below
+            if cpu_slots is not None:
+                slot = cpu_slots[step - 1]  # this step's OWN row, written once below
+            else:  # alt2 positive control: the exact old alternation
+                slot = cpu_a if step % 2 == 1 else cpu_b
             slot.fill_(step)  # host write: this step's "real token id"
 
             if bg_gpu is not None:
@@ -355,15 +385,24 @@ def run(args) -> int:
 
 
 def selftest() -> int:
-    """Logic check on cpu: both modes must run clean and report zero misses."""
+    """Logic check on cpu: both modes and both slot designs must run clean."""
     ok = True
     for mode in ("racy", "fix"):
-        args = argparse.Namespace(
-            device="cpu", mode=mode, steps=500, payload=16, bg=2, bg_elems=1024, profile=None, copy_mode="torch"
-        )
-        print(f"--- selftest {mode} ---")
-        if run(args) != 0:
-            ok = False
+        for slot_mode in ("unique", "alt2"):
+            args = argparse.Namespace(
+                device="cpu",
+                mode=mode,
+                steps=500,
+                payload=16,
+                bg=2,
+                bg_elems=1024,
+                profile=None,
+                copy_mode="torch",
+                slot_mode=slot_mode,
+            )
+            print(f"--- selftest {mode} slot={slot_mode} ---")
+            if run(args) != 0:
+                ok = False
     print("SELFTEST " + ("PASS" if ok else "FAIL"))
     return 0 if ok else 1
 
@@ -391,6 +430,14 @@ def main() -> int:
         help="tested copy channel: torch = Tensor.copy_ (host task queue); acl-direct = ctypes"
         " aclrtMemcpyAsync from the main thread on the current torch.npu stream; acl-direct-query"
         " additionally mirrors torch copy_'s aclrtPointerGetAttributes epilogue (barrier test)",
+    )
+    ap.add_argument(
+        "--slot-mode",
+        choices=["unique", "alt2"],
+        default="unique",
+        help="host slot design: unique = one pinned row per step, written once (artifact-free);"
+        " alt2 = the exact old two-buffer alternation (POSITIVE CONTROL for the slot-overwrite"
+        " artifact - expect future-dominant miss under backlog if the async path is intact)",
     )
     args = ap.parse_args()
     if args.device == "cpu" and args.mode == "event":
