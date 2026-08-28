@@ -575,3 +575,42 @@ python3 research/repro_h2d_order.py --mode racy --slot-mode alt2            # �
 python3 research/repro_h2d_order.py --mode racy --slot-mode alt2 --bg 0     # 对照的平静格
 python3 research/repro_h2d_order.py --mode racy --slot-mode alt2 --bg 16 --bg-elems 1048576 --steps 5000  # 99.94% 锚点复刻
 ```
+
+### 第五轮(2026-08-28 终审):alt2 阳性对照闭案 → 证据体系重写
+
+| 结果 | 判读 |
+|---|---|
+| alt2 bg=8:**99.85%,future=1997** | 与旧 99.9% 精确复现,全 future |
+| alt2 满环:**99.94%,future=4997** | 与旧 99.94% 逐位复现,全 future |
+| alt2 bg=0:0.35% future | 旧 0.70% 同量级(启动瞬态:host 领先的头几步) |
+| `pinned_whole=True pinned_row=True` | 读法 B(行视图失 pinned→copy_ 静默阻塞)死亡 |
+| 同二进制/同环境复现旧红 | 读法 C(环境漂移)死亡 |
+
+**读法 A 定谳:repro 全部 miss 质量 = 槽覆盖伪影**(host 领先 + 双槽改写 → 晚拷贝送 future 值)。同二进制配对(unique 0% vs alt2 99.9%)= 单变量闭案。
+
+#### 证据清单重审(2026-08-28 终)
+
+**死亡(勿再引用)**:
+- repro 的六格"窗口谱"(0.7%/1.5%/99.9%/99.94%/47%……)——全部 future 伪影;
+- **msprof 时间线证据(§3.3"拷贝 task_stop < kernel start 仍读旧值")**——该 run 的 miss 本身是伪影:拷贝确实先完成(送的是被覆盖槽的未来值),时间线自洽于伪影机制,与可见性缺口无关;
+- **栅栏阶梯"sync 不等拷贝"(wall 740us<996us 推断)**——wall 比较是弱推断(64B 拷贝等待本可微秒级);且 event 格旧 miss 同为伪影候选,待 unique 槽复跑裁决;
+- 08-27 报告 §4 终判归因层("CANN runtime SDMA 写→AI core 读可见性缺口")——纯 CANN v3/v4 全绿已推翻;
+- "torch_npu 拓扑放大窗口"叙事——repro 层两种 manifestation 均为伪影。
+
+**存活(engine 级经验事实)**:
+- eagle3 16K 无 fix 确定性崩溃 / fix 后 9/9 全绿(多轮);
+- 三计数器 Run 4:esc=[-1,-1],c3=1/843(唯一逃逸值 = -1,device 侧计数,零 host 同步);
+- 算术线索:c1=837 ≈ 门关步 836 + **1**——**逃逸步的拷贝位置(c1 检查点)就已经是 -1**,即 -1 在"拷贝之后第一个 kernel"处已然可见,不是 where 与 c1 之间才出现。
+
+#### 引擎缺陷机制:剩余假设空间(重开)
+
+- **(b) host 侧 pinned 单缓冲改写 × 深环**:engine 的 backup.cpu 是**单缓冲每步改写**(比 repro 的双槽更激进);host 领先时,在途拷贝晚执行会读到**后续门关步写入的 -1**→拷贝亲自把 -1 送上设备→where 消费→逃逸。与 c1=836+1 算术吻合(c1 位置已是 -1 = 拷贝送来的或未落地)。CUDA 不崩的解释:同构 hazard 但 host 实际跑前量被逐步 D2H 依赖(采样结果)压住+队列语义差异 → 窗口不落于 -1 内容上。**若 (b) 成立:这是 upstream CpuGpuBuffer 使用模式在深提交队列下的固有风险,#14922 的 blocking fix 恰好对症(同步拷贝 = 内容被即时捕获,host 改写不再影响在途拷贝)——fix 跨机制稳健。**
+- **(a) torch_npu TQ=1 提交序破坏**(拷贝与算子在真实引擎 op 混合/图重放下环序被破)——与纯 CANN FIFO 有序矛盾,需引擎级证据才可主张;
+- **(c) 引擎特有**(ACL graph 重放与逐 token 拷贝互作)。
+
+**判别实验(engine 级,下一步)**:env 门控给 backup.cpu 做逐步双缓冲(改写隔步)——崩溃消失 = (b) 定谳;仍崩 = (a)/(c)。另:fence ladder 用 `--slot-mode unique` 复跑 event 格 2 条(裁决"栅栏盲"叙事死活)。
+
+#### 连带行动
+
+- **#14922 机制叙事需更正评论**:已交维护者的回复(中/英)构建于被推翻的"流外拷贝/栅栏盲/可见性缺口"故事上;**fix 本身跨机制稳健,不受影响**,但机制段必须更正——诚实义务,尽快补评。
+- **外部 issue 计划冻结**:目前没有任何层被证明存在可外报缺陷;重复检索/两份 issue 草稿归档备用。~2048 环行为学(深度、背压、run-ahead 定量)可作独立的文档型贡献候选(低优先级)。
