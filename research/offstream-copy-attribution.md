@@ -694,3 +694,61 @@ esc=[-1,-1]`。**唯一变量 = 拷贝源是私有快照页还是被逐步重写
 
 **案件状态:CLOSED**(08-24 崩溃 → 08-25 修复+三计数器 → 08-26/27 平台层
 调查(两次定性被推翻)→ 08-28 六轮审计翻案 + 引擎机制判别定谳)。
+
+### Run D(2026-08-28 设计,待执行):staged vs blocking 同日对照
+
+目的:B 轮 staged ITL 25.8ms vs blocking 历史 ~31ms 是**跨日数据**(已知
+跨日漂移 ~2ms 量级,T1 教训);同日同卡背靠背各跑一条,坐实或否掉
+"staged 保住异步管线、优于 blocking"这一上游优化素材。
+
+#### 安全锚点(最小修复回退记录,先读后跑)
+
+- **默认路径 = 最小修复,无需任何操作即处于修复态**:`llm_base_proposer.py`
+  的 `prepare_next_token_ids_padded` 拷贝点,不带 env 时走
+  `non_blocking=False` blocking 拷贝(commit `62533dafa`,2026-08-24;
+  9/9 全量矩阵 + 其后全部运行验证)。
+- **staged 只在双 env 下激活**:`VLLM_ASCEND_SD_REVIVE_RACE=1` 且
+  `VLLM_ASCEND_SD_STAGED_COPY>=2`,二者缺一即回落默认 blocking。默认字节
+  不因本实验改变——**回退 = 不带 env 重启 serve,无代码回滚、无分支切换**。
+- **Phase 2 及后续研究基线一律不带这两个 env** = 确切可运行版本。
+- serve log 自证路径:`[SD-staged-copy] engaged` 行存在 = staged;不存在
+  且无 `[SD-counters]` 行 = 默认 blocking。
+- commit 锚点:本手册落盘 commit(research/v0.23.0,已推 myfork);staged
+  实现 = `55ae3ba57`,判别数据 = `4bac35396` §14 第八轮。
+
+#### 命令(容器内,同卡同日背靠背;D1 先跑——缺的数据点优先)
+
+```bash
+# D1: 默认 blocking fix(不带任何研究 env)= 安全锚点本尊
+TIERS=16384 CONCS=1 NPUS=<id> bash research/run_baseline_npu.sh eagle3 8024
+cp experiments/out/serve-npu-bf16-eagle3-k5.log  experiments/out/serve-rund-fix-blocking.log
+cp experiments/out/baseline-npu-qwen3-8b-npu-bf16-eagle3-k5.json experiments/out/rund-fix-blocking.json
+grep -c "SD-staged-copy engaged" experiments/out/serve-rund-fix-blocking.log || true   # 预期 0
+
+# 排水(脚本不杀 serve;共享服务器纪律,防双引擎重叠):
+pkill -TERM -f "vllm serve.*--port 8024"; sleep 30
+# 确认钉卡 HBM 回落(npu-smi info,空闲底噪 ~3.4GB)再跑 D2
+
+# D2: staged(与 B 轮同配置,作同日第二锚点)
+VLLM_ASCEND_SD_REVIVE_RACE=1 VLLM_ASCEND_SD_STAGED_COPY=8 \
+  TIERS=16384 CONCS=1 NPUS=<id> bash research/run_baseline_npu.sh eagle3 8025
+cp experiments/out/serve-npu-bf16-eagle3-k5.log  experiments/out/serve-rund-staged8.log
+cp experiments/out/baseline-npu-qwen3-8b-npu-bf16-eagle3-k5.json experiments/out/rund-staged8.json
+grep "SD-staged-copy engaged" experiments/out/serve-rund-staged8.log   # 预期 8 pages 行
+```
+
+注意:两 run 的 TAG 同为 `npu-bf16-eagle3-k5`,serve log/JSON 会互相覆盖,
+**copy-aside 是强制步骤**(命令已含);SUMMARY 不记录研究 env,靠
+engaged 行 + 归档文件名区分。
+
+#### 判读矩阵
+
+| 结果 | 定性与行动 |
+|---|---|
+| D2 绿且 ITL(D2) < ITL(D1) − 2ms | staged 优坐实(差值跨过日漂移量级)→ 上游优化素材成立:follow-up PR/评论提案(生产形态=写入时轮转或 CpuGpuBuffer 环,见 §14 第八轮) |
+| D2 绿且差 <2ms | blocking 已够,staged 降级为"可选",不推进;B 轮 25.8 记为日间漂移 |
+| D2 崩 | staged N=8 生产化不安全(拷贝在途寿命可超 8 步)→ 可选加深 `STAGED_COPY=64` 复跑一次再判;仍崩则 staged 出局,上游素材只保留 blocking fix。**对研究主线零影响** |
+| D1 崩 | 重大异常(默认修复路径理论不可崩,9/9 验证过)→ 立即停,贴 serve log tail;排查方向=环境漂移/条件变化,而非代码 |
+| 两 run accept 差 >0.1 | 数据可疑(机制上只差拷贝方式,不影响采样),复跑确认 |
+
+数据回传:两份 SUMMARY 块(含 ITL/accept/out-s)+ 两行 grep 结果即可。
