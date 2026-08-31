@@ -842,3 +842,32 @@ VLLM_ASCEND_SD_REVIVE_RACE=1 VLLM_ASCEND_SD_EVENT_COPY=1 VLLM_ASCEND_SD_COUNTERS
 期望(维护者意向偏保守);三修法对比数据服务自用研究线——为 Phase 2+
 的引擎改造(staged 或事件协议择优)提供选型依据。默认路径恒为 blocking
 最小修复(安全锚点不变),实验路径全部 env 门控。
+
+#### Run E 结果(2026-08-31 执行,@7d2c5486b,NPU2 同日四跑):E2≈E3 → 事件协议定为自用线选定形态
+
+| 臂 | 配置 | ITL p50 | out/s | accept(C) | ok | 自证 |
+|---|---|---|---|---|---|---|
+| E1 | blocking 默认 | 33.4ms | 66.18 | 2.4824 | 8/8 | engaged 行 = 0 |
+| E2 | REVIVE+EVENT | **25.9ms** | **83.62** | 2.4824 | 8/8 | `[SD-event-copy] engaged` 行在 |
+| E3 | REVIVE+STAGED=8 | 25.8ms | 83.87 | 2.4824 | 8/8 | 跨日三跑 25.8/25.7/25.8 复现 |
+| E2' | E2+COUNTERS | 25.8ms | 83.68 | 2.4824 | 8/8 | `steps=847 c1=840 c2=7 c3=0 c1x=0 esc=none` |
+
+- **判读 = 判读矩阵末行命中**:ITL(E2)≈ITL(E3)(差 0.1ms,噪声级)
+  → **事件协议 = staged 的等价形态且更简**(无 N 安全界、无页环管理、
+  upstream `synchronize_input_prep` 同源习语)——**自用线选定形态**,
+  Phase 2+ 引擎改造采用此修法(判定记录)。
+- **正确性定谳**:E2' 计数器与 staged 时代(Run C,08-28)逐位一致
+  (steps=847/c1=840/c2=7/c3=0/esc=none;门开 7 次与页/事件设计无关,
+  逃逸归零)——事件栅栏在引擎级完整阻断 -1 逃逸;counters 臂 ITL
+  不受扰动(25.8ms,插桩纪律保持)。
+- **blocking 同步税机理修正(重要)**:E2 每步同样要等"上一步拷贝
+  落地"(entry `event.synchronize()`),ITL 却与零等待的 staged 打平
+  → **run D 的 ~8ms 税不是"等拷贝"的代价,而是 torch_npu blocking
+  拷贝路径自身的开销**(aclrtSynchronizeStream 全排空 + 同步 memcpy
+  慢路径)。host 在 propose 点本就不跑前(被步内结构天然压住),等
+  一个"步内早已落地"的事件 ≈ 免费;blocking 贵在路径,不在等待。
+- 执行注记:08-31 执行(设计 08-28);E1→E2 间 30s 排水不足触发一次
+  PREFLIGHT-FAIL(E1 引擎 HBM 22GB 未排空),等待后重试通过——共享
+  服务器排水间隔应 ≥60s 或轮询 npu-smi 确认回落。
+- **默认路径未动**:blocking 仍为默认(安全锚点);事件协议转正
+  (改默认)是独立决策,留待 Phase 2 引擎改造时一并执行。
