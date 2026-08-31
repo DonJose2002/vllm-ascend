@@ -1,25 +1,35 @@
 #!/usr/bin/env python3
-"""Standalone repro: non_blocking H2D copy vs consumer-kernel ordering on NPU.
+"""Standalone demo of the use-after-rewrite hazard behind PR #14922: a late
+async H2D copy reads its pinned source AT EXECUTION TIME on NPU.
 
-Extracted from vllm-ascend PR #14922 (eagle H2D race), with zero vllm
-dependencies: one pinned CPU buffer, one NPU buffer, one copy under test per
-step, one consumer comparison on the compute stream, and DEVICE-SIDE counters
-only - a single host read at the end (same zero-sync protocol as the original
-three-counter experiment, so the instrumentation cannot hide the race).
+Extracted from the PR's investigation, with zero vllm dependencies: pinned
+CPU slot(s), one NPU buffer, one copy under test per step, one consumer
+comparison on the compute stream, and DEVICE-SIDE counters only - a single
+host read at the end (same zero-sync protocol as the original three-counter
+experiment, so the instrumentation cannot hide the race).
+
+Terminal mechanism (adjudicated on the engine 2026-08-28; see the correction
+comment on PR #14922): the engine rewrites a SINGLE pinned host page every
+step (gate-closed steps hold the -1 "no token yet" sentinel) while its tiny
+non_blocking H2D copy sits in a ~2048-task-deep FIFO submission ring.
+Execution order copy->consumer is PRESERVED; what breaks is the VALUE: the
+late-executing copy reads the source as rewritten by a LATER step and
+delivers it faithfully - at a request boundary that future value is -1, and
+where/gather(-1) faults the vector core. The PR fix (blocking copy)
+snapshots the page content synchronously. This script reproduces the HAZARD
+PATTERN standalone, not the crash: counters observe delivered values instead
+of crashing into a vocab gather.
 
 Per-step timeline (racy mode), mirroring prepare_next_token_ids_padded:
 
-    host   : cpu_slot <- step_id                (new value; host write)
+    host   : slot <- step_id                    (the "token id" write)
     [bg]   : K large non_blocking H2D copies    (SDMA backlog amplification)
-    under  : gpu <- cpu_slot, non_blocking=True (the copy in question)
+    under  : gpu <- slot, non_blocking=True     (the copy under test)
     stream : counter += 1                       (consumer-side step tick)
-             miss += (gpu[0] != counter)        (reads whatever has landed)
-             esc  += (gpu[0] == SENTINEL)       (stale -1 sentinel escape)
-
-If the copy is not ordered before the consumer kernel, the comparison reads
-the PREVIOUS landed value: miss counts exactly the steps whose copy had not
-landed yet; esc counts reads of the initial -1 sentinel (the exact value that
-escaped into the vocab gather in the original crash).
+             miss += (gpu[0] != counter)        (delivered-value check)
+             fut  += (gpu[0] >  counter)        (future = host-rewritten
+             esc  += (gpu[0] == SENTINEL)        source delivered late /
+                                                  initial fill never covered)
 
 Amplification rationale: in the real engine the race window is created by the
 deep SDMA backlog of a chunked-prefill boundary step (16K = 8 chunks of
@@ -35,37 +45,45 @@ Faithfulness map (repro element <-> original prepare_next_token_ids_padded):
   gpu.copy_(slot, nb=True)  backup_next_token_ids.gpu.copy_(cpu, nb=True)
                             - literally the same call, same payload scale
   counter+=1; miss+=(...)   torch.where consuming backup.gpu: same position
-                            (first compute-stream op after the copy), same
-                            stream, same kind of buffer read -> identical
-                            sensitivity to "has the copy landed". The read
-                            value is compared against the stream-side counter
-                            (expected value generated ON the compute stream -
-                            host-side expectations would need their own H2D
-                            and pollute the timeline); miss = read of a stale
-                            previous value, esc = read of the initial -1
-                            sentinel = the original escape event, counted
-                            instead of crashed into gather(-1).
-  --bg / double-buffered    environment reconstruction only: SDMA backlog
-  slots                     (the 16K-always condition) / removal of the
-                            orthogonal host-write-vs-inflight-read confounder.
+                             (first compute-stream op after the copy), same
+                             stream, same kind of buffer read -> identical
+                             exposure to the DELIVERED VALUE. The read value
+                             is compared against the stream-side counter
+                             (expected value generated ON the compute stream -
+                             host-side expectations would need their own H2D
+                             and pollute the timeline). future-dominant miss
+                             under a REWRITTEN source (alt2) = the script
+                             analogue of the engine escape; stale-side miss
+                             and esc would be genuine ordering-failure
+                             evidence (never observed at terminal audit).
+  --slot-mode unique        per-step private page = the "staged" fix shape:
+                             source stable while in flight -> clean
+  --slot-mode alt2          the original two-buffer alternation = the
+                             single-page rewrite behaviour = positive control
 
-Modes:
-  racy   copy_(non_blocking=True)   expected miss>0; rate grows with --bg
-                                    (0.7% calm -> ~100% under backlog, server
-                                    measured) mirroring the engine-side
-                                    4K-occasional / 16K-deterministic split
-  fix    copy_(non_blocking=False)  expected miss==0 (the PR fix) - the ONLY
-                                    local synchronization that works
-  event  copy on a side stream +    expected miss>0: server-measured fence
-         stream.synchronize()       ladder - wait_event, host-waited recorded
-                                    event, and whole-stream synchronize ALL
-                                    miss with wall-times proving no wait
-                                    happened: the copy is OFF-STREAM (an
-                                    internal SDMA channel invisible to the
-                                    stream/event apparatus on this stack)
+Modes (expectations depend on --slot-mode):
+  racy   copy_(non_blocking=True)   unique: miss==0 (source stable, async
+                                    path intact). alt2 + --bg 8: ~99.9%
+                                    future-dominant miss - the
+                                    use-after-rewrite pattern, mirroring the
+                                    engine-side 4K-occasional / 16K-
+                                    deterministic split via backlog depth.
+  fix    copy_(non_blocking=False)  miss==0 on BOTH slot designs (the PR fix:
+                                    the synchronous copy snapshots the source
+                                    content, so later host rewrites cannot
+                                    poison the transfer)
+  event  copy on a side stream +    fence re-check: unique -> clean (the sync
+         copy_stream.synchronize()  covers the copy properly); alt2 ->
+                                    residual future-direction miss only
+                                    (startup host-run-ahead, NOT a fence
+                                    failure). The earlier "fences are blind /
+                                    copy is off-stream" readings from this
+                                    mode were artifacts of the old slot
+                                    design - retracted in the PR correction.
 
-A miss==0 under racy does NOT invalidate the bug (see PR evidence); it means
-these parameters did not open the window - raise --bg / --steps / --bg-elems.
+Under alt2, a miss==0 means the parameters did not open the window -
+raise --bg / --steps / --bg-elems. Under unique, miss==0 is the expected
+clean result.
 
 NPU-API provenance (everything NPU-specific mirrors vllm-ascend production
 usage, so no untested API shapes on the hot path): pinned allocation via the
@@ -78,28 +96,29 @@ no NPU-specific API at all beyond the pinned ctor. Locally verified on cpu
 IS the measurement.
 
 Usage (server, inside the v0.23.0 container, no serve needed):
-  python3 research/repro_h2d_order.py --mode racy
-  python3 research/repro_h2d_order.py --mode fix
+  # the use-after-rewrite pattern (expect ~99.9% future-dominant miss):
+  python3 research/repro_h2d_order.py --mode racy --slot-mode alt2 --bg 8
+  # stable source -> expect clean (the staged-page principle):
+  python3 research/repro_h2d_order.py --mode racy --slot-mode unique --bg 8
+  # the PR fix shape -> expect clean on both slot designs:
+  python3 research/repro_h2d_order.py --mode fix --slot-mode alt2
   python3 research/repro_h2d_order.py --mode racy --bg 0      # calm control
   python3 research/repro_h2d_order.py --device cpu --mode racy # logic selftest
+  python3 research/repro_h2d_order.py --selftest               # all 4 combos, cpu
   python3 research/repro_h2d_order.py --mode racy --steps 50 \
       --profile /tmp/reprof        # torch_npu profiler (msprof Text export),
                                    # then auto-audits memcpy vs compute stream
                                    # ownership via research/stream_audit.py
 
-  # attribution rounds (2026-08-27): decouple the tested copy's submission
-  # channel from the consumer kernels' channel. --copy-mode acl-direct issues
-  # the tested copy via ctypes -> libascendcl aclrtMemcpyAsync from the MAIN
-  # thread (bypassing torch_npu's host task queue entirely); the bg copies and
-  # the consumer kernels keep their usual channels. Combined with the
-  # TASK_QUEUE_ENABLE env this fills the missing cell of the channel matrix:
+  # Legacy investigation harness (2026-08-27 attribution rounds, kept for
+  # reproducibility only - their interpretations were superseded by the
+  # 08-28 terminal audit; full trail in research/offstream-copy-attribution.md
+  # in the fork's research branch). --copy-mode acl-direct issues the tested
+  # copy via ctypes -> libascendcl aclrtMemcpyAsync from the MAIN thread
+  # (bypassing torch_npu's host task queue); combined with TASK_QUEUE_ENABLE
+  # env it fills the channel matrix used during that investigation:
     TASK_QUEUE_ENABLE=1 python3 research/repro_h2d_order.py --mode racy \
         --copy-mode acl-direct --bg 8
-    # copy=main-thread-direct, kernels=queue-consumer-thread
-    #   miss>0 -> mixed-thread submission to one stream is the trigger
-    #             (pure-CANN single-thread FIFO was clean)
-    #   miss=0 -> the copy must go through torch_npu's queue to misbehave;
-    #             the queue's memcpy submission itself is implicated
 """
 
 from __future__ import annotations
@@ -151,11 +170,13 @@ def acl_direct_copy_factory(is_npu: bool, with_query: bool = False):
 
     with_query=True additionally mirrors torch_npu's copy_ epilogue: right
     after the memcpy, process_non_blocking_copy calls aclrtPointerGetAttributes
-    on the host pointer (CachingHostAllocator.cpp:1356) before returning. If
-    that incidental runtime call acts as an implicit flush/barrier, adding it
-    here should drop the miss rate back to torch copy_'s level - pinning the
-    true self-healing mechanism of the torch path (record_event itself is
-    pure bookkeeping, CachingHostAllocator.cpp:689-719)."""
+    on the host pointer (CachingHostAllocator.cpp:1356) before returning.
+    Tested 2026-08-27 as a barrier hypothesis (does this incidental runtime
+    call flush the submission queue?): NO barrier effect - miss stayed at
+    the no-query level under the then-used slot design; the torch path's
+    cleanliness was later explained by slot stability, not by any epilogue
+    call (record_event itself is pure bookkeeping,
+    CachingHostAllocator.cpp:689-719)."""
     if not is_npu:
         return None
     try:
@@ -305,15 +326,17 @@ def run(args) -> int:
             else:  # event: fence the async copy on a side stream, host-side wait
                 with torch.npu.stream(copy_stream):
                     gpu.copy_(slot, non_blocking=True)
-                # Fences tried in the order the server evidence forced:
-                #   a) current_stream().wait_event(fence) -> MISSES (08-26 run)
-                #   b) fence.record(copy_stream) + fence.synchronize() -> MISSES
-                #      (08-27 run): wall-time shows the wait returned immediately
-                #      - the event never observed the copy at all
-                #   c) copy_stream.synchronize() (the in-tree production
-                #      workaround, cpu_offload_connector.py:318 + its TODO) ->
-                #      drains the WHOLE stream, so it distinguishes "event
-                #      mechanism broken" from "copy not on the stream at all".
+                # Fence re-check (terminal audit 2026-08-28): with unique
+                # slots this mode is CLEAN - miss=0/2000 measured; the sync
+                # covers the copy properly. The historical "fences are
+                # blind / the event never observed the copy" misses were
+                # artifacts of the old alternating slot design
+                # (future-direction reads), retracted in the PR correction.
+                # copy_stream.synchronize() is kept as the fence because it
+                # mirrors the in-tree production workaround
+                # (cpu_offload_connector.py:318 + its TODO); wait_event and
+                # recorded-event variants were tried during the investigation
+                # and are documented in the attribution doc.
                 copy_stream.synchronize()
 
             # Consumer on the compute stream (zero host sync until the very end).
@@ -346,18 +369,21 @@ def run(args) -> int:
         f" | stale={stale_n} future={fut_n} sentinel-escapes={esc_n}"
     )
     print(
-        "note: only stale+esc are defect evidence; future = host-run-ahead"
-        " artifact (~2048-task submission ring) or shared-gpu-buffer overwrite"
-        " - see research/cann_aicore_visibility.py v3/v4 and attribution s14"
+        "note: only stale+esc are defect evidence (ordering failure - never"
+        " observed); future = a late copy delivered a host-rewritten source"
+        " value (the use-after-rewrite pattern this demo showcases)"
     )
 
     if args.device == "cpu":
         expected_zero = True  # cpu copies are synchronous by construction
     else:
-        expected_zero = args.mode == "fix"
+        # unique slots keep the source stable while the copy is in flight,
+        # so racy/event are expected CLEAN too (async path intact); only
+        # alt2 (rewritten source) expects the future-dominant demo miss.
+        expected_zero = args.mode == "fix" or getattr(args, "slot_mode", "unique") == "unique"
     if expected_zero:
         ok_clean = miss_n == 0
-        verdict = "PASS (ordered as expected)" if ok_clean else "UNEXPECTED miss>0"
+        verdict = "PASS (clean as expected)" if ok_clean else "UNEXPECTED miss>0"
     elif args.mode == "event":
         if stale_n > 0 or esc_n > 0:
             verdict = "FENCE-BLIND (stale-side): fence completed yet the consumer read older data"
@@ -372,8 +398,9 @@ def run(args) -> int:
         verdict = "RACE REPRODUCED, stale-side (unordered copy observed: kernel read older data)"
     elif fut_n > 0:
         verdict = (
-            "FUTURE-only: host-run-ahead / shared-buffer artifact, NOT a stale-read verdict"
-            " (2048-task ring; see cann_aicore_visibility v3/v4)"
+            "FUTURE-only: use-after-rewrite pattern - a late async copy"
+            " delivered a host-rewritten source value; NOT a stale-read"
+            " (ordering-failure) verdict"
         )
     else:
         verdict = "no race under these parameters - raise --bg/--steps/--bg-elems"
@@ -447,7 +474,14 @@ def main() -> int:
         " alt2 = the exact old two-buffer alternation (POSITIVE CONTROL for the slot-overwrite"
         " artifact - expect future-dominant miss under backlog if the async path is intact)",
     )
+    ap.add_argument(
+        "--selftest",
+        action="store_true",
+        help="cpu logic check: both modes x both slot designs, must run clean",
+    )
     args = ap.parse_args()
+    if args.selftest:
+        return selftest()
     if args.device == "cpu" and args.mode == "event":
         print("event mode is npu-only (cross-stream fence); use racy/fix on cpu")
         return 2
