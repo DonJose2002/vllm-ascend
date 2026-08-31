@@ -132,6 +132,26 @@ _SD_STAGED_COPY = int(os.getenv("VLLM_ASCEND_SD_STAGED_COPY", "0"))
 if _SD_STAGED_COPY == 1:
     logger.warning("[SD-staged-copy] depth 1 gives no protection, ignoring (use >=2)")
 
+# [research instrumentation 2026-08-28] event-protocol variant (run E):
+# upstream GPUModelRunner.synchronize_input_prep() fences reused pinned CPU
+# tensors against exactly this hazard class ("back-to-back steps don't
+# overwrite pinned memory while a prior non_blocking H2D DMA is still
+# reading" - gpu_model_runner._dummy_run comment), but its window covers
+# only the runner's input prep, NOT this proposer's backup page, and its
+# event exists only under use_async_scheduling. VLLM_ASCEND_SD_EVENT_COPY=1
+# applies the SAME protocol here with a dedicated event:
+#   entry  (before the host rewrite): event.synchronize() - wait until the
+#           previous step's async copy has landed;
+#   exit   (right after the copy):    event.record()    - the copy stays
+#           non_blocking (original copy_to_gpu path).
+# Only meaningful together with VLLM_ASCEND_SD_REVIVE_RACE=1; default off -
+# the blocking fix below stays the default engine behavior.
+# Verdict (run E, same-day three-arm comparison blocking/event/staged):
+#   crash at the 16K config  -> event pairing insufficient at engine level
+#   green + counters c3=0    -> correctness established; then ITL decides
+#   (vs blocking: does keeping the copy async pay for the entry wait?)
+_SD_EVENT_COPY = _env_flag("VLLM_ASCEND_SD_EVENT_COPY")
+
 
 class _RaceCounters:
     """Persistent on-device accumulators for the H2D-race probes.
@@ -2096,6 +2116,30 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         state["turn"] += 1
         return page
 
+    def _sd_backup_event(self):
+        """[research instrumentation 2026-08-28] dedicated fence event for
+        the event-protocol variant (run E); mirrors upstream
+        synchronize_input_prep(): synchronize() before the host rewrite,
+        record() after the async copy. blocking=True = host sleep-wait
+        instead of busy-polling (upstream idiom, avoids driver-lock spin
+        under TP contention)."""
+        evt = getattr(self, "_sd_event_obj", None)
+        if evt is None:
+            mod = getattr(torch, "npu", None)
+            cls = getattr(mod, "Event", None) if mod is not None else None
+            if cls is None:
+                cls = torch.cuda.Event
+            try:
+                evt = cls(blocking=True)
+            except TypeError:  # backend Event without the blocking kwarg
+                evt = cls()
+            self._sd_event_obj = evt
+            logger.info(
+                "[SD-event-copy] engaged: dedicated backup-copy fence event (%s)",
+                type(evt).__name__,
+            )
+        return evt
+
     def prepare_next_token_ids_padded(
         self,
         sampled_token_ids: torch.Tensor,
@@ -2117,6 +2161,11 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
 
         # Precompute get_token_id for when there is no valid next token
         num_reqs = gpu_input_batch.num_reqs
+        if _SD_REVIVE_RACE and _SD_EVENT_COPY:
+            # event protocol, entry half (upstream synchronize_input_prep
+            # idiom): wait until the PREVIOUS step's async copy has landed
+            # before rewriting the shared pinned page
+            self._sd_backup_event().synchronize()
         seq_lens_list = (gpu_input_batch.num_tokens_no_spec[:num_reqs] - 1).tolist()
         self.backup_next_token_ids.np[:num_reqs] = np.array(
             [requests[gpu_input_batch.req_ids[i]].get_token_id(seq_lens_list[i]) for i in range(num_reqs)]
@@ -2133,7 +2182,12 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             # research-only: the exact original racy path (full-buffer pinned
             # non_blocking H2D via CpuGpuBuffer.copy_to_gpu). Default off;
             # the blocking fix below stays active.
-            if _SD_STAGED_COPY >= 2:
+            if _SD_EVENT_COPY:
+                # event protocol, exit half: keep the original async copy,
+                # record the fence so the next entry can wait for it
+                self.backup_next_token_ids.copy_to_gpu()
+                self._sd_backup_event().record()
+            elif _SD_STAGED_COPY >= 2:
                 page = self._sd_stage_next_page()
                 # host-side snapshot (pinned->pinned memcpy, num_reqs int32
                 # <1KB): this step's async copy reads a page the host will not

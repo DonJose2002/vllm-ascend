@@ -773,3 +773,72 @@ engaged 行 + 归档文件名区分。
   (N=8 三跑全绿为实证,生产建议大余量 N 或页复用前 event 守卫)。
 - 执行注记:手册原 grep 模式漏了 `]`(实际日志行 `[SD-staged-copy]
   engaged: ...`),已改 `-F` 整串匹配。
+
+### Run E(2026-08-28 设计,待执行):事件协议变体——第三个修法同日三臂对照
+
+背景:维护者提及 upstream `GPUModelRunner.synchronize_input_prep()`
+(vllm gpu_model_runner.py:3809-3822,pin v0.23.0 亦有)。研究结论
+(2026-08-28,代码级):该协议防的正是本案权害类(其注释原文"don't
+overwrite pinned memory while a prior non_blocking H2D DMA is still
+reading"),但 ①窗口只包 execute_model 顶部输入 prep,backup 改写在
+`propose_draft_token_ids`(model_runner_v1.py:1788/1821)窗口外;
+②upstream 自己的 GPU drafter backup(llm_base_proposer.py:1065-1070,
+单页改写+copy_to_gpu)同样无保护;③`prepare_inputs_event` 仅在
+use_async_scheduling 时创建,我们的配置下为 None=no-op。
+
+**变体实现**(`_SD_EVENT_COPY`,research 线,默认 off,仅 REVIVE 下
+生效;与 STAGED 互斥,EVENT 优先):backup 专用 event(`torch.npu.Event
+(blocking=True)`,cuda 回退,无 kwarg 回退),**入口半**在 host 改写
+`backup.cpu` 之前 `event.synchronize()`(等上一步异步拷贝落地),
+**出口半**在原路径 `copy_to_gpu()`(保持 non_blocking)之后
+`event.record()`。拷贝全程异步,只栅栏源复用。
+
+判读前提:正确性 = 挺过 16K 崩溃配置(counters 复核 c3=0);性能 =
+同日三臂(blocking/event/staged)ITL 对照。
+
+```bash
+# E1: blocking 默认(安全锚点本尊,不带研究 env)
+TIERS=16384 CONCS=1 NPUS=<id> bash research/run_baseline_npu.sh eagle3 8026
+cp experiments/out/serve-npu-bf16-eagle3-k5.log  experiments/out/serve-rune-fix-blocking.log
+cp experiments/out/baseline-npu-qwen3-8b-npu-bf16-eagle3-k5.json experiments/out/rune-fix-blocking.json
+grep -cF "[SD-event-copy] engaged" experiments/out/serve-rune-fix-blocking.log || true   # 预期 0
+
+# 排水后:
+pkill -TERM -f "vllm serve.*--port 8026"; sleep 30   # 等 HBM 回落再跑 E2
+
+# E2: 事件协议(拷贝保持异步 + 源复用栅栏)
+VLLM_ASCEND_SD_REVIVE_RACE=1 VLLM_ASCEND_SD_EVENT_COPY=1 \
+  TIERS=16384 CONCS=1 NPUS=<id> bash research/run_baseline_npu.sh eagle3 8027
+cp experiments/out/serve-npu-bf16-eagle3-k5.log  experiments/out/serve-rune-event.log
+cp experiments/out/baseline-npu-qwen3-8b-npu-bf16-eagle3-k5.json experiments/out/rune-event.json
+grep -F "[SD-event-copy] engaged" experiments/out/serve-rune-event.log   # 预期 engaged 行
+
+# E3: staged(同日第三臂,与 run D 的 D2 互为复现锚点)
+VLLM_ASCEND_SD_REVIVE_RACE=1 VLLM_ASCEND_SD_STAGED_COPY=8 \
+  TIERS=16384 CONCS=1 NPUS=<id> bash research/run_baseline_npu.sh eagle3 8028
+cp experiments/out/serve-npu-bf16-eagle3-k5.log  experiments/out/serve-rune-staged8.log
+cp experiments/out/baseline-npu-qwen3-8b-npu-bf16-eagle3-k5.json experiments/out/rune-staged8.json
+
+# (可选,正确性复核)E2 配置 + 计数器:预期绿 + c3=0 esc=none
+VLLM_ASCEND_SD_REVIVE_RACE=1 VLLM_ASCEND_SD_EVENT_COPY=1 VLLM_ASCEND_SD_COUNTERS=1 \
+  TIERS=16384 CONCS=1 NPUS=<id> bash research/run_baseline_npu.sh eagle3 8029
+```
+
+注意:三臂 TAG 相同,copy-aside 强制;同卡执行;SUMMARY 不记研究 env,
+靠 engaged 行(`[SD-event-copy]`/`[SD-staged-copy]`)与归档名区分。
+
+#### 判读矩阵
+
+| 结果 | 定性与行动 |
+|---|---|
+| E2 崩 | 引擎级 event 配对(record 于当前流 + host synchronize)在 NPU 深环下不足——变体出局,blocking/staged 不受影响;记录后不再追 |
+| E2 绿 + (可选)c3=0 | 正确性成立;进入性能判读 |
+| ITL(E2) ≈ ITL(E1) | 入口等待把 host run-ahead 压到设备节奏,与 blocking 同量级 → 变体无吞吐优势,仅剩"upstream 习语"评审价值(自用线无用) |
+| ITL(E1) > ITL(E2) > ITL(E3) | 中间态:量化"拷贝异步化收益 − 入口等待代价"的分解 |
+| ITL(E2) ≈ ITL(E3) | 事件协议与 staged 打平 → 事件协议成为等价但更简的形态(无 N 安全界问题)——**自用线最优候选** |
+| accept 差 >0.1 于任一臂 | 数据可疑,复跑确认 |
+
+**服务对象注记(2026-08-28 用户定调)**:PR #14922 合入前景不抱
+期望(维护者意向偏保守);三修法对比数据服务自用研究线——为 Phase 2+
+的引擎改造(staged 或事件协议择优)提供选型依据。默认路径恒为 blocking
+最小修复(安全锚点不变),实验路径全部 env 门控。

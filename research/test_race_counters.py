@@ -90,6 +90,8 @@ def _make_namespace() -> dict:
         # staged-copy experiment (2026-08-28): default off in these scenarios;
         # the real prepare() references the module global in its revive branch
         "_SD_STAGED_COPY": 0,
+        # event-protocol variant (2026-08-28, run E): default off likewise
+        "_SD_EVENT_COPY": False,
         "_RACE_COUNTERS": None,
     }
     return ns
