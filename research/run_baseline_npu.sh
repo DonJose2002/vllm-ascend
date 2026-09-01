@@ -24,6 +24,13 @@
 #   SAVE_TS=1 ...                                            # store token timestamps for R(t)
 #   TIERS=4096 CONCS=1 bash research/run_baseline_npu.sh eagle3 8009       # smoke = 1 cell
 #   EXTRA_SERVE_ARGS="--no-enable-prefix-caching" ...        # passthrough extra vllm serve flags (triage)
+#   bash research/run_baseline_npu.sh hamming 8011                    # Phase 2 C-line: hamming_sparse KV
+#        # compression (dual-gate + kvcomp json; TIERS/CONCS default to 16384,32768 x 1,16)
+#   HAMMING_TOPK=2048 bash research/run_baseline_npu.sh hamming 8012  # tightness knob (json must exist)
+#   bash research/run_baseline_npu.sh hammingsd 8013                  # mutual-exclusion cell (+ngram SD;
+#        # expect hamming silently OFF -> behavior == plain ngram)
+#   NIAH=1 bash research/run_baseline_npu.sh hamming 8014             # also run the NIAH accuracy grid
+#        # on the same serve (needle_eval.py; result embedded in SUMMARY as niah: lines)
 #   PROFILER=1 PROFILE_ONLY=1 bash research/run_baseline_npu.sh dense 8010 # Phase 1.5 tax probe:
 #        # serve with --profiler-config (torch_npu wrapper), then ONE 4K/c1 decode window
 #        # bracketed by /start_profile //stop_profile (auto-bounded by max_iterations);
@@ -32,10 +39,12 @@
 # Key envs: NPU_MODEL, DRAFT, EAGLE3_MODEL, DFLASH_MODEL, K, NGRAM_MAX/NGRAM_MIN,
 #           TIERS, CONCS, NUM_PROMPTS, MAX_TOKENS, SEED_PROFILE, SAVE_TS, NPUS,
 #           PROFILER, PROFILE_ONLY, PROFILER_DIR, PROFILER_STEPS, PROFILER_ROUNDS,
-#           PROFILER_START_TOKENS, PROFILE_TIER
+#           PROFILER_START_TOKENS, PROFILE_TIER,
+#           HAMMING_TOPK, KVCOMP_JSON (hamming modes), NIAH, NIAH_TIERS, NIAH_DEPTHS,
+#           NIAH_SAMPLES, NIAH_MAX_TOKENS
 set -euo pipefail
 
-MODE="${1:?usage: run_baseline_npu.sh dense|sd|sda|ngram|eagle3|dflash PORT}"
+MODE="${1:?usage: run_baseline_npu.sh dense|sd|sda|ngram|eagle3|dflash|hamming|hammingsd PORT}"
 PORT="${2:-8001}"
 MODEL="${NPU_MODEL:-/nfs-share/hf_weights/Qwen3-8B}"
 DRAFT="${NPU_DRAFT:-/nfs-share/hf_weights/Qwen3-0.6B}"
@@ -45,6 +54,11 @@ K="${K:-5}"
 NGRAM_MAX="${NGRAM_MAX:-5}"
 NGRAM_MIN="${NGRAM_MIN:-3}"
 SEED_PROFILE="${SEED_PROFILE:-generic}"
+# Remember whether the caller pinned the matrix axes: modes whose informative
+# range differs (hamming: nothing below seq_len_threshhold) may then install
+# their own defaults WITHOUT overriding explicit user values.
+TIERS_EXPLICIT="${TIERS:+1}"
+CONCS_EXPLICIT="${CONCS:+1}"
 TIERS="${TIERS:-${NPU_TIERS:-4096,16384,32768}}"
 CONCS="${CONCS:-1,4,16}"
 NUM_PROMPTS="${NUM_PROMPTS:-8}"
@@ -236,6 +250,48 @@ case "$MODE" in
     TAG="npu-bf16-${MODE}-k${K}"
     NOTE="$NOTE; $MODE drafter ($DMODEL), capture [$(derive_capture_sizes)]${GRAPH_MODE:+, mode=$GRAPH_MODE} - FIRST RUN, smoke first"
     ;;
+  hamming|hammingsd)
+    # Phase 2 C-line: query-aware dynamic KV compression (hamming_sparse).
+    # DUAL GATE, both keys required (they are read independently):
+    #   - attention-layer gate: additional_config["enable_hamming_sparse"]
+    #     (kvcomp_attn/attention_utils.py:150)
+    #   - runner gate: additional_config["hamming_sparse"]["enabled" +
+    #     "sparse_json_location"] (ascend_config.py:344-346; a hamming_sparse
+    #     dict missing either key crashes with KeyError; missing file raises).
+    # kvcomp emits NO log lines, so SUMMARY self-evidence is the "hamming:"
+    # line below (json path/topk/sha1) plus the ITL delta vs dense.
+    HAMMING_TOPK="${HAMMING_TOPK:-4096}"
+    KVCOMP_JSON="${KVCOMP_JSON:-$REPO_DIR/research/kvcomp/qwen3-8b-topk${HAMMING_TOPK}.json}"
+    if [ ! -f "$KVCOMP_JSON" ]; then
+      echo "kvcomp json not found: $KVCOMP_JSON (HAMMING_TOPK=$HAMMING_TOPK)"
+      exit 1
+    fi
+    KVCOMP_JSON="$(readlink -f "$KVCOMP_JSON")"
+    KVCOMP_SHA="$(python3 -c 'import hashlib,sys; print(hashlib.sha1(open(sys.argv[1],"rb").read()).hexdigest()[:12])' "$KVCOMP_JSON")"
+    SPEC_ARGS="--additional-config {\"enable_hamming_sparse\":true,\"hamming_sparse\":{\"enabled\":true,\"sparse_json_location\":\"$KVCOMP_JSON\"}}"
+    if [ -n "${GRAPH_MODE:-}" ]; then
+      # Risk #3 mitigation: decode-path custom op (npu_hamming_dist_top_k)
+      # under FULL graph is unvalidated for Qwen3-8B; GRAPH_MODE / enforce-
+      # eager (via EXTRA_SERVE_ARGS) are the fallbacks, eager cells get their
+      # own table rows, never mixed into graph-mode tables.
+      SPEC_ARGS="$SPEC_ARGS --compilation-config {\"cudagraph_mode\":\"$GRAPH_MODE\"}"
+    fi
+    TAG="npu-bf16-dense-hamming-topk${HAMMING_TOPK}"
+    NOTE="$NOTE; hamming sparse (dual-gate on, topk=$HAMMING_TOPK tokens, json sha1=$KVCOMP_SHA)"
+    # Below seq_len_threshhold(2048) compression never triggers: default the
+    # C-line matrix (16K/32K x 1/16) unless the caller pinned TIERS/CONCS.
+    if [ -z "$TIERS_EXPLICIT" ]; then TIERS="16384,32768"; fi
+    if [ -z "$CONCS_EXPLICIT" ]; then CONCS="1,16"; fi
+    if [ "$MODE" = "hammingsd" ]; then
+      # Mutual-exclusion confirmation cell: hamming dual-gate + SD on. Expected
+      # = silently disabled (model_runner_v1.py:613 and attention_utils.py:151
+      # both AND with `not speculative_config`, no warning). Evidence is
+      # behavioral: cells should match the Phase 1 plain-ngram numbers.
+      SPEC_ARGS="$SPEC_ARGS --speculative-config {\"method\":\"ngram\",\"prompt_lookup_max\":$NGRAM_MAX,\"prompt_lookup_min\":$NGRAM_MIN,\"num_speculative_tokens\":$K}"
+      TAG="$TAG-sd-ngram-k${K}"
+      NOTE="$NOTE; +ngram SD = mutual-exclusion cell (expect hamming OFF, behavior == plain ngram)"
+    fi
+    ;;
   *)
     echo "unknown MODE '$MODE' (dense|sd|sda|ngram|eagle3|dflash)"; exit 1
     ;;
@@ -273,6 +329,15 @@ if [ "$PROFILER" = "1" ] || [ "$PROFILE_ONLY" = "1" ]; then
   NOTE="$NOTE; profile window only (steps=$PROFILER_STEPS x$PROFILER_ROUNDS, armed@tok$PROFILER_START_TOKENS, tier$PROFILE_TIER)"
 fi
 
+# --- Phase 2 NIAH accuracy grid (optional, any mode; same serve reused) ---
+# Runs needle_eval.py AFTER the latency bench on the same server. The
+# repetitive/generic bench profiles cannot see quality; this grid can.
+NIAH="${NIAH:-0}"
+NIAH_TIERS="${NIAH_TIERS:-16384,32768}"
+NIAH_DEPTHS="${NIAH_DEPTHS:-0.1,0.25,0.5,0.75,0.9}"
+NIAH_SAMPLES="${NIAH_SAMPLES:-2}"
+NIAH_MAX_TOKENS="${NIAH_MAX_TOKENS:-48}"
+
 strip_log() {
   sed -E 's/^\((APIServer|EngineCore) pid=[0-9]+\) //; s/(INFO|ERROR|WARNING) [0-9]{2}-[0-9]{2} [0-9:]{8} \[[^]]*\] //'
 }
@@ -299,6 +364,11 @@ on_exit() {
   echo "repo_commit=$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
   echo "vllm_ascend_dist=$DIST_VER"
   echo "tiers=$TIERS concs=$CONCS nprompts=$NUM_PROMPTS maxtok=$MAX_TOKENS k=$K profile=$SEED_PROFILE"
+  # Phase 2 self-evidence: kvcomp emits no engine log lines, so the harness
+  # reports the wiring it armed (path must be absolute, sha pins content).
+  if [ -n "${KVCOMP_JSON:-}" ]; then
+    echo "hamming: topk=${HAMMING_TOPK:-?} sha1=${KVCOMP_SHA:-?} json=$KVCOMP_JSON"
+  fi
   SERVE_LOG="$OUTDIR/serve-$TAG.log"
   if [ -s "$SERVE_LOG" ]; then
     grep -E "Available KV cache memory|GPU KV cache size|model weights take|Maximum concurrency|Wrapping draft model|drafter FULL graph enabled|drafter sizes|Capturing CUDA graphs" \
@@ -310,6 +380,9 @@ on_exit() {
   fi
   if [ -f "$OUTDIR/baseline-npu-qwen3-8b-$TAG.json" ]; then
     python3 research/bench_baseline.py summary "$OUTDIR/baseline-npu-qwen3-8b-$TAG.json"
+    if [ -f "$OUTDIR/niah-$TAG.json" ]; then
+      python3 research/needle_eval.py curve "$OUTDIR/niah-$TAG.json" | sed 's/^/niah: /' || true
+    fi
   elif [ -s "$SERVE_LOG" ]; then
     echo "# bench json missing; EngineCore fatal block (if any):"
     grep -B2 -A45 "EngineCore encountered a fatal error" "$SERVE_LOG" \
@@ -393,6 +466,20 @@ if curl -s -o /dev/null "http://127.0.0.1:$PORT/v1/models"; then
       --out "$OUTDIR/baseline-npu-qwen3-8b-$TAG.json" \
       --note "$NOTE" \
       || echo "# bench exited non-zero (partial summary follows)"
+    if [ "${NIAH:-0}" = "1" ]; then
+      echo ">>> NIAH grid $TAG (tiers=$NIAH_TIERS depths=$NIAH_DEPTHS samples=$NIAH_SAMPLES)"
+      python3 research/needle_eval.py run \
+        --base-url "http://127.0.0.1:$PORT" \
+        --model qwen3-8b \
+        --tag "$TAG" \
+        --tiers "$NIAH_TIERS" \
+        --depths "$NIAH_DEPTHS" \
+        --samples "$NIAH_SAMPLES" \
+        --max-tokens "$NIAH_MAX_TOKENS" \
+        --timeout 600 \
+        --out "$OUTDIR/niah-$TAG.json" \
+        || echo "# NIAH run failed (partial summary follows)"
+    fi
   fi
 else
   echo ">>> server not up; skipping bench"
