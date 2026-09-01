@@ -57,8 +57,18 @@ SCHEMA: dict = {
     "hash_weight_qk_rope": None,
     "vllm_hash_attention_topk": 4096,  # THE tightness knob (tokens)
     "vllm_hash_attention_reduction_head_num": None,
-    "vllm_hash_attention_rollback_layers": [],
-    "vllm_hash_attention_skip_layers": [],
+    "vllm_hash_attention_rollback_layers": [],  # consumed ONLY as layer-id list
+    # LANDMINE (smoke 2026-09-01): consumed with TWO incompatible semantics -
+    #   kvcomp_utils.py:601  `layer_index in <list>`       (layer-id list)
+    #   attention_utils.py:115 `<list>[layer_index]`       (per-layer mask)
+    # Upstream's own default [] crashes the mask read with IndexError on the
+    # first decode forward (any model). [None]*36 satisfies BOTH readings
+    # with no behavior change: None is falsy (no skip in decode) and no int
+    # layer_index equals None (no skip layer at init). [0]*36 would silently
+    # un-compress layer 0 via the `in` read (0 in [0]*36); [False]*36 too
+    # (0 == False in Python). Upstream fix candidate (PR material): make
+    # attention_utils.py:115 use `layer_index in ...` like the init path.
+    "vllm_hash_attention_skip_layers": [None] * NUM_HIDDEN_LAYERS,
 }
 
 TOPKS = (2048, 4096, 8192)

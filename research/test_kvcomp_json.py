@@ -44,6 +44,11 @@ TOPKS = (2048, 4096, 8192)
 
 # Fields we intentionally vary away from upstream defaults (see gen_kvcomp_json.py).
 VARYING_FIELDS = {"model_name", "vllm_hash_attention_topk"}
+# Fields whose upstream default is BROKEN at runtime (not merely unsuitable):
+# vllm_hash_attention_skip_layers default [] is read BOTH as a layer-id list
+# (kvcomp_utils.py:601, fine) AND as a per-layer mask (attention_utils.py:115,
+# IndexError on any index). We ship [None]*36 which satisfies both readings.
+LANDMINE_FIXED_FIELDS = {"vllm_hash_attention_skip_layers"}
 
 
 def dataclass_defaults(path: Path) -> dict[str, object]:
@@ -84,7 +89,7 @@ def test_schema_and_values(defaults: dict[str, object], jsons: dict[int, dict]) 
             f"  missing (silent default fallback): {sorted(want_fields - got)}"
         )
         for k, v in cfg.items():
-            if k in VARYING_FIELDS:
+            if k in VARYING_FIELDS or k in LANDMINE_FIXED_FIELDS:
                 continue
             assert v == defaults[k], f"topk{topk}: field {k}: json={v!r} != upstream default {defaults[k]!r}"
 
@@ -102,6 +107,17 @@ def test_invariants(jsons: dict[int, dict]) -> None:
         assert len(cfg["top_k_ratio_per_layer"]) == cfg["num_hidden_layers"]
         assert len(cfg["top_k_index_reuse"]) == cfg["num_hidden_layers"]
         assert cfg["must_select_blocks"] == [0, -2, -1], "sink + recent anchors (design §2.2)"
+        # Dual-semantics landmine guard (smoke 2026-09-01 IndexError):
+        # attention_utils.py:115 does skip_layers[layer_index] -> needs len>=36
+        # AND falsy per entry; kvcomp_utils.py:601 does `layer_index in list`
+        # -> no entry may equal any int layer index. [None]*36 is the only
+        # value class satisfying both; [] crashes, [0]/[False]-masks snare
+        # layer 0 via the membership read.
+        skip = cfg["vllm_hash_attention_skip_layers"]
+        assert len(skip) == cfg["num_hidden_layers"], "skip_layers must be mask-length for the [idx] read"
+        assert all(v is None for v in skip), "skip_layers entries must be None (falsy AND != any int)"
+        assert all(not skip[i] for i in range(cfg["num_hidden_layers"])), "no layer may read as skipped"
+        assert all(i not in skip for i in range(cfg["num_hidden_layers"])), "membership read must match nothing"
 
 
 def test_cross_file(jsons: dict[int, dict]) -> None:
