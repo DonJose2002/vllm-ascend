@@ -26,4 +26,4 @@ else
 fi
 
 echo "--- serve log tail (inside $CONTAINER:$LOG) ---"
-docker exec "$CONTAINER" tail -5 "$LOG" 2>/dev/null | sed 's/^/log: /' || echo "log: (unavailable)"
+$DOCKER exec "$CONTAINER" tail -5 "$LOG" 2>/dev/null | sed 's/^/log: /' || echo "log: (unavailable)"

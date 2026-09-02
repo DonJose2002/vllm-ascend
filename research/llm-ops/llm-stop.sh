@@ -12,14 +12,18 @@ cd "$(dirname "$0")"
 
 say() { echo "[llm-stop] $*"; }
 
-serve_pids() {
-  docker top "$CONTAINER" -o pid,cmd 2>/dev/null | awk '/vllm serve/ && !/awk/ {print $1}'
-}
+# serve_pids / vllm_tree_pids come from llm-npu-lib.sh (via $DOCKER).
 
 PIDS="$(serve_pids || true)"
 if [ -z "$PIDS" ]; then
-  say "no serve process found in $CONTAINER (nothing to do)"
-  exit 0
+  if [ -n "$(vllm_tree_pids || true)" ]; then
+    # No main serve process but workers linger (crashed API server?): kill the tree.
+    PIDS="$(vllm_tree_pids)"
+    say "main serve gone, orphaned vllm tree found: $(echo "$PIDS" | tr '\n' ' ')"
+  else
+    say "no serve process found in $CONTAINER (nothing to do)"
+    exit 0
+  fi
 fi
 say "TERM: $(echo "$PIDS" | tr '\n' ' ')"
 
@@ -31,13 +35,13 @@ echo "$PIDS" | xargs -r kill -TERM 2>/dev/null || true
 deadline=$(( $(date +%s) + 300 ))
 while [ "$(date +%s)" -lt "$deadline" ]; do
   sleep 10
-  PIDS="$(serve_pids || true)"
-  [ -z "$PIDS" ] && break
-  say "still dying: $(echo "$PIDS" | tr '\n' ' ')"
+  TREE="$(vllm_tree_pids || true)"
+  [ -z "$TREE" ] && break
+  say "still dying: $(echo "$TREE" | tr '\n' ' ')"
 done
-if [ -n "${PIDS:-}" ]; then
-  say "still alive after 300s - hard kill"
-  echo "$PIDS" | xargs -r kill -KILL 2>/dev/null || true
+if [ -n "${TREE:-}" ]; then
+  say "still alive after 300s - hard kill: $(echo "$TREE" | tr '\n' ' ')"
+  echo "$TREE" | xargs -r kill -KILL 2>/dev/null || true
   sleep 10
 fi
 

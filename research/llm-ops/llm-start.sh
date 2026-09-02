@@ -21,7 +21,7 @@ say() { echo "[llm-start] $*"; }
 [ -f ./llm-ops.secret ] && . ./llm-ops.secret
 [ -n "$API_KEY" ] || { say "API_KEY empty - create ./llm-ops.secret next to the scripts (see llm-ops.conf header)"; exit 1; }
 
-if ! docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null | grep -q true; then
+if ! $DOCKER inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null | grep -q true; then
   say "container $CONTAINER is not running (start it first, manual §2.5)"
   exit 1
 fi
@@ -60,7 +60,7 @@ for d in $(echo "$PICK" | tr ',' ' '); do
 done
 
 # --- launch inside the container (detached; logs to $LOG inside container) ---
-docker exec -d \
+$DOCKER exec -d \
   -e ASCEND_RT_VISIBLE_DEVICES="$PICK" \
   -e PYTORCH_NPU_ALLOC_CONF=max_split_size_mb:256 \
   "$CONTAINER" \
@@ -82,16 +82,16 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
   sleep 10
   if curl -s -m 5 -o /dev/null "http://127.0.0.1:$PORT/v1/models" -H "Authorization: Bearer $API_KEY"; then
     say "UP on :$PORT (cards $PICK) - company URL: http://<server-ip>:$PORT/v1"
-    docker exec "$CONTAINER" grep -m2 -E "Available KV cache memory|GPU KV cache size" "$LOG" 2>/dev/null | sed 's/^/kv: /' || true
+    $DOCKER exec "$CONTAINER" grep -m2 -E "Available KV cache memory|GPU KV cache size" "$LOG" 2>/dev/null | sed 's/^/kv: /' || true
     exit 0
   fi
   # died during startup? (docker top reads host-side, no container deps)
-  if ! docker top "$CONTAINER" -o pid,cmd 2>/dev/null | grep -q "vllm serve"; then
+  if [ -z "$(serve_pids)" ]; then
     say "serve process died during startup - last 25 log lines:"
-    docker exec "$CONTAINER" tail -25 "$LOG" 2>/dev/null | sed 's/^/  /'
+    $DOCKER exec "$CONTAINER" tail -25 "$LOG" 2>/dev/null | sed 's/^/  /'
     exit 1
   fi
 done
 say "TIMEOUT after 25min - last 25 log lines:"
-docker exec "$CONTAINER" tail -25 "$LOG" 2>/dev/null | sed 's/^/  /'
+$DOCKER exec "$CONTAINER" tail -25 "$LOG" 2>/dev/null | sed 's/^/  /'
 exit 1

@@ -46,3 +46,16 @@ state_cards() {
   awk '{for (i = 1; i <= NF; i++) if ($i ~ /^cards=/) {sub("cards=", "", $i); print $i}}' \
     "$(dirname "${BASH_SOURCE[0]}")/llm-ops.state"
 }
+
+# --- serve process management (host-side view via docker top) ---
+# Main serve process only (the API server; TERM target for graceful stop).
+serve_pids() {
+  $DOCKER top "$CONTAINER" -o pid,cmd 2>/dev/null | awk '/vllm serve/ && !/awk/ {print $1}'
+}
+
+# Whole vllm process tree: main + EngineCore + Worker_TP* (the "VLLM::" set).
+# Liveness checks and the hard-kill phase must use THIS so orphaned workers
+# cannot outlive the API server holding the cards.
+vllm_tree_pids() {
+  $DOCKER top "$CONTAINER" -o pid,cmd 2>/dev/null | awk '/vllm serve|VLLM::/ && !/awk/ {print $1}'
+}
