@@ -23,8 +23,15 @@ fi
 # server alone stalls on keep-alive connections), give it TERM_WAIT seconds,
 # then hard kill. Success criterion is the HBM drain below, not process-list
 # politeness (zombies hold no resources and are excluded upstream).
+# NOTE: the serve processes run as ROOT inside the container (= host uid 0);
+# from the ops user's shell the kill MUST go through sudo as well - the
+# 2026-09-02 "force kill did nothing" incident was exactly a bare `kill`
+# getting EPERM silently swallowed by `2>/dev/null || true`.
 say "TERM tree: $(echo "$PIDS" | tr '\n' ' ')"
-echo "$PIDS" | xargs -r kill -TERM 2>/dev/null || true
+if ! echo "$PIDS" | xargs -r sudo kill -TERM; then
+  say "TERM failed (rc=$?) - sudo asking for a password? Run me from an interactive shell"
+  exit 1
+fi
 
 deadline=$(( $(date +%s) + TERM_WAIT ))
 while [ "$(date +%s)" -lt "$deadline" ]; do
@@ -35,8 +42,18 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
 done
 if [ -n "${TREE:-}" ]; then
   say "graceful window (${TERM_WAIT}s) over - hard kill: $(echo "$TREE" | tr '\n' ' ')"
-  echo "$TREE" | xargs -r kill -KILL 2>/dev/null || true
+  if ! echo "$TREE" | xargs -r sudo kill -KILL; then
+    say "KILL failed (rc=$?) - check sudo"
+    exit 1
+  fi
   sleep 5
+  LEFT="$(vllm_tree_pids || true)"
+  if [ -n "$LEFT" ]; then
+    say "processes SURVIVED SIGKILL: $(echo "$LEFT" | tr '\n' ' ')"
+    say "likely D-state (uninterruptible NPU driver cleanup) - wait, or last resort:"
+    say "  sudo docker restart $CONTAINER"
+    exit 1
+  fi
 fi
 
 # --- drain check on the cards recorded at start time ---
