@@ -223,3 +223,7 @@ csrc/third_party/
 .codegraph/
 
 .vllm_ascend/
+
+# company LLM service ops (research/llm-ops): the serve API key lives only
+# in this local secret file, never in git (public fork!)
+research/llm-ops/llm-ops.secret
