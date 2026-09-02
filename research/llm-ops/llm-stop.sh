@@ -14,35 +14,29 @@ say() { echo "[llm-stop] $*"; }
 
 # serve_pids / vllm_tree_pids come from llm-npu-lib.sh (via $DOCKER).
 
-PIDS="$(serve_pids || true)"
+PIDS="$(vllm_tree_pids || true)"
 if [ -z "$PIDS" ]; then
-  if [ -n "$(vllm_tree_pids || true)" ]; then
-    # No main serve process but workers linger (crashed API server?): kill the tree.
-    PIDS="$(vllm_tree_pids)"
-    say "main serve gone, orphaned vllm tree found: $(echo "$PIDS" | tr '\n' ' ')"
-  else
-    say "no serve process found in $CONTAINER (nothing to do)"
-    exit 0
-  fi
+  say "no live vllm process in $CONTAINER (nothing to do)"
+  exit 0
 fi
-say "TERM: $(echo "$PIDS" | tr '\n' ' ')"
-
-# The serve was started via docker exec, so its processes are children of the
-# container's init; killing them by host PID (from docker top) is correct and
-# leaves the container itself running.
+# Stateless service: TERM the WHOLE tree at once (waiting politely on the API
+# server alone stalls on keep-alive connections), give it TERM_WAIT seconds,
+# then hard kill. Success criterion is the HBM drain below, not process-list
+# politeness (zombies hold no resources and are excluded upstream).
+say "TERM tree: $(echo "$PIDS" | tr '\n' ' ')"
 echo "$PIDS" | xargs -r kill -TERM 2>/dev/null || true
 
-deadline=$(( $(date +%s) + 300 ))
+deadline=$(( $(date +%s) + TERM_WAIT ))
 while [ "$(date +%s)" -lt "$deadline" ]; do
-  sleep 10
+  sleep 5
   TREE="$(vllm_tree_pids || true)"
-  [ -z "$TREE" ] && break
-  say "still dying: $(echo "$TREE" | tr '\n' ' ')"
+  [ -z "$TREE" ] && { say "tree exited gracefully"; break; }
+  say "still dying (${TREE})... $(date +%H:%M:%S)"
 done
 if [ -n "${TREE:-}" ]; then
-  say "still alive after 300s - hard kill: $(echo "$TREE" | tr '\n' ' ')"
+  say "graceful window (${TERM_WAIT}s) over - hard kill: $(echo "$TREE" | tr '\n' ' ')"
   echo "$TREE" | xargs -r kill -KILL 2>/dev/null || true
-  sleep 10
+  sleep 5
 fi
 
 # --- drain check on the cards recorded at start time ---

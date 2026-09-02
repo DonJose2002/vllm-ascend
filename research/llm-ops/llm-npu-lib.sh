@@ -48,14 +48,21 @@ state_cards() {
 }
 
 # --- serve process management (host-side view via docker top) ---
-# Main serve process only (the API server; TERM target for graceful stop).
-serve_pids() {
-  $DOCKER top "$CONTAINER" -o pid,cmd 2>/dev/null | awk '/vllm serve/ && !/awk/ {print $1}'
+# Whole vllm process tree: main serve + EngineCore + Worker_TP* (the "VLLM::"
+# set). STAT column is included so ZOMBIES are excluded - children reparented
+# to the container's bash PID 1 can linger as <defunct> in docker top forever
+# while holding no resources (2026-09-02 "still dying" incident).
+_vllm_top() {
+  $DOCKER top "$CONTAINER" -o pid,stat,cmd 2>/dev/null
 }
 
-# Whole vllm process tree: main + EngineCore + Worker_TP* (the "VLLM::" set).
-# Liveness checks and the hard-kill phase must use THIS so orphaned workers
-# cannot outlive the API server holding the cards.
+# Main serve process only (the API server).
+serve_pids() {
+  _vllm_top | awk '$2 !~ /^Z/ && /vllm serve/ && !/awk/ {print $1}'
+}
+
+# Liveness checks and kill phases use the TREE so orphaned workers cannot
+# outlive the API server holding the cards.
 vllm_tree_pids() {
-  $DOCKER top "$CONTAINER" -o pid,cmd 2>/dev/null | awk '/vllm serve|VLLM::/ && !/awk/ {print $1}'
+  _vllm_top | awk '$2 !~ /^Z/ && (/vllm serve/ || /VLLM::/) && !/awk/ {print $1}'
 }
