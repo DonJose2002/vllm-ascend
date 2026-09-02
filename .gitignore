@@ -227,3 +227,4 @@ csrc/third_party/
 # company LLM service ops (research/llm-ops): the serve API key lives only
 # in this local secret file, never in git (public fork!)
 research/llm-ops/llm-ops.secret
+research/llm-ops/llm-ops.state

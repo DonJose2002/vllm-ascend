@@ -37,16 +37,50 @@ if ss -tln 2>/dev/null | awk '{print $4}' | grep -q ":$PORT$"; then
 fi
 
 # --- card selection ---
+# Pick the TP lowest-HBM cards AMONG FREE ONES (<= HBM_FREE_MB). Returns
+# 0 = picked (PICK set), 2 = insufficient free cards, 1 = npu-smi unparseable.
+select_cards() {
+  local dev_list free_list n_free
+  dev_list="$(npu_hbm_list)"
+  case "$dev_list" in
+    PARSE-FAIL*|"") say "cannot parse npu-smi: ${dev_list:-empty}"; say "fall back: NPUS=4,5 $0"; return 1 ;;
+  esac
+  free_list="$(echo "$dev_list" | awk -v th="$HBM_FREE_MB" '$2 + 0 <= th' | sort -k2 -n)"
+  n_free=$(echo "$free_list" | grep -c . || true)
+  if [ "${n_free:-0}" -lt "$TP" ]; then
+    say "insufficient free cards: ${n_free:-0}/$TP (threshold ${HBM_FREE_MB}MB) - current occupancy:"
+    echo "$dev_list" | sort -k2 -n | sed 's/^/  npu: /'
+    return 2
+  fi
+  PICK="$(echo "$free_list" | head -"$TP" | awk '{print $1}' | paste -sd, -)"
+  say "picked $TP lowest-HBM free cards: $PICK ($(echo "$free_list" | head -"$TP" | tr '\n' ' '))"
+}
+
 if [ -n "${NPUS:-}" ]; then
   PICK="$NPUS"
   say "using caller-specified cards: $PICK"
 else
-  DEV_LIST="$(npu_hbm_list)"
-  case "$DEV_LIST" in
-    PARSE-FAIL*|"") say "cannot parse npu-smi: ${DEV_LIST:-empty}"; say "fall back: NPUS=4,5 $0"; exit 1 ;;
-  esac
-  PICK="$(echo "$DEV_LIST" | sort -k2 -n | head -2 | awk '{print $1}' | paste -sd, -)"
-  say "auto-picked 2 lowest-HBM cards: $PICK ($(echo "$DEV_LIST" | sort -k2 -n | head -2 | tr '\n' ' '))"
+  rc=0; select_cards || rc=$?
+  if [ "$rc" -eq 2 ] && [ -n "${SQUAT_CONTAINER:-}" ]; then
+    say "insufficient free cards - restarting the group occupancy container '$SQUAT_CONTAINER' (sanctioned) and retrying"
+    if $DOCKER restart "$SQUAT_CONTAINER" >/dev/null 2>&1; then
+      # HBM release after the container restart takes a moment to show up
+      # in npu-smi; poll for up to ~1 min before declaring truly no cards.
+      ok=""
+      for _ in 1 2 3 4 5 6; do
+        sleep 10
+        rc=0; select_cards || rc=$?
+        [ "$rc" -eq 0 ] && { ok=1; break; }
+        [ "$rc" -eq 1 ] && break   # parser broke, no point retrying
+      done
+      [ -n "$ok" ] || { say "still insufficient after restarting $SQUAT_CONTAINER - the cards are genuinely busy"; exit 1; }
+    else
+      say "failed to restart $SQUAT_CONTAINER - continuing with manual selection only"
+      exit 1
+    fi
+  elif [ "$rc" -ne 0 ]; then
+    exit 1
+  fi
 fi
 # ASCEND_RT_VISIBLE_DEVICES REQUIRES ascending device ids (CANN constraint,
 # unlike CUDA's order-defines-mapping). 2026-09-02 incident: HBM-sorted pick
