@@ -99,7 +99,16 @@ for d in $(echo "$PICK" | tr ',' ' '); do
 done
 
 # --- launch inside the container (detached; logs to $LOG inside container) ---
-$DOCKER exec -d \
+TOOL_ARGS=""
+if [ "${ENABLE_TOOLS:-1}" = "1" ]; then
+  TOOL_ARGS="--enable-auto-tool-choice --tool-call-parser $TOOL_PARSER"
+fi
+if [ -n "${REASONING_PARSER:-}" ]; then
+  TOOL_ARGS="$TOOL_ARGS --reasoning-parser $REASONING_PARSER"
+fi
+[ -n "$TOOL_ARGS" ] && say "agent tooling flags: $TOOL_ARGS"
+
+docker exec -d \
   -e ASCEND_RT_VISIBLE_DEVICES="$PICK" \
   -e PYTORCH_NPU_ALLOC_CONF=max_split_size_mb:256 \
   "$CONTAINER" \
@@ -109,6 +118,7 @@ $DOCKER exec -d \
       --max-model-len $MAX_MODEL_LEN \
       --gpu-memory-utilization $GPU_MEM_UTIL \
       --compilation-config '{\"cudagraph_mode\":\"FULL\"}' \
+      $TOOL_ARGS \
       --api-key '$API_KEY' --port $PORT \
       > $LOG 2>&1"
 
