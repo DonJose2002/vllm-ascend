@@ -76,6 +76,22 @@ $DOCKER exec -d \
 echo "$(date '+%F %T') cards=$PICK port=$PORT" > llm-ops.state
 say "launched in $CONTAINER (cards $PICK), waiting for :$PORT ..."
 
+# Failure-path log dump: NPU error dumps are LONG and the interesting
+# Python exception sits ABOVE the device-spam tail - so print (a) from the
+# LAST "Traceback" line to EOF (bounded), (b) any ERROR/EE/EZ device lines.
+dump_fail_log() {
+  say "--- last traceback to EOF (max 60 lines) ---"
+  $DOCKER exec "$CONTAINER" sh -c \
+    "awk '/Traceback/{buf=\"\"} {buf=buf \$0 \"\n\"} END{printf \"%s\", buf}' $LOG | tail -60" \
+    2>/dev/null | sed 's/^/  /' || true
+  say "--- error lines ---"
+  $DOCKER exec "$CONTAINER" sh -c \
+    "grep -nE 'ERROR|Traceback|EE[0-9]{4}|EZ[0-9]{4}' $LOG | tail -15" \
+    2>/dev/null | sed 's/^/  /' || true
+  say "--- raw tail (10) ---"
+  $DOCKER exec "$CONTAINER" tail -10 "$LOG" 2>/dev/null | sed 's/^/  /' || true
+}
+
 # --- health wait: weights load + FULL graph capture take minutes ---
 deadline=$(( $(date +%s) + 1500 ))
 while [ "$(date +%s)" -lt "$deadline" ]; do
@@ -87,11 +103,11 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
   fi
   # died during startup? (docker top reads host-side, no container deps)
   if [ -z "$(serve_pids)" ]; then
-    say "serve process died during startup - last 25 log lines:"
-    $DOCKER exec "$CONTAINER" tail -25 "$LOG" 2>/dev/null | sed 's/^/  /'
+    say "serve process died during startup"
+    dump_fail_log
     exit 1
   fi
 done
-say "TIMEOUT after 25min - last 25 log lines:"
-$DOCKER exec "$CONTAINER" tail -25 "$LOG" 2>/dev/null | sed 's/^/  /'
+say "TIMEOUT after 25min"
+dump_fail_log
 exit 1
