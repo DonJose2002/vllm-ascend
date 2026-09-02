@@ -48,6 +48,11 @@ else
   PICK="$(echo "$DEV_LIST" | sort -k2 -n | head -2 | awk '{print $1}' | paste -sd, -)"
   say "auto-picked 2 lowest-HBM cards: $PICK ($(echo "$DEV_LIST" | sort -k2 -n | head -2 | tr '\n' ' '))"
 fi
+# ASCEND_RT_VISIBLE_DEVICES REQUIRES ascending device ids (CANN constraint,
+# unlike CUDA's order-defines-mapping). 2026-09-02 incident: HBM-sorted pick
+# produced "2,1" and every worker died at aclInit 107001 / "Invalid device
+# ID" at rtSetDefaultDeviceId(0). Normalize BOTH auto-picked and NPUS input.
+PICK="$(echo "$PICK" | tr ',' '\n' | sed 's/ //g' | sort -n | uniq | paste -sd, -)"
 NPICK=$(echo "$PICK" | tr ',' '\n' | grep -c .)
 [ "$NPICK" -eq "$TP" ] || { say "need $TP cards, got '$PICK'"; exit 1; }
 for d in $(echo "$PICK" | tr ',' ' '); do
