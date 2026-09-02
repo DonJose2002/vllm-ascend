@@ -53,6 +53,9 @@ select_cards() {
     return 2
   fi
   PICK="$(echo "$free_list" | head -"$TP" | awk '{print $1}' | paste -sd, -)"
+  # normalize FIRST so the log shows exactly what gets exported (ascending;
+  # see the ASCEND_RT_VISIBLE_DEVICES constraint note below)
+  PICK="$(echo "$PICK" | tr ',' '\n' | sed 's/ //g' | sort -n | uniq | paste -sd, -)"
   say "picked $TP lowest-HBM free cards: $PICK ($(echo "$free_list" | head -"$TP" | tr '\n' ' '))"
 }
 
@@ -108,7 +111,7 @@ if [ -n "${REASONING_PARSER:-}" ]; then
 fi
 [ -n "$TOOL_ARGS" ] && say "agent tooling flags: $TOOL_ARGS"
 
-docker exec -d \
+$DOCKER exec -d \
   -e ASCEND_RT_VISIBLE_DEVICES="$PICK" \
   -e PYTORCH_NPU_ALLOC_CONF=max_split_size_mb:256 \
   "$CONTAINER" \
