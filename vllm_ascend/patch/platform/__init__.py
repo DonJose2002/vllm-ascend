@@ -47,6 +47,9 @@ import vllm_ascend.patch.platform.patch_mamba_manager  # noqa
 if os.getenv("DYNAMIC_EPLB", "false").lower() in ("true", "1") or os.getenv("EXPERT_MAP_RECORD", "false") == "true":
     import vllm_ascend.patch.platform.patch_multiproc_executor  # noqa
 
+if os.getenv("VLLM_ASCEND_STATIC_KV_COMPACT", "0") == "1":
+    import vllm_ascend.patch.platform.patch_static_kv_compact  # noqa
+
 import vllm_ascend.patch.platform.patch_balance_schedule  # noqa
 
 import vllm_ascend.patch.platform.patch_kv_cache_coordinator  # noqa

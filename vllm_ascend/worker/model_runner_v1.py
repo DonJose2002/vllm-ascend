@@ -168,6 +168,7 @@ from vllm_ascend.utils import (
     sparse_kv_cache_has_indexer,
     vllm_version_is,
 )
+from vllm_ascend.worker import static_kv_compact
 from vllm_ascend.worker.npu_input_batch import NPUInputBatch
 from vllm_ascend.worker.pcp_utils import PCPAsyncSpecDecodeRebuildResult, PCPManager
 from vllm_ascend.worker.utils import AscendKVBlockZeroer, copy_snapshot_to_gpu
@@ -3156,6 +3157,16 @@ class NPUModelRunner(GPUModelRunner):
 
         block_table_gid_0, slot_mapping_gid_0 = _get_block_table_and_slot_mapping(0)
         self.long_seq_metadata, block_table_gid_0 = _get_pcp_metadata(block_table_gid_0)
+        # Static KV compaction (research, env-gated): gathered block-table view
+        # + compacted seq_lens override when any record is active; None keeps
+        # the untouched dense metadata path (zero overhead when disabled).
+        kv_compact_views = (
+            static_kv_compact.prepare_runner_views(self, num_reqs_padded)
+            if static_kv_compact.ENABLED
+            else None
+        )
+        if kv_compact_views is not None:
+            block_table_gid_0 = kv_compact_views.block_table_device
         num_computed_tokens_cpu = self.input_batch.num_computed_tokens_cpu_tensor[
             :num_reqs_padded
         ]
@@ -3173,15 +3184,31 @@ class NPUModelRunner(GPUModelRunner):
         cm_base = AscendCommonAttentionMetadata(
             query_start_loc=self.query_start_loc.gpu[: num_reqs_padded + 1],
             query_start_loc_cpu=self.query_start_loc.cpu[: num_reqs_padded + 1],
-            seq_lens=self.seq_lens[:num_reqs_padded],
+            seq_lens=(
+                self.seq_lens[:num_reqs_padded]
+                if kv_compact_views is None
+                else kv_compact_views.seq_lens_device
+            ),
             # Always pass optimistic_seq_lens_cpu via _seq_lens_cpu so NPU
             # attention backends can get CPU seq_lens without GPU->CPU sync.
             # This is separate from seq_lens_cpu (None in async) which eagle
             # proposer checks to distinguish async/non-async behavior.
-            _seq_lens_cpu=self.optimistic_seq_lens_cpu[:num_reqs_padded],
-            seq_lens_cpu_upper_bound=self.optimistic_seq_lens_cpu[:num_reqs_padded],
+            _seq_lens_cpu=(
+                self.optimistic_seq_lens_cpu[:num_reqs_padded]
+                if kv_compact_views is None
+                else kv_compact_views.seq_lens_cpu
+            ),
+            seq_lens_cpu_upper_bound=(
+                self.optimistic_seq_lens_cpu[:num_reqs_padded]
+                if kv_compact_views is None
+                else kv_compact_views.seq_lens_cpu
+            ),
             # TODO
-            seq_lens_cpu=seq_lens_cpu,
+            seq_lens_cpu=(
+                seq_lens_cpu
+                if kv_compact_views is None or seq_lens_cpu is None
+                else kv_compact_views.seq_lens_cpu
+            ),
             # TODO
             # num_computed_tokens_cpu=self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs_padded],
             num_computed_tokens_cpu=num_computed_tokens_cpu,
