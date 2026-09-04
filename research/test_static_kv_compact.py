@@ -353,6 +353,9 @@ def test_wiring_presence():
     assert "KVCacheManager.free" in patch_file
     assert "static_kv_compact.maybe_compact_batch" in patch_file
     assert "static_kv_compact.forget" in patch_file
+    # install self-evidence line (b2smoke 2026-09-04: silent install was
+    # indistinguishable from a tripped gate)
+    assert "[static-kv-compact] scheduler hooks installed" in patch_file
 
 
 def test_b2_script_wiring():
@@ -369,6 +372,12 @@ def test_b2_script_wiring():
     assert 'grep -E "KV cache usage"' in base
     assert "ZERO [static-kv-compact] events with env=1" in base
     assert "negative control" in base
+    # installed-dist probe: workspace edits need a container reinstall
+    # (b2smoke 2026-09-04 incident: serve imports site-packages, the patch
+    # was never loaded, zero events)
+    assert "COMPACT-PREFLIGHT-FAIL" in base
+    assert "import vllm_ascend.worker.static_kv_compact" in base
+    assert "MAX_JOBS=32 pip install . --no-build-isolation" in base
 
     drv = (REPO_ROOT / "research" / "run_phase2.sh").read_text()
     assert "b2smoke" in drv.split("Usage:")[1]

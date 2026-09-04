@@ -128,6 +128,25 @@ then
   exit 1
 fi
 DIST_VER="$(cd "$PROBE_DIR" && python3 -c 'import importlib.metadata as m; print(m.version("vllm-ascend"))' 2>/dev/null || echo '?')"
+
+# --- compact-mode dist probe: B1 code must live in the INSTALLED dist. ---
+# The serve imports the SITE-PACKAGES copy (non-editable install, the
+# 2026-08-21 structural decision: checkouts stop affecting running code).
+# Workspace edits therefore need a container reinstall to take effect -
+# b2smoke 2026-09-04 ran "green" with ZERO compaction events exactly
+# because the patch was never loaded. Abort early instead of burning a
+# card on a serve that silently behaves like plain dense.
+if [ "$MODE" = "compact" ] && [ "${VLLM_ASCEND_STATIC_KV_COMPACT:-1}" = "1" ]; then
+  if ! (cd "$PROBE_DIR" && python3 -c 'import vllm_ascend.worker.static_kv_compact') 2>/dev/null; then
+    echo "COMPACT-PREFLIGHT-FAIL: the installed vllm-ascend dist has no"
+    echo "  vllm_ascend/worker/static_kv_compact.py - B1 code is only in the"
+    echo "  workspace checkout. Reinstall inside the container (csrc cache is"
+    echo "  reused; .py-only diffs take minutes):"
+    echo "    MAX_JOBS=32 pip install . --no-build-isolation"
+    exit 1
+  fi
+  echo "COMPACT-PREFLIGHT: static_kv_compact present in the installed dist"
+fi
 rm -rf "$PROBE_DIR"
 
 # --- pre-flight 2: NPU selection (shared server).

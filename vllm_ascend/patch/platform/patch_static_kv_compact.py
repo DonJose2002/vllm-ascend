@@ -12,6 +12,7 @@ strictly before the next schedule in sync mode) and ``KVCacheManager.free``
 
 from functools import wraps
 
+from vllm.logger import logger
 from vllm.v1.core.kv_cache_manager import KVCacheManager
 from vllm.v1.core.sched.scheduler import Scheduler
 
@@ -43,6 +44,14 @@ def install() -> None:
         return _original_free(self, request)
 
     KVCacheManager.free = _patched_free
+    # Install self-evidence: b2smoke 2026-09-04 ran green with ZERO compaction
+    # events because the serve imports the SITE-PACKAGES dist - this code was
+    # never loaded. A silent install cannot be distinguished from a tripped
+    # gate; this line makes "not installed" observable in every serve log.
+    logger.info(
+        "[static-kv-compact] scheduler hooks installed (research gate env=%s)",
+        static_kv_compact.ENABLED,
+    )
 
 
 install()
