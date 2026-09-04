@@ -367,11 +367,20 @@ def test_b2_script_wiring():
     assert 'TAG="npu-bf16-compact"' in base
     assert 'TIERS="16384,32768"' in base
     assert "VLLM_ASCEND_STATIC_KV_COMPACT" in base.split("Key envs:")[1]
-    # SUMMARY self-evidence: event count, release evidence, zero-event tell
-    assert 'grep -cF "[static-kv-compact]"' in base
+    # SUMMARY self-evidence: real events counted separately from install lines
+    # (b2smoke 2026-09-04: shared-prefix install lines masked the zero-event
+    # tell), diagnosis lines surfaced on zero events
+    assert 'grep -cF "[static-kv-compact] req="' in base
+    assert 'grep -cF "[static-kv-compact] scheduler hooks installed"' in base
     assert 'grep -E "KV cache usage"' in base
-    assert "ZERO [static-kv-compact] events with env=1" in base
+    assert "ZERO compaction events" in base
     assert "negative control" in base
+    assert "patch never ran" in base
+    # module-side observability: disable reason + active/candidate lines
+    module_src = (REPO_ROOT / "vllm_ascend" / "worker" / "static_kv_compact.py").read_text()
+    assert "coordinator disabled" in module_src
+    assert "coordinator active" in module_src
+    assert "first candidate seen" in module_src
     # installed-dist probe: workspace edits need a container reinstall
     # (b2smoke 2026-09-04 incident: serve imports site-packages, the patch
     # was never loaded, zero events)

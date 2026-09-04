@@ -441,24 +441,34 @@ on_exit() {
   else
     echo "# bench json missing AND serve log empty/missing at $SERVE_LOG"
   fi
-  # Phase 2 B-line self-evidence: unlike kvcomp, the coordinator DOES log one
-  # line per compaction. The harness counts them and surfaces the release
+  # Phase 2 B-line self-evidence: the coordinator logs one "req=" line per
+  # compaction (plus install/active/disabled diagnostics - counted separately,
+  # b2smoke 2026-09-04 lesson: a shared-prefix install line masked the
+  # zero-event tell). The harness counts real events, surfaces the release
   # evidence (vllm engine stats "GPU KV cache usage" should step DOWN after
-  # events - the pool itself is preallocated, so capacity, not HBM, moves).
+  # events - the pool itself is preallocated, so capacity, not HBM, moves),
+  # and on zero events prints the diagnosis lines that localize the break.
   if [ "$MODE" = "compact" ]; then
-    n_events="$(grep -cF "[static-kv-compact]" "$SERVE_LOG" 2>/dev/null || true)"
+    n_events="$(grep -cF "[static-kv-compact] req=" "$SERVE_LOG" 2>/dev/null || true)"
     n_events="${n_events:-0}"
+    n_install="$(grep -cF "[static-kv-compact] scheduler hooks installed" "$SERVE_LOG" 2>/dev/null || true)"
+    n_install="${n_install:-0}"
     if [ "$n_events" -gt 0 ]; then
-      echo "compact: $n_events events (first/last):"
-      grep -F "[static-kv-compact]" "$SERVE_LOG" | sed -n '1p;$p' | strip_log | sed 's/^/compact:   /'
+      echo "compact: $n_events compaction events (install lines: $n_install); first/last:"
+      grep -F "[static-kv-compact] req=" "$SERVE_LOG" | sed -n '1p;$p' | strip_log | sed 's/^/compact:   /'
       echo "compact: kv usage tail (release evidence, expect step DOWN after events):"
       grep -E "KV cache usage" "$SERVE_LOG" | tail -4 | strip_log | sed 's/^/compact:   /' || true
-    elif [ "${VLLM_ASCEND_STATIC_KV_COMPACT:-0}" = "1" ]; then
-      echo "compact: ZERO [static-kv-compact] events with env=1 - a structural gate tripped"
-      echo "compact:   (world_size!=1 / async / SD / prefix-caching on / multi KV group /"
-      echo "compact:    kv connector) or no prompt >= MIN_LEN. serve log: $SERVE_LOG"
     else
-      echo "compact: env=0 (negative control) - zero events expected by design"
+      echo "compact: ZERO compaction events (install lines: $n_install). Diagnosis:"
+      if [ "${VLLM_ASCEND_STATIC_KV_COMPACT:-0}" != "1" ]; then
+        echo "compact:   env=0 (negative control) - zero events expected by design"
+      else
+        grep -E "static-kv-compact. (coordinator|scheduler hooks)" "$SERVE_LOG" \
+          | tail -4 | strip_log | sed 's/^/compact:   /' || true
+        echo "compact:   no 'coordinator active/disabled' line above = patch never ran in"
+        echo "compact:   the EngineCore process (check install-line process prefixes in"
+        echo "compact:   $SERVE_LOG)"
+      fi
     fi
   fi
   # Phase 1.5 profiler section: aggregate traces IN PLACE (server-side), embed

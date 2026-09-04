@@ -25,11 +25,14 @@ context parallelism off, hamming sparse off.
 
 from __future__ import annotations
 
+import logging
 import math
 import os
 from dataclasses import dataclass
 
 import torch
+
+_log = logging.getLogger(__name__)
 
 ENV_MASTER = "VLLM_ASCEND_STATIC_KV_COMPACT"
 ENV_BUDGET_TOKENS = "VLLM_ASCEND_KV_COMPACT_BUDGET_TOKENS"
@@ -45,6 +48,8 @@ RECENT_BLOCKS = 4
 RECORDS: dict[str, CompactRecord] = {}
 _CHECKED: set[str] = set()
 _DISABLED_REASON: str | None = None
+_ACTIVE_LOGGED = False
+_CANDIDATE_LOGGED = False
 
 
 @dataclass
@@ -82,6 +87,7 @@ def disable(reason: str) -> None:
     global _DISABLED_REASON
     if _DISABLED_REASON is None:
         _DISABLED_REASON = reason
+        _log.warning("[static-kv-compact] coordinator disabled: %s", reason)
     RECORDS.clear()
 
 
@@ -200,6 +206,7 @@ def check_structural_gates(scheduler) -> bool:
 
 def maybe_compact_batch(scheduler, scheduler_output) -> None:
     """Scheduler-side entry: called from the wrapped update_from_output."""
+    global _ACTIVE_LOGGED, _CANDIDATE_LOGGED
     if not ENABLED or _DISABLED_REASON is not None:
         return
     if not check_structural_gates(scheduler):
@@ -207,6 +214,13 @@ def maybe_compact_batch(scheduler, scheduler_output) -> None:
     num_scheduled_tokens = scheduler_output.num_scheduled_tokens
     if not num_scheduled_tokens:
         return
+    if not _ACTIVE_LOGGED:
+        _ACTIVE_LOGGED = True
+        _log.info(
+            "[static-kv-compact] coordinator active (gates passed, min_len=%d budget=%d)",
+            MIN_PROMPT_LEN,
+            BUDGET_TOKENS,
+        )
     manager = scheduler.kv_cache_manager.coordinator.single_type_managers[0]
     block_size = manager.block_size
     for request_id in num_scheduled_tokens:
@@ -223,6 +237,15 @@ def maybe_compact_batch(scheduler, scheduler_output) -> None:
             continue
         blocks = manager.req_to_blocks.get(request_id)
         num_prompt_blocks = len(blocks) if blocks else 0
+        if not _CANDIDATE_LOGGED:
+            _CANDIDATE_LOGGED = True
+            _log.info(
+                "[static-kv-compact] first candidate seen: req=%s prompt=%d computed=%d blocks=%d",
+                request_id,
+                prompt_len,
+                request.num_computed_tokens,
+                num_prompt_blocks,
+            )
         keep = select_keep_positions(num_prompt_blocks, prompt_len, block_size)
         if keep is None:
             _CHECKED.add(request_id)
@@ -238,11 +261,14 @@ def maybe_compact_batch(scheduler, scheduler_output) -> None:
             dropped_tokens=prompt_len - kept_tokens,
             freed_blocks=freed,
         )
-        print(
-            f"[static-kv-compact] req={request_id} prompt={prompt_len} "
-            f"blocks={num_prompt_blocks} keep={len(keep)} kept_tokens={kept_tokens} "
-            f"freed={freed}",
-            flush=True,
+        _log.info(
+            "[static-kv-compact] req=%s prompt=%d blocks=%d keep=%d kept_tokens=%d freed=%d",
+            request_id,
+            prompt_len,
+            num_prompt_blocks,
+            len(keep),
+            kept_tokens,
+            freed,
         )
 
 
