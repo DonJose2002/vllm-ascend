@@ -355,6 +355,35 @@ def test_wiring_presence():
     assert "static_kv_compact.forget" in patch_file
 
 
+def test_b2_script_wiring():
+    base = (REPO_ROOT / "research" / "run_baseline_npu.sh").read_text()
+    # compact mode: env arming, hard prerequisite, axis defaults, usage
+    assert "  compact)" in base
+    assert 'export VLLM_ASCEND_STATIC_KV_COMPACT="${VLLM_ASCEND_STATIC_KV_COMPACT:-1}"' in base
+    assert 'EXTRA_SERVE_ARGS="${EXTRA_SERVE_ARGS:-} --no-enable-prefix-caching"' in base
+    assert 'TAG="npu-bf16-compact"' in base
+    assert 'TIERS="16384,32768"' in base
+    assert "VLLM_ASCEND_STATIC_KV_COMPACT" in base.split("Key envs:")[1]
+    # SUMMARY self-evidence: event count, release evidence, zero-event tell
+    assert 'grep -cF "[static-kv-compact]"' in base
+    assert 'grep -E "KV cache usage"' in base
+    assert "ZERO [static-kv-compact] events with env=1" in base
+    assert "negative control" in base
+
+    drv = (REPO_ROOT / "research" / "run_phase2.sh").read_text()
+    assert "b2smoke" in drv.split("Usage:")[1]
+    # graph-mode helper must NOT inject --enforce-eager (the bet)
+    run_graph_body = drv.split("run_graph() {")[1].split("\n}")[0]
+    assert "--enforce-eager" not in run_graph_body
+    assert 'EXTRA_SERVE_ARGS="${EXTRA_SERVE_ARGS:-}"' in run_graph_body
+    # b2smoke: compact first with NIAH, dense anchor caliber-matched, OUTROOT isolation
+    assert "run_graph compact 16384 1 NIAH=1" in drv
+    assert 'EXTRA_SERVE_ARGS="--no-enable-prefix-caching"' in drv
+    assert "run_graph dense 16384 1" in drv
+    assert 'OUTROOT_DEFAULT="experiments/out/phase2-b2"' in drv
+    assert "digest_b2" in drv
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     failed = 0

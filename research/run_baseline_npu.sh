@@ -31,6 +31,15 @@
 #        # expect hamming silently OFF -> behavior == plain ngram)
 #   NIAH=1 bash research/run_baseline_npu.sh hamming 8014             # also run the NIAH accuracy grid
 #        # on the same serve (needle_eval.py; result embedded in SUMMARY as niah: lines)
+#   bash research/run_baseline_npu.sh compact 8015                    # Phase 2 B-line: one-shot static
+#        # KV compaction with TRUE block release (B1, research). Graph mode by default (the
+#        # B2 bet: block table flows via the update_attn_params metadata channel). The mode
+#        # arms VLLM_ASCEND_STATIC_KV_COMPACT=1 and adds --no-enable-prefix-caching (HARD
+#        # prerequisite - a B1 gate; forgetting it silently disables compaction, the tell
+#        # is zero [static-kv-compact] lines). TIERS/CONCS default to 16384,32768 x 1,16
+#        # (MIN_PROMPT_LEN 8192 below never triggers). Triage: EXTRA_SERVE_ARGS="--enforce-eager"
+#        # isolates the graph bet; VLLM_ASCEND_STATIC_KV_COMPACT=0 = negative control
+#        # (plain dense + --no-enable-prefix-caching).
 #   PROFILER=1 PROFILE_ONLY=1 bash research/run_baseline_npu.sh dense 8010 # Phase 1.5 tax probe:
 #        # serve with --profiler-config (torch_npu wrapper), then ONE 4K/c1 decode window
 #        # bracketed by /start_profile //stop_profile (auto-bounded by max_iterations);
@@ -41,10 +50,12 @@
 #           PROFILER, PROFILE_ONLY, PROFILER_DIR, PROFILER_STEPS, PROFILER_ROUNDS,
 #           PROFILER_START_TOKENS, PROFILE_TIER,
 #           HAMMING_TOPK, KVCOMP_JSON (hamming modes), NIAH, NIAH_TIERS, NIAH_DEPTHS,
-#           NIAH_SAMPLES, NIAH_MAX_TOKENS
+#           NIAH_SAMPLES, NIAH_MAX_TOKENS,
+#           VLLM_ASCEND_STATIC_KV_COMPACT, VLLM_ASCEND_KV_COMPACT_BUDGET_TOKENS,
+#           VLLM_ASCEND_KV_COMPACT_MIN_LEN (compact mode)
 set -euo pipefail
 
-MODE="${1:?usage: run_baseline_npu.sh dense|sd|sda|ngram|eagle3|dflash|hamming|hammingsd PORT}"
+MODE="${1:?usage: run_baseline_npu.sh dense|sd|sda|ngram|eagle3|dflash|hamming|hammingsd|compact PORT}"
 PORT="${2:-8001}"
 MODEL="${NPU_MODEL:-/nfs-share/hf_weights/Qwen3-8B}"
 DRAFT="${NPU_DRAFT:-/nfs-share/hf_weights/Qwen3-0.6B}"
@@ -292,8 +303,27 @@ case "$MODE" in
       NOTE="$NOTE; +ngram SD = mutual-exclusion cell (expect hamming OFF, behavior == plain ngram)"
     fi
     ;;
+  compact)
+    # Phase 2 B-line (B1, research): one-shot static KV compaction with TRUE
+    # block release. The master gate is an ENV (not additional-config) because
+    # the scheduler patch installs at import time - exported here so every
+    # serve process (API server + EngineCore) inherits it. VLLM_ASCEND_...=0
+    # keeps the serve as plain dense + --no-enable-prefix-caching (negative
+    # control). --no-enable-prefix-caching is a HARD B1 gate: without it the
+    # coordinator silently disables itself (tell = zero [static-kv-compact]
+    # lines in the serve log / SUMMARY below). Graph mode stays DEFAULT -
+    # that IS the B2 bet; triage with EXTRA_SERVE_ARGS="--enforce-eager".
+    export VLLM_ASCEND_STATIC_KV_COMPACT="${VLLM_ASCEND_STATIC_KV_COMPACT:-1}"
+    EXTRA_SERVE_ARGS="${EXTRA_SERVE_ARGS:-} --no-enable-prefix-caching"
+    TAG="npu-bf16-compact"
+    NOTE="$NOTE; static kv compact (B1, budget=${VLLM_ASCEND_KV_COMPACT_BUDGET_TOKENS:-4096} tokens, min_len=${VLLM_ASCEND_KV_COMPACT_MIN_LEN:-8192}, env=$VLLM_ASCEND_STATIC_KV_COMPACT)"
+    # Compaction never triggers below MIN_PROMPT_LEN (default 8192): default
+    # the B-line matrix to 16K/32K x 1/16 unless the caller pinned the axes.
+    if [ -z "$TIERS_EXPLICIT" ]; then TIERS="16384,32768"; fi
+    if [ -z "$CONCS_EXPLICIT" ]; then CONCS="1,16"; fi
+    ;;
   *)
-    echo "unknown MODE '$MODE' (dense|sd|sda|ngram|eagle3|dflash)"; exit 1
+    echo "unknown MODE '$MODE' (dense|sd|sda|ngram|eagle3|dflash|hamming|hammingsd|compact)"; exit 1
     ;;
 esac
 
@@ -391,6 +421,26 @@ on_exit() {
     tail -10 "$SERVE_LOG" | strip_log | sed 's/^/  /'
   else
     echo "# bench json missing AND serve log empty/missing at $SERVE_LOG"
+  fi
+  # Phase 2 B-line self-evidence: unlike kvcomp, the coordinator DOES log one
+  # line per compaction. The harness counts them and surfaces the release
+  # evidence (vllm engine stats "GPU KV cache usage" should step DOWN after
+  # events - the pool itself is preallocated, so capacity, not HBM, moves).
+  if [ "$MODE" = "compact" ]; then
+    n_events="$(grep -cF "[static-kv-compact]" "$SERVE_LOG" 2>/dev/null || true)"
+    n_events="${n_events:-0}"
+    if [ "$n_events" -gt 0 ]; then
+      echo "compact: $n_events events (first/last):"
+      grep -F "[static-kv-compact]" "$SERVE_LOG" | sed -n '1p;$p' | strip_log | sed 's/^/compact:   /'
+      echo "compact: kv usage tail (release evidence, expect step DOWN after events):"
+      grep -E "KV cache usage" "$SERVE_LOG" | tail -4 | strip_log | sed 's/^/compact:   /' || true
+    elif [ "${VLLM_ASCEND_STATIC_KV_COMPACT:-0}" = "1" ]; then
+      echo "compact: ZERO [static-kv-compact] events with env=1 - a structural gate tripped"
+      echo "compact:   (world_size!=1 / async / SD / prefix-caching on / multi KV group /"
+      echo "compact:    kv connector) or no prompt >= MIN_LEN. serve log: $SERVE_LOG"
+    else
+      echo "compact: env=0 (negative control) - zero events expected by design"
+    fi
   fi
   # Phase 1.5 profiler section: aggregate traces IN PLACE (server-side), embed
   # the compact TSV in this paste block - trace files never leave the server.

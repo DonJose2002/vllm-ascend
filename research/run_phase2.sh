@@ -5,7 +5,7 @@
 # and prints a paste-ready digest (per-JSON TSV + NIAH curve + ITL delta table
 # + mutual-exclusion 3-way compare) at the end.
 #
-# Usage:  bash research/run_phase2.sh smoke|cline|digest [start_port]
+# Usage:  bash research/run_phase2.sh smoke|cline|b2smoke|digest [start_port]
 #   smoke : single 16K/c1 topk4096 eager cell (first-run validation only -
 #           already PASSED 2026-09-01 on NPU2; kept for re-runs on new hosts)
 #   cline : the full eager matrix, 6 serves (~1 evening):
@@ -13,15 +13,27 @@
 #             2-4. hamming topk {2048,4096,8192}  16K/32K x 1/16 + NIAH
 #             5. hammingsd topk4096 (+ngram SD K=5) - mutual-exclusion cell
 #             6. ngram   eager anchor K=5 - the exclusion compare target
+#   b2smoke: Phase 2 B-line B2 smoke, GRAPH mode (the bet!), 2 serves (~15 min):
+#             1. compact 16K/c1 + NIAH(16K/32K on same serve) - verifies:
+#                graph-mode serve survives (update_attn_params channel bet),
+#                [static-kv-compact] self-evidence lines + KV-usage drop,
+#                NIAH quality ~ topk4096 class (conservative selector)
+#             2. dense 16K/c1 with --no-enable-prefix-caching - same-caliber
+#                latency anchor (prefix state matches run 1; ITL delta ~0
+#                expected at this corner - weights dominate, not a failure)
+#           If run 1 dies during capture/replay, triage in eager (hint printed
+#           at the end); eager green + graph red = bet lost, report the logs.
 #   digest: analysis only (no serves, no card) over JSONs under experiments/out/phase2
 #
-# WHY EAGER EVERYWHERE: the first graph-mode smoke crashed with an aivec
-# (vector core invalid GM) during FULL-graph capture warmup - the kvcomp
+# WHY EAGER EVERYWHERE (cline only): the first graph-mode smoke crashed with an
+# aivec (vector core invalid GM) during FULL-graph capture warmup - the kvcomp
 # decode path mutates/reassigns tensors per layer/step (hamming_output et al),
 # which cannot be safely captured; upstream later removed the whole feature
 # (#12049, not in v0.23.0). Eager is the only validated mode for hamming on
 # v0.23.0, so ALL cline cells (anchors included) run --enforce-eager for a
 # same-mode comparison. Graph-mode numbers from Phase 0/1 are NOT comparable.
+# B-line static compaction has NO per-forward mutation (metadata-level view
+# only), so b2smoke runs graph mode by design - that difference is the point.
 #
 # Output isolation: experiments/out/phase2/ - Phase 0/1 JSONs are never
 # clobbered (hamming TAGs are unique, but discipline is discipline).
@@ -31,9 +43,15 @@
 # drain after each serve, no core dumps, capped inductor threads.
 set -uo pipefail
 
-BATCH="${1:?usage: run_phase2.sh smoke|cline|digest [start_port]}"
+BATCH="${1:?usage: run_phase2.sh smoke|cline|b2smoke|digest [start_port]}"
 PORT="${2:-8130}"
-OUTROOT="${OUTROOT:-experiments/out/phase2}"
+# Output isolation: b2smoke reuses the dense TAG, so it MUST live in its own
+# directory (phase2-b2) or it would clobber the cline eager JSONs.
+case "$BATCH" in
+  b2smoke) OUTROOT_DEFAULT="experiments/out/phase2-b2" ;;
+  *)       OUTROOT_DEFAULT="experiments/out/phase2" ;;
+esac
+OUTROOT="${OUTROOT:-$OUTROOT_DEFAULT}"
 mkdir -p "$OUTROOT"
 MASTER="$OUTROOT/phase2-${BATCH}-$(date +%Y%m%d-%H%M).log"
 
@@ -135,6 +153,23 @@ run() {
   drain_card
 }
 
+# run_graph <mode> <tiers> <concs> [env=val ...] - one GRAPH-mode call (B2 bet:
+# no --enforce-eager injected). Extra serve flags come via the EXTRA_SERVE_ARGS
+# shell variable read at call time (e.g. the dense anchor's
+# --no-enable-prefix-caching); pass nothing for compact - the mode itself adds it.
+run_graph() {
+  local mode="$1" tiers="$2" concs="$3"; shift 3
+  PORT=$((PORT + 1))
+  banner "RUN graph mode=$mode tiers=$tiers concs=$concs port=$PORT outdir=$OUTROOT envs=$* $(date +%H:%M:%S)"
+  wait_host_ram
+  env -u VLLM_ASCEND_SD_REVIVE_RACE -u VLLM_ASCEND_SD_COUNTERS -u VLLM_ASCEND_SD_DEBUG \
+    "$@" TIERS="$tiers" CONCS="$concs" SAVE_TS=1 OUTDIR="$OUTROOT" \
+    EXTRA_SERVE_ARGS="${EXTRA_SERVE_ARGS:-}" \
+    bash research/run_baseline_npu.sh "$mode" "$PORT" 2>&1 | tee -a "$MASTER"
+  pkill -TERM -f "vllm serve.*--port $PORT" 2>/dev/null || true
+  drain_card
+}
+
 BENCH="$OUTROOT/baseline-npu-qwen3-8b"
 NIAHJSON="$OUTROOT/niah"
 
@@ -212,6 +247,43 @@ PYEOF
   } 2>&1 | tee -a "$MASTER"
 }
 
+digest_b2() {
+  banner "DIGEST (phase2 b2smoke, graph mode) $(date +%H:%M:%S)"
+  {
+    echo "--- per-file TSV ---"
+    ls "$BENCH"-*.json >/dev/null 2>&1 && \
+      python3 research/bench_baseline.py summary "$BENCH"-*.json
+    echo
+    echo "--- NIAH curve (compact, conservative selector; C-line refs: dense 1.0, topk4096 1.0) ---"
+    if [ -f "$NIAHJSON-npu-bf16-compact.json" ]; then
+      python3 research/needle_eval.py curve "$NIAHJSON-npu-bf16-compact.json" 2>&1
+    else
+      echo "no compact NIAH json"
+    fi
+    echo
+    echo "--- B2 compact vs dense (both graph + --no-enable-prefix-caching) ---"
+    python3 - "$BENCH" <<'PYEOF'
+import json, sys, os
+bench_prefix = sys.argv[1]
+def cells(tag):
+    p = f"{bench_prefix}-{tag}.json"
+    if not os.path.exists(p):
+        return None
+    return {(c["tier"], c["conc"]): c for c in json.load(open(p))["cells"]}
+comp, dn = cells("npu-bf16-compact"), cells("npu-bf16-dense")
+if not comp:
+    print("compact json missing - delta table skipped"); raise SystemExit
+print("tag\ttier\tconc\titl50\touts")
+for key in sorted(comp):
+    c = comp[key]
+    print(f"compact\t{key[0]}\t{key[1]}\t{c.get('itl_ms_p50')}\t{c.get('aggregate_out_tok_per_s')}")
+    d = dn.get(key) if dn else None
+    if d:
+        print(f"dense\t{key[0]}\t{key[1]}\t{d.get('itl_ms_p50')}\t{d.get('aggregate_out_tok_per_s')}")
+PYEOF
+  } 2>&1 | tee -a "$MASTER"
+}
+
 case "$BATCH" in
   smoke)
     pin_npus
@@ -226,9 +298,32 @@ case "$BATCH" in
     run hammingsd 16384,32768 1,16 HAMMING_TOPK=4096
     run ngram   16384,32768 1,16
     ;;
+  b2smoke)
+    pin_npus
+    # 1. THE BET: graph mode + static compaction. 16K/c1 bench; the NIAH grid
+    #    covers BOTH tiers on the same serve (32K prompts also compact ->
+    #    more events + 32K quality). Judgment: serve alive, [static-kv-compact]
+    #    lines present with sane numbers, KV usage steps down, NIAH >= 0.9.
+    run_graph compact 16384 1 NIAH=1
+    # 2. Same-caliber latency anchor: graph dense with prefix caching off
+    #    (matches run 1's serve caliber; isolates compaction as the variable).
+    #    ITL delta ~0 at this corner is EXPECTED (weights dominate) - B3's
+    #    32K/c16 cell is where the bandwidth win should show.
+    EXTRA_SERVE_ARGS="--no-enable-prefix-caching"
+    run_graph dense 16384 1
+    unset EXTRA_SERVE_ARGS
+    echo "" | tee -a "$MASTER"
+    echo "b2smoke triage: if run 1 died during graph capture/replay, isolate the bet:" | tee -a "$MASTER"
+    echo "  EXTRA_SERVE_ARGS='--enforce-eager' NPUS=\$NPUS bash research/run_baseline_npu.sh compact 8141" | tee -a "$MASTER"
+    echo "  eager green + graph red = bet lost (paste serve log tail); eager red = deeper bug." | tee -a "$MASTER"
+    ;;
   digest)
     ;;
-  *) echo "unknown BATCH '$BATCH' (smoke|cline|digest)"; exit 1 ;;
+  *) echo "unknown BATCH '$BATCH' (smoke|cline|b2smoke|digest)"; exit 1 ;;
 esac
 
-digest
+if [ "$BATCH" = "b2smoke" ]; then
+  digest_b2
+else
+  digest
+fi
