@@ -376,11 +376,12 @@ def test_b2_script_wiring():
     assert "ZERO compaction events" in base
     assert "negative control" in base
     assert "patch never ran" in base
-    # module-side observability: disable reason + active/candidate lines
+    # module-side observability: hook-seen / disable reason / active/candidate lines
     module_src = (REPO_ROOT / "vllm_ascend" / "worker" / "static_kv_compact.py").read_text()
     assert "coordinator disabled" in module_src
     assert "coordinator active" in module_src
     assert "first candidate seen" in module_src
+    assert "update_from_output hook observed" in module_src
     # installed-dist probe: workspace edits need a container reinstall
     # (b2smoke 2026-09-04 incident: serve imports site-packages, the patch
     # was never loaded, zero events)

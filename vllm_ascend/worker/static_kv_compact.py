@@ -50,6 +50,7 @@ _CHECKED: set[str] = set()
 _DISABLED_REASON: str | None = None
 _ACTIVE_LOGGED = False
 _CANDIDATE_LOGGED = False
+_HOOK_SEEN_LOGGED = False
 
 
 @dataclass
@@ -206,7 +207,10 @@ def check_structural_gates(scheduler) -> bool:
 
 def maybe_compact_batch(scheduler, scheduler_output) -> None:
     """Scheduler-side entry: called from the wrapped update_from_output."""
-    global _ACTIVE_LOGGED, _CANDIDATE_LOGGED
+    global _ACTIVE_LOGGED, _CANDIDATE_LOGGED, _HOOK_SEEN_LOGGED
+    if not _HOOK_SEEN_LOGGED:
+        _HOOK_SEEN_LOGGED = True
+        _log.info("[static-kv-compact] update_from_output hook observed (engine stepping)")
     if not ENABLED or _DISABLED_REASON is not None:
         return
     if not check_structural_gates(scheduler):
