@@ -34,12 +34,18 @@
 #   bash research/run_baseline_npu.sh compact 8015                    # Phase 2 B-line: one-shot static
 #        # KV compaction with TRUE block release (B1, research). Graph mode by default (the
 #        # B2 bet: block table flows via the update_attn_params metadata channel). The mode
-#        # arms VLLM_ASCEND_STATIC_KV_COMPACT=1 and adds --no-enable-prefix-caching (HARD
-#        # prerequisite - a B1 gate; forgetting it silently disables compaction, the tell
-#        # is zero [static-kv-compact] lines). TIERS/CONCS default to 16384,32768 x 1,16
-#        # (MIN_PROMPT_LEN 8192 below never triggers). Triage: EXTRA_SERVE_ARGS="--enforce-eager"
-#        # isolates the graph bet; VLLM_ASCEND_STATIC_KV_COMPACT=0 = negative control
-#        # (plain dense + --no-enable-prefix-caching).
+#        # arms VLLM_ASCEND_STATIC_KV_COMPACT=1 and adds --no-enable-prefix-caching AND
+#        # --no-async-scheduling (both HARD B1 gates; vllm v0.23.0 resolves async_scheduling
+#        # None->True by default - config/vllm.py:957-997 - so WITHOUT the flag the
+#        # coordinator silently disables itself; 2026-09-09 b2smoke lesson, tell = the
+#        # "coordinator disabled: async_scheduling enabled" line). TIERS/CONCS default to
+#        # 16384,32768 x 1,16 (MIN_PROMPT_LEN 8192 below never triggers). Triage:
+#        # EXTRA_SERVE_ARGS="--enforce-eager" isolates the graph bet;
+#        # VLLM_ASCEND_STATIC_KV_COMPACT=0 = negative control (plain dense, both flags kept
+#        # so the control stays same-caliber).
+#   NO_ASYNC=1 bash research/run_baseline_npu.sh dense 8016            # append --no-async-scheduling
+#        # to ANY mode (B-line same-caliber anchors; all pre-B baselines ran async-ON,
+#        # vllm default - comparisons across the two calibers need this stated)
 #   PROFILER=1 PROFILE_ONLY=1 bash research/run_baseline_npu.sh dense 8010 # Phase 1.5 tax probe:
 #        # serve with --profiler-config (torch_npu wrapper), then ONE 4K/c1 decode window
 #        # bracketed by /start_profile //stop_profile (auto-bounded by max_iterations);
@@ -52,7 +58,7 @@
 #           HAMMING_TOPK, KVCOMP_JSON (hamming modes), NIAH, NIAH_TIERS, NIAH_DEPTHS,
 #           NIAH_SAMPLES, NIAH_MAX_TOKENS,
 #           VLLM_ASCEND_STATIC_KV_COMPACT, VLLM_ASCEND_KV_COMPACT_BUDGET_TOKENS,
-#           VLLM_ASCEND_KV_COMPACT_MIN_LEN (compact mode)
+#           VLLM_ASCEND_KV_COMPACT_MIN_LEN (compact mode), NO_ASYNC (any mode)
 set -euo pipefail
 
 MODE="${1:?usage: run_baseline_npu.sh dense|sd|sda|ngram|eagle3|dflash|hamming|hammingsd|compact PORT}"
@@ -333,9 +339,15 @@ case "$MODE" in
     # lines in the serve log / SUMMARY below). Graph mode stays DEFAULT -
     # that IS the B2 bet; triage with EXTRA_SERVE_ARGS="--enforce-eager".
     export VLLM_ASCEND_STATIC_KV_COMPACT="${VLLM_ASCEND_STATIC_KV_COMPACT:-1}"
-    EXTRA_SERVE_ARGS="${EXTRA_SERVE_ARGS:-} --no-enable-prefix-caching"
+    # Two HARD B1 gates go on the serve line unconditionally (even for the
+    # env=0 negative control, so control vs armed stays same-caliber):
+    #  - --no-enable-prefix-caching: gate #1 (caching re-anchors freed blocks)
+    #  - --no-async-scheduling: gate #2 (vllm v0.23.0 default is async-ON via
+    #    the None->True resolution in config/vllm.py:957-997; compaction must
+    #    run strictly between step N and N+1, which async scheduling breaks)
+    EXTRA_SERVE_ARGS="${EXTRA_SERVE_ARGS:-} --no-enable-prefix-caching --no-async-scheduling"
     TAG="npu-bf16-compact"
-    NOTE="$NOTE; static kv compact (B1, budget=${VLLM_ASCEND_KV_COMPACT_BUDGET_TOKENS:-4096} tokens, min_len=${VLLM_ASCEND_KV_COMPACT_MIN_LEN:-8192}, env=$VLLM_ASCEND_STATIC_KV_COMPACT)"
+    NOTE="$NOTE; static kv compact (B1, budget=${VLLM_ASCEND_KV_COMPACT_BUDGET_TOKENS:-4096} tokens, min_len=${VLLM_ASCEND_KV_COMPACT_MIN_LEN:-8192}, env=$VLLM_ASCEND_STATIC_KV_COMPACT, async=off)"
     # Compaction never triggers below MIN_PROMPT_LEN (default 8192): default
     # the B-line matrix to 16K/32K x 1/16 unless the caller pinned the axes.
     if [ -z "$TIERS_EXPLICIT" ]; then TIERS="16384,32768"; fi
@@ -345,6 +357,15 @@ case "$MODE" in
     echo "unknown MODE '$MODE' (dense|sd|sda|ngram|eagle3|dflash|hamming|hammingsd|compact)"; exit 1
     ;;
 esac
+
+# NO_ASYNC=1: append --no-async-scheduling to any mode (B-line same-caliber
+# anchors; compact already adds it above - guard prevents duplication).
+if [ "${NO_ASYNC:-0}" = "1" ]; then
+  case "$EXTRA_SERVE_ARGS" in
+    *--no-async-scheduling*) ;;
+    *) EXTRA_SERVE_ARGS="${EXTRA_SERVE_ARGS:-} --no-async-scheduling" ;;
+  esac
+fi
 
 # Append the seed-profile suffix to the FINAL tag (post-case; see note above).
 if [ "$SEED_PROFILE" != "generic" ]; then
@@ -422,6 +443,9 @@ on_exit() {
   if [ -s "$SERVE_LOG" ]; then
     grep -E "Available KV cache memory|GPU KV cache size|model weights take|Maximum concurrency|Wrapping draft model|drafter FULL graph enabled|drafter sizes|Capturing CUDA graphs" \
       "$SERVE_LOG" | tail -6 | strip_log | sed 's/^/cfg: /'
+    # scheduling caliber self-evidence (vllm logs it once at config init);
+    # B-line runs async-off, all pre-B baselines ran async-on (vllm default)
+    grep -m1 "Asynchronous scheduling is" "$SERVE_LOG" | strip_log | sed 's/^/cfg: /' || true
     # race-counter readout (last line wins; engaged lines excluded)
     grep "SD-counters" "$SERVE_LOG" | grep -v "engaged" | tail -2 | strip_log | sed 's/^/counters: /' || true
   else

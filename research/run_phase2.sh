@@ -18,9 +18,15 @@
 #                graph-mode serve survives (update_attn_params channel bet),
 #                [static-kv-compact] self-evidence lines + KV-usage drop,
 #                NIAH quality ~ topk4096 class (conservative selector)
-#             2. dense 16K/c1 with --no-enable-prefix-caching - same-caliber
-#                latency anchor (prefix state matches run 1; ITL delta ~0
-#                expected at this corner - weights dominate, not a failure)
+#             2. dense 16K/c1 with --no-enable-prefix-caching + --no-async-
+#                scheduling - same-caliber latency anchor (prefix + scheduling
+#                state match run 1; ITL delta ~0 expected at this corner -
+#                weights dominate, not a failure). BOTH async-off: vllm v0.23.0
+#                defaults async-ON (None->True, config/vllm.py:957-997; the
+#                2026-09-09 b2smoke lesson - coordinator disabled, zero events)
+#                and B1 gate #2 requires sync steps. Side product: dense(async-
+#                off) vs the 09-09 dense(async-on) 16K/c1 ITL quantifies the
+#                async-scheduling tax for free.
 #           If run 1 dies during capture/replay, triage in eager (hint printed
 #           at the end); eager green + graph red = bet lost, report the logs.
 #   digest: analysis only (no serves, no card) over JSONs under experiments/out/phase2
@@ -261,7 +267,7 @@ digest_b2() {
       echo "no compact NIAH json"
     fi
     echo
-    echo "--- B2 compact vs dense (both graph + --no-enable-prefix-caching) ---"
+    echo "--- B2 compact vs dense (both graph + --no-enable-prefix-caching + --no-async-scheduling) ---"
     python3 - "$BENCH" <<'PYEOF'
 import json, sys, os
 bench_prefix = sys.argv[1]
@@ -305,12 +311,14 @@ case "$BATCH" in
     #    more events + 32K quality). Judgment: serve alive, [static-kv-compact]
     #    lines present with sane numbers, KV usage steps down, NIAH >= 0.9.
     run_graph compact 16384 1 NIAH=1
-    # 2. Same-caliber latency anchor: graph dense with prefix caching off
-    #    (matches run 1's serve caliber; isolates compaction as the variable).
-    #    ITL delta ~0 at this corner is EXPECTED (weights dominate) - B3's
-    #    32K/c16 cell is where the bandwidth win should show.
+    # 2. Same-caliber latency anchor: graph dense with prefix caching off AND
+    #    async scheduling off (both match run 1's serve caliber - compact adds
+    #    both flags itself; NO_ASYNC=1 does it for dense here and shows in the
+    #    banner). Isolates compaction as the variable. ITL delta ~0 at this
+    #    corner is EXPECTED (weights dominate) - B3's 32K/c16 cell is where
+    #    the bandwidth win should show.
     EXTRA_SERVE_ARGS="--no-enable-prefix-caching"
-    run_graph dense 16384 1
+    run_graph dense 16384 1 NO_ASYNC=1
     unset EXTRA_SERVE_ARGS
     echo "" | tee -a "$MASTER"
     echo "b2smoke triage: if run 1 died during graph capture/replay, isolate the bet:" | tee -a "$MASTER"

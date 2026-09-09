@@ -363,7 +363,10 @@ def test_b2_script_wiring():
     # compact mode: env arming, hard prerequisite, axis defaults, usage
     assert "  compact)" in base
     assert 'export VLLM_ASCEND_STATIC_KV_COMPACT="${VLLM_ASCEND_STATIC_KV_COMPACT:-1}"' in base
-    assert 'EXTRA_SERVE_ARGS="${EXTRA_SERVE_ARGS:-} --no-enable-prefix-caching"' in base
+    # both HARD B1 gates on the serve line (2026-09-09 b2smoke lesson:
+    # vllm v0.23.0 defaults async-ON via None->True, config/vllm.py:957-997,
+    # so the flag must be explicit or the coordinator silently disables)
+    assert 'EXTRA_SERVE_ARGS="${EXTRA_SERVE_ARGS:-} --no-enable-prefix-caching --no-async-scheduling"' in base
     assert 'TAG="npu-bf16-compact"' in base
     assert 'TIERS="16384,32768"' in base
     assert "VLLM_ASCEND_STATIC_KV_COMPACT" in base.split("Key envs:")[1]
@@ -388,6 +391,9 @@ def test_b2_script_wiring():
     assert "COMPACT-PREFLIGHT-FAIL" in base
     assert "import vllm_ascend.worker.static_kv_compact" in base
     assert "MAX_JOBS=32 pip install . --no-build-isolation" in base
+    # async caliber: generic knob (dedup-guarded) + SUMMARY self-evidence line
+    assert 'if [ "${NO_ASYNC:-0}" = "1" ]' in base
+    assert 'grep -m1 "Asynchronous scheduling is"' in base
 
     drv = (REPO_ROOT / "research" / "run_phase2.sh").read_text()
     assert "b2smoke" in drv.split("Usage:")[1]
@@ -395,10 +401,12 @@ def test_b2_script_wiring():
     run_graph_body = drv.split("run_graph() {")[1].split("\n}")[0]
     assert "--enforce-eager" not in run_graph_body
     assert 'EXTRA_SERVE_ARGS="${EXTRA_SERVE_ARGS:-}"' in run_graph_body
-    # b2smoke: compact first with NIAH, dense anchor caliber-matched, OUTROOT isolation
+    # b2smoke: compact first with NIAH, dense anchor caliber-matched (prefix
+    # caching + async scheduling both off, NO_ASYNC=1 shows in the banner),
+    # OUTROOT isolation
     assert "run_graph compact 16384 1 NIAH=1" in drv
     assert 'EXTRA_SERVE_ARGS="--no-enable-prefix-caching"' in drv
-    assert "run_graph dense 16384 1" in drv
+    assert "run_graph dense 16384 1 NO_ASYNC=1" in drv
     assert 'OUTROOT_DEFAULT="experiments/out/phase2-b2"' in drv
     assert "digest_b2" in drv
 
