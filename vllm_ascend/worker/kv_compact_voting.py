@@ -43,6 +43,7 @@ _RUNNER = None
 _HOOKS: list = []
 _HOOKS_FAILED = False
 _FIRST_VOTE_LOGGED = False
+_RAW_FWD_LOGGED = False
 
 
 def _resolve_model(runner):
@@ -65,11 +66,18 @@ def raw_model_forward(runner, **model_inputs):
     run 6/7 evidence. Calling .forward directly bypasses __call__ entirely
     and runs plain python, so the vote hooks actually fire.
     """
+    global _RAW_FWD_LOGGED
     model = _resolve_model(runner)
     fwd = getattr(model, "forward", None)
     if not callable(fwd):
         raise RuntimeError(f"no python forward on {type(model).__name__}; dwvote cannot run")
-    return fwd(**model_inputs)
+    if not _RAW_FWD_LOGGED:
+        _log.warning("[kv-compact-voting] raw forward start (model=%s)", type(model).__name__)
+    out = fwd(**model_inputs)
+    if not _RAW_FWD_LOGGED:
+        _RAW_FWD_LOGGED = True
+        _log.warning("[kv-compact-voting] raw forward end OK")
+    return out
 
 
 def needs_eager_step() -> bool:
