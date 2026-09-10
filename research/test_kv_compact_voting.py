@@ -83,6 +83,7 @@ def reset_all():
     kcv._RUNNER = None
     kcv._HOOKS.clear()
     kcv._HOOKS_FAILED = False
+    kcv._FIRST_VOTE_LOGGED = False
 
 
 try:
@@ -260,6 +261,8 @@ def test_runner_wiring_assertions():
     runner_src = (_HERE.parent / "vllm_ascend" / "worker" / "model_runner_v1.py").read_text()
     assert "kv_compact_voting.needs_eager_step()" in runner_src
     assert "kv_compact_voting.maybe_install(self)" in runner_src
+    assert "torch.compiler.disable()" in runner_src
+    assert "first vote recorded" in (_HERE.parent / "vllm_ascend" / "worker" / "kv_compact_voting.py").read_text()
     base = (_HERE / "run_baseline_npu.sh").read_text()
     assert "VLLM_ASCEND_KV_COMPACT_SELECTOR:-dwvote" in base
     assert "VLLM_ASCEND_KV_COMPACT_VOTE_STEPS:-8" in base

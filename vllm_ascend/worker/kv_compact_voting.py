@@ -42,6 +42,7 @@ _log = logging.getLogger(__name__)
 _RUNNER = None
 _HOOKS: list = []
 _HOOKS_FAILED = False
+_FIRST_VOTE_LOGGED = False
 
 
 def needs_eager_step() -> bool:
@@ -137,5 +138,13 @@ def _vote_layer(runner, attn, layer_idx: int, positions, hidden, pend) -> None:
         probs = torch.softmax(torch.matmul(q_grouped, keys.transpose(1, 2)) * attn.scaling, dim=-1)
         block_votes = probs.sum(dim=(0, 1)).view(pv.num_prompt_blocks, block_size).max(dim=1).values
         pv.votes_dev += block_votes
+        global _FIRST_VOTE_LOGGED
+        if not _FIRST_VOTE_LOGGED:
+            _FIRST_VOTE_LOGGED = True
+            _log.warning(
+                "[kv-compact-voting] first vote recorded (layer=%d pending=%d)",
+                layer_idx,
+                len(pend),
+            )
         if layer_idx == 0:
             pv.vote_steps += 1

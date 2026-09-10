@@ -2335,9 +2335,19 @@ class NPUModelRunner(GPUModelRunner):
         ):
             if self.cache_config.mamba_cache_mode == "align":
                 mamba_utils.do_mamba_copy_block(preprocess_bufs)
-            hidden_states = self._model_forward(
-                num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
-            )
+            if kv_compact_voting.needs_eager_step():
+                # Static KV compaction B1.5 (research): the dwvote hooks only
+                # fire in a genuinely uncompiled call - FULL mode sets
+                # splitting_ops=[] (platform.py), so attention lives INSIDE the
+                # compiled region and even graph-free steps skip python hooks.
+                with torch.compiler.disable():
+                    hidden_states = self._model_forward(
+                        num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
+                    )
+            else:
+                hidden_states = self._model_forward(
+                    num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
+                )
         with record_function_or_nullcontext("post process"):
             aux_hidden_states = None
             if self.use_aux_hidden_state_outputs:
