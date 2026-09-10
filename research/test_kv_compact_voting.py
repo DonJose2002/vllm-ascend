@@ -261,11 +261,39 @@ def test_runner_wiring_assertions():
     runner_src = (_HERE.parent / "vllm_ascend" / "worker" / "model_runner_v1.py").read_text()
     assert "kv_compact_voting.needs_eager_step()" in runner_src
     assert "kv_compact_voting.maybe_install(self)" in runner_src
-    assert 'set_stance("force_eager")' in runner_src
+    assert "kv_compact_voting.raw_model_forward(" in runner_src
     assert "first vote recorded" in (_HERE.parent / "vllm_ascend" / "worker" / "kv_compact_voting.py").read_text()
     base = (_HERE / "run_baseline_npu.sh").read_text()
     assert "VLLM_ASCEND_KV_COMPACT_SELECTOR:-dwvote" in base
     assert "VLLM_ASCEND_KV_COMPACT_VOTE_STEPS:-8" in base
+
+
+class _FakeWrappedModel:
+    def __init__(self):
+        self.called = []
+
+    def forward(self, **kwargs):
+        self.called.append(kwargs)
+        return "raw-ok"
+
+
+class _FakeWrapper:
+    def __init__(self, runnable):
+        self.runnable = runnable
+
+    def unwrap(self):
+        return self.runnable
+
+    def __call__(self, **kwargs):
+        raise AssertionError("compiled __call__ must not be used")
+
+
+def test_raw_model_forward_bypasses_call():
+    inner = _FakeWrappedModel()
+    runner = types.SimpleNamespace(model=_FakeWrapper(inner))
+    out = kcv.raw_model_forward(runner, input_ids=1, positions=2)
+    assert out == "raw-ok"
+    assert inner.called == [{"input_ids": 1, "positions": 2}]
 
 
 def main():

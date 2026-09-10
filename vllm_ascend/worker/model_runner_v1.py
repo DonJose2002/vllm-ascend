@@ -2337,16 +2337,19 @@ class NPUModelRunner(GPUModelRunner):
                 mamba_utils.do_mamba_copy_block(preprocess_bufs)
             if kv_compact_voting.needs_eager_step():
                 # Static KV compaction B1.5 (research): the dwvote hooks only
-                # fire in a genuinely uncompiled call - FULL mode sets
-                # splitting_ops=[] (platform.py), so attention lives INSIDE the
-                # compiled region and even graph-free steps skip python hooks.
-                # NOTE: torch.compiler.disable() raises on torch>=2.6 when used
-                # as a ctx manager (raise_on_ctx_manager_usage); the supported
-                # form is set_stance("force_eager") - verified hooks fire.
-                with torch.compiler.set_stance("force_eager"):
-                    hidden_states = self._model_forward(
-                        num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
-                    )
+                # fire in a plain-python forward. FULL mode sets splitting_ops=[]
+                # (platform.py) and the model is a TorchCompileWithNoGuardsWrapper
+                # whose __call__ ALWAYS dispatches to the compiled artifact, so
+                # neither NONE mode nor dynamo stances ever run python (runs 6/7).
+                # Bypass __call__ and invoke the original forward directly.
+                hidden_states = kv_compact_voting.raw_model_forward(
+                    self,
+                    input_ids=input_ids,
+                    positions=positions,
+                    intermediate_tensors=intermediate_tensors,
+                    inputs_embeds=inputs_embeds,
+                    **model_kwargs,
+                )
             else:
                 hidden_states = self._model_forward(
                     num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs

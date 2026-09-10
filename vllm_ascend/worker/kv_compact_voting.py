@@ -45,6 +45,33 @@ _HOOKS_FAILED = False
 _FIRST_VOTE_LOGGED = False
 
 
+def _resolve_model(runner):
+    """The underlying (possibly compile-wrapped) model, ACLGraphWrapper off."""
+    model = runner.model
+    unwrap = getattr(model, "unwrap", None)  # ACLGraphWrapper
+    if callable(unwrap):
+        model = unwrap()
+    return model
+
+
+def raw_model_forward(runner, **model_inputs):
+    """Call the model's ORIGINAL python forward for dwvote steps.
+
+    The runnable inside ACLGraphWrapper is a TorchCompileWithNoGuardsWrapper
+    mix-in (vllm support_torch_compile monkeypatches it into the model's
+    bases): its __call__ always dispatches to the compiled artifact (guards
+    dropped / bytecode dispatch), so neither CUDAGraphMode.NONE nor dynamo
+    stances (force_eager) ever reach a python-executing forward - b2smoke
+    run 6/7 evidence. Calling .forward directly bypasses __call__ entirely
+    and runs plain python, so the vote hooks actually fire.
+    """
+    model = _resolve_model(runner)
+    fwd = getattr(model, "forward", None)
+    if not callable(fwd):
+        raise RuntimeError(f"no python forward on {type(model).__name__}; dwvote cannot run")
+    return fwd(**model_inputs)
+
+
 def needs_eager_step() -> bool:
     """execute_model override input: any request still inside its vote window."""
     if not (skc.ENABLED and skc.SELECTOR == "dwvote"):
@@ -57,10 +84,7 @@ def maybe_install(runner) -> None:
     global _RUNNER, _HOOKS_FAILED
     if _HOOKS or _HOOKS_FAILED:
         return
-    model = runner.model
-    unwrap = getattr(model, "unwrap", None)  # ACLGraphWrapper
-    if callable(unwrap):
-        model = unwrap()
+    model = _resolve_model(runner)
     layers = getattr(getattr(model, "model", None), "layers", None)
     if layers is None:
         _fail_open("model layers not found on runner.model")
