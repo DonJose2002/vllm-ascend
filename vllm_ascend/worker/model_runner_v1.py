@@ -2340,7 +2340,10 @@ class NPUModelRunner(GPUModelRunner):
                 # fire in a genuinely uncompiled call - FULL mode sets
                 # splitting_ops=[] (platform.py), so attention lives INSIDE the
                 # compiled region and even graph-free steps skip python hooks.
-                with torch.compiler.disable():
+                # NOTE: torch.compiler.disable() raises on torch>=2.6 when used
+                # as a ctx manager (raise_on_ctx_manager_usage); the supported
+                # form is set_stance("force_eager") - verified hooks fire.
+                with torch.compiler.set_stance("force_eager"):
                     hidden_states = self._model_forward(
                         num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
                     )

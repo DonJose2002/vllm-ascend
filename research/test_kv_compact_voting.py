@@ -261,7 +261,7 @@ def test_runner_wiring_assertions():
     runner_src = (_HERE.parent / "vllm_ascend" / "worker" / "model_runner_v1.py").read_text()
     assert "kv_compact_voting.needs_eager_step()" in runner_src
     assert "kv_compact_voting.maybe_install(self)" in runner_src
-    assert "torch.compiler.disable()" in runner_src
+    assert 'set_stance("force_eager")' in runner_src
     assert "first vote recorded" in (_HERE.parent / "vllm_ascend" / "worker" / "kv_compact_voting.py").read_text()
     base = (_HERE / "run_baseline_npu.sh").read_text()
     assert "VLLM_ASCEND_KV_COMPACT_SELECTOR:-dwvote" in base
