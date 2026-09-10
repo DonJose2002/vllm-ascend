@@ -336,7 +336,8 @@ def test_runner_state_buffers_stable():
 
 def test_wiring_presence():
     mr = (REPO_ROOT / "vllm_ascend" / "worker" / "model_runner_v1.py").read_text()
-    assert "from vllm_ascend.worker import static_kv_compact" in mr
+    # B1.5: import line grew kv_compact_voting (combined import)
+    assert "from vllm_ascend.worker import kv_compact_voting, static_kv_compact" in mr
     assert "static_kv_compact.prepare_runner_views(self, num_reqs_padded)" in mr
     assert "if static_kv_compact.ENABLED" in mr
     assert "kv_compact_views.seq_lens_device" in mr

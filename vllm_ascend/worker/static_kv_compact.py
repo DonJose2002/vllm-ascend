@@ -40,15 +40,20 @@ _log = logging.getLogger(__name__)
 ENV_MASTER = "VLLM_ASCEND_STATIC_KV_COMPACT"
 ENV_BUDGET_TOKENS = "VLLM_ASCEND_KV_COMPACT_BUDGET_TOKENS"
 ENV_MIN_PROMPT_LEN = "VLLM_ASCEND_KV_COMPACT_MIN_LEN"
+ENV_SELECTOR = "VLLM_ASCEND_KV_COMPACT_SELECTOR"
+ENV_VOTE_STEPS = "VLLM_ASCEND_KV_COMPACT_VOTE_STEPS"
 
 ENABLED = os.environ.get(ENV_MASTER, "0") == "1"
 BUDGET_TOKENS = int(os.environ.get(ENV_BUDGET_TOKENS, "4096"))
 MIN_PROMPT_LEN = int(os.environ.get(ENV_MIN_PROMPT_LEN, "8192"))
+SELECTOR = os.environ.get(ENV_SELECTOR, "stride")
+VOTE_STEPS = int(os.environ.get(ENV_VOTE_STEPS, "8"))
 RATIO_FLOOR = 0.15
 SINK_BLOCKS = 1
 RECENT_BLOCKS = 4
 
 RECORDS: dict[str, CompactRecord] = {}
+PENDING_VOTES: dict[str, PendingVote] = {}
 _CHECKED: set[str] = set()
 _DISABLED_REASON: str | None = None
 _ACTIVE_LOGGED = False
@@ -69,6 +74,24 @@ class CompactRecord:
 
 
 @dataclass
+class PendingVote:
+    """Prefill-complete request awaiting decode-window votes (B1.5 dwvote).
+
+    votes_dev accumulates per-block attention mass (max-pooled per block,
+    summed over layers and decode steps) on the runner device; the scheduler
+    hook finalizes once vote_steps reaches VOTE_STEPS (or the request leaves
+    the batch), falling back to the stride selector when no vote landed.
+    """
+
+    request_id: str
+    prompt_len: int
+    num_prompt_blocks: int
+    vote_steps: int = 0
+    votes_dev: torch.Tensor | None = None
+    blocks_dev: torch.Tensor | None = None
+
+
+@dataclass
 class RunnerViews:
     block_table_device: torch.Tensor
     seq_lens_device: torch.Tensor
@@ -85,6 +108,7 @@ class _RunnerState:
 
 def forget(request_id: str) -> None:
     RECORDS.pop(request_id, None)
+    PENDING_VOTES.pop(request_id, None)
     _CHECKED.discard(request_id)
 
 
@@ -98,6 +122,16 @@ def disable(reason: str) -> None:
 
 def is_disabled() -> str | None:
     return _DISABLED_REASON
+
+
+def _budget_block_count(
+    prompt_len: int,
+    block_size: int,
+    budget_tokens: int = BUDGET_TOKENS,
+    ratio_floor: float = RATIO_FLOOR,
+) -> int:
+    budget = max(budget_tokens, math.ceil(prompt_len * ratio_floor))
+    return math.ceil(budget / block_size)
 
 
 def select_keep_positions(
@@ -115,8 +149,7 @@ def select_keep_positions(
     already fits the budget (no-op). The tail block is always kept (it carries
     the partial tokens decode appends into).
     """
-    budget = max(budget_tokens, math.ceil(prompt_len * ratio_floor))
-    budget_blocks = math.ceil(budget / block_size)
+    budget_blocks = _budget_block_count(prompt_len, block_size, budget_tokens, ratio_floor)
     if num_prompt_blocks <= budget_blocks:
         return None
     keep = set(range(sink_blocks))
@@ -130,6 +163,37 @@ def select_keep_positions(
                 if pos >= num_prompt_blocks - recent_blocks:
                     pos = num_prompt_blocks - recent_blocks - 1
                 keep.add(pos)
+    return sorted(keep)
+
+
+def select_keep_by_votes(
+    votes: torch.Tensor,
+    num_prompt_blocks: int,
+    budget_blocks: int,
+    sink_blocks: int = SINK_BLOCKS,
+    recent_blocks: int = RECENT_BLOCKS,
+) -> list[int] | None:
+    """B1.5 vote selector: sink + recent anchors, remaining budget by vote rank.
+
+    ``votes`` is the accumulated per-block attention mass (CPU, length >=
+    num_prompt_blocks). Same contract as select_keep_positions: sorted engine
+    positions, None when the prompt fits the budget.
+    """
+    if num_prompt_blocks <= budget_blocks:
+        return None
+    keep = set(range(sink_blocks))
+    keep.update(range(num_prompt_blocks - recent_blocks, num_prompt_blocks))
+    need = budget_blocks - len(keep)
+    if need > 0:
+        anchored = set(keep)
+        order = torch.argsort(votes[:num_prompt_blocks], descending=True).tolist()
+        for pos in order:
+            if pos in anchored:
+                continue
+            keep.add(pos)
+            need -= 1
+            if need == 0:
+                break
     return sorted(keep)
 
 
@@ -209,6 +273,73 @@ def check_structural_gates(scheduler) -> bool:
     return True
 
 
+def _commit_compaction(
+    manager,
+    request_id: str,
+    prompt_len: int,
+    num_prompt_blocks: int,
+    block_size: int,
+    keep: list[int],
+    note: str = "",
+) -> None:
+    kept_tokens = kept_tokens_of(keep, prompt_len, num_prompt_blocks, block_size)
+    freed = compact_manager_blocks(manager, request_id, keep)
+    RECORDS[request_id] = CompactRecord(
+        request_id=request_id,
+        prompt_len=prompt_len,
+        num_prompt_blocks=num_prompt_blocks,
+        keep_positions=keep,
+        kept_tokens=kept_tokens,
+        dropped_tokens=prompt_len - kept_tokens,
+        freed_blocks=freed,
+    )
+    _log.warning(
+        "[static-kv-compact] req=%s prompt=%d blocks=%d keep=%d kept_tokens=%d freed=%d%s",
+        request_id,
+        prompt_len,
+        num_prompt_blocks,
+        len(keep),
+        kept_tokens,
+        freed,
+        note,
+    )
+
+
+def _finalize_pending_votes(scheduler, manager, block_size: int) -> None:
+    """Commit dwvote records whose observation window closed (B1.5)."""
+    for request_id, pv in list(PENDING_VOTES.items()):
+        alive = request_id in scheduler.requests
+        if alive and pv.vote_steps < VOTE_STEPS:
+            continue
+        del PENDING_VOTES[request_id]
+        if not alive:
+            continue
+        blocks = manager.req_to_blocks.get(request_id)
+        num_prompt_blocks = len(blocks) if blocks else 0
+        if num_prompt_blocks == 0:
+            continue
+        budget_blocks = _budget_block_count(pv.prompt_len, block_size)
+        keep = None
+        if pv.votes_dev is not None and float(pv.votes_dev.sum()) > 0:
+            keep = select_keep_by_votes(pv.votes_dev.cpu(), num_prompt_blocks, budget_blocks)
+        if keep is None:
+            # No vote landed (hook never fired / request left early): stride
+            # fallback keeps correctness.
+            keep = select_keep_positions(num_prompt_blocks, pv.prompt_len, block_size)
+        if keep is None:
+            _CHECKED.add(request_id)
+            continue
+        _commit_compaction(
+            manager,
+            request_id,
+            pv.prompt_len,
+            num_prompt_blocks,
+            block_size,
+            keep,
+            note=f" selector=dwvote steps={pv.vote_steps}",
+        )
+
+
 def maybe_compact_batch(scheduler, scheduler_output) -> None:
     """Scheduler-side entry: called from the wrapped update_from_output."""
     global _ACTIVE_LOGGED, _CANDIDATE_LOGGED, _HOOK_SEEN_LOGGED
@@ -220,7 +351,7 @@ def maybe_compact_batch(scheduler, scheduler_output) -> None:
     if not check_structural_gates(scheduler):
         return
     num_scheduled_tokens = scheduler_output.num_scheduled_tokens
-    if not num_scheduled_tokens:
+    if not num_scheduled_tokens and not PENDING_VOTES:
         return
     if not _ACTIVE_LOGGED:
         _ACTIVE_LOGGED = True
@@ -231,8 +362,9 @@ def maybe_compact_batch(scheduler, scheduler_output) -> None:
         )
     manager = scheduler.kv_cache_manager.coordinator.single_type_managers[0]
     block_size = manager.block_size
+    _finalize_pending_votes(scheduler, manager, block_size)
     for request_id in num_scheduled_tokens:
-        if request_id in RECORDS or request_id in _CHECKED:
+        if request_id in RECORDS or request_id in _CHECKED or request_id in PENDING_VOTES:
             continue
         request = scheduler.requests.get(request_id)
         if request is None:
@@ -254,29 +386,26 @@ def maybe_compact_batch(scheduler, scheduler_output) -> None:
                 request.num_computed_tokens,
                 num_prompt_blocks,
             )
+        if SELECTOR == "dwvote":
+            PENDING_VOTES[request_id] = PendingVote(
+                request_id=request_id,
+                prompt_len=prompt_len,
+                num_prompt_blocks=num_prompt_blocks,
+            )
+            _log.warning(
+                "[static-kv-compact] voting window opened: req=%s prompt=%d blocks=%d D=%d",
+                request_id,
+                prompt_len,
+                num_prompt_blocks,
+                VOTE_STEPS,
+            )
+            continue
         keep = select_keep_positions(num_prompt_blocks, prompt_len, block_size)
         if keep is None:
             _CHECKED.add(request_id)
             continue
-        kept_tokens = kept_tokens_of(keep, prompt_len, num_prompt_blocks, block_size)
-        freed = compact_manager_blocks(manager, request_id, keep)
-        RECORDS[request_id] = CompactRecord(
-            request_id=request_id,
-            prompt_len=prompt_len,
-            num_prompt_blocks=num_prompt_blocks,
-            keep_positions=keep,
-            kept_tokens=kept_tokens,
-            dropped_tokens=prompt_len - kept_tokens,
-            freed_blocks=freed,
-        )
-        _log.warning(
-            "[static-kv-compact] req=%s prompt=%d blocks=%d keep=%d kept_tokens=%d freed=%d",
-            request_id,
-            prompt_len,
-            num_prompt_blocks,
-            len(keep),
-            kept_tokens,
-            freed,
+        _commit_compaction(
+            manager, request_id, prompt_len, num_prompt_blocks, block_size, keep, note=" selector=stride"
         )
 
 

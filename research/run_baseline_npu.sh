@@ -339,6 +339,11 @@ case "$MODE" in
     # lines in the serve log / SUMMARY below). Graph mode stays DEFAULT -
     # that IS the B2 bet; triage with EXTRA_SERVE_ARGS="--enforce-eager".
     export VLLM_ASCEND_STATIC_KV_COMPACT="${VLLM_ASCEND_STATIC_KV_COMPACT:-1}"
+    # B1.5 selector: dwvote (decode-window attention voting) by default after
+    # 2026-09-10 (stride NIAH = keep-rate, unusable); stride remains for the
+    # A/B arm. VOTE_STEPS = decode-window width D.
+    export VLLM_ASCEND_KV_COMPACT_SELECTOR="${VLLM_ASCEND_KV_COMPACT_SELECTOR:-dwvote}"
+    export VLLM_ASCEND_KV_COMPACT_VOTE_STEPS="${VLLM_ASCEND_KV_COMPACT_VOTE_STEPS:-8}"
     # Two HARD B1 gates go on the serve line unconditionally (even for the
     # env=0 negative control, so control vs armed stays same-caliber):
     #  - --no-enable-prefix-caching: gate #1 (caching re-anchors freed blocks)
@@ -347,7 +352,7 @@ case "$MODE" in
     #    run strictly between step N and N+1, which async scheduling breaks)
     EXTRA_SERVE_ARGS="${EXTRA_SERVE_ARGS:-} --no-enable-prefix-caching --no-async-scheduling"
     TAG="npu-bf16-compact"
-    NOTE="$NOTE; static kv compact (B1, budget=${VLLM_ASCEND_KV_COMPACT_BUDGET_TOKENS:-4096} tokens, min_len=${VLLM_ASCEND_KV_COMPACT_MIN_LEN:-8192}, env=$VLLM_ASCEND_STATIC_KV_COMPACT, async=off)"
+    NOTE="$NOTE; static kv compact (B1, budget=${VLLM_ASCEND_KV_COMPACT_BUDGET_TOKENS:-4096} tokens, min_len=${VLLM_ASCEND_KV_COMPACT_MIN_LEN:-8192}, env=$VLLM_ASCEND_STATIC_KV_COMPACT, async=off, selector=$VLLM_ASCEND_KV_COMPACT_SELECTOR, D=$VLLM_ASCEND_KV_COMPACT_VOTE_STEPS)"
     # Compaction never triggers below MIN_PROMPT_LEN (default 8192): default
     # the B-line matrix to 16K/32K x 1/16 unless the caller pinned the axes.
     if [ -z "$TIERS_EXPLICIT" ]; then TIERS="16384,32768"; fi

@@ -168,7 +168,7 @@ from vllm_ascend.utils import (
     sparse_kv_cache_has_indexer,
     vllm_version_is,
 )
-from vllm_ascend.worker import static_kv_compact
+from vllm_ascend.worker import kv_compact_voting, static_kv_compact
 from vllm_ascend.worker.npu_input_batch import NPUInputBatch
 from vllm_ascend.worker.pcp_utils import PCPAsyncSpecDecodeRebuildResult, PCPManager
 from vllm_ascend.worker.utils import AscendKVBlockZeroer, copy_snapshot_to_gpu
@@ -2288,6 +2288,11 @@ class NPUModelRunner(GPUModelRunner):
             cudagraph_mode = CUDAGraphMode.NONE
             # Mark KV scales as calculated after the first forward pass
             self.calculate_kv_scales = False  # type: ignore[has-type]
+        # Static KV compaction B1.5 (research, env-gated): a request's first
+        # VOTE_STEPS decode steps must run eager so the dwvote forward hooks
+        # actually execute (graph replay never runs python hooks).
+        if kv_compact_voting.needs_eager_step():
+            cudagraph_mode = CUDAGraphMode.NONE
         if self.ascend_config.enable_async_exponential:
             self.sampler.do_async_exponential(
                 b_s=logits_indices.shape[0],
@@ -3160,6 +3165,8 @@ class NPUModelRunner(GPUModelRunner):
         # Static KV compaction (research, env-gated): gathered block-table view
         # + compacted seq_lens override when any record is active; None keeps
         # the untouched dense metadata path (zero overhead when disabled).
+        if static_kv_compact.ENABLED and static_kv_compact.SELECTOR == "dwvote":
+            kv_compact_voting.maybe_install(self)
         kv_compact_views = (
             static_kv_compact.prepare_runner_views(self, num_reqs_padded)
             if static_kv_compact.ENABLED
