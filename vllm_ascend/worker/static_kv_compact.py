@@ -33,6 +33,9 @@ from dataclasses import dataclass
 import torch
 
 _log = logging.getLogger(__name__)
+# Diagnostics below use WARNING on purpose: EngineCore's root logger drops
+# stdlib INFO (b2smoke 09-09: gates passed but every INFO line was invisible,
+# a false "ZERO events"). All lines are one-shot or per-event, volume is tiny.
 
 ENV_MASTER = "VLLM_ASCEND_STATIC_KV_COMPACT"
 ENV_BUDGET_TOKENS = "VLLM_ASCEND_KV_COMPACT_BUDGET_TOKENS"
@@ -51,6 +54,7 @@ _DISABLED_REASON: str | None = None
 _ACTIVE_LOGGED = False
 _CANDIDATE_LOGGED = False
 _HOOK_SEEN_LOGGED = False
+_VIEWS_LOGGED = False
 
 
 @dataclass
@@ -210,7 +214,7 @@ def maybe_compact_batch(scheduler, scheduler_output) -> None:
     global _ACTIVE_LOGGED, _CANDIDATE_LOGGED, _HOOK_SEEN_LOGGED
     if not _HOOK_SEEN_LOGGED:
         _HOOK_SEEN_LOGGED = True
-        _log.info("[static-kv-compact] update_from_output hook observed (engine stepping)")
+        _log.warning("[static-kv-compact] update_from_output hook observed (engine stepping)")
     if not ENABLED or _DISABLED_REASON is not None:
         return
     if not check_structural_gates(scheduler):
@@ -220,7 +224,7 @@ def maybe_compact_batch(scheduler, scheduler_output) -> None:
         return
     if not _ACTIVE_LOGGED:
         _ACTIVE_LOGGED = True
-        _log.info(
+        _log.warning(
             "[static-kv-compact] coordinator active (gates passed, min_len=%d budget=%d)",
             MIN_PROMPT_LEN,
             BUDGET_TOKENS,
@@ -243,7 +247,7 @@ def maybe_compact_batch(scheduler, scheduler_output) -> None:
         num_prompt_blocks = len(blocks) if blocks else 0
         if not _CANDIDATE_LOGGED:
             _CANDIDATE_LOGGED = True
-            _log.info(
+            _log.warning(
                 "[static-kv-compact] first candidate seen: req=%s prompt=%d computed=%d blocks=%d",
                 request_id,
                 prompt_len,
@@ -265,7 +269,7 @@ def maybe_compact_batch(scheduler, scheduler_output) -> None:
             dropped_tokens=prompt_len - kept_tokens,
             freed_blocks=freed,
         )
-        _log.info(
+        _log.warning(
             "[static-kv-compact] req=%s prompt=%d blocks=%d keep=%d kept_tokens=%d freed=%d",
             request_id,
             prompt_len,
@@ -324,6 +328,14 @@ def prepare_runner_views(runner, num_reqs_padded: int) -> RunnerViews | None:
 
     if not changed:
         return None
+    global _VIEWS_LOGGED
+    if not _VIEWS_LOGGED:
+        _VIEWS_LOGGED = True
+        _log.warning(
+            "[static-kv-compact] runner views applied (records=%d padded_reqs=%d)",
+            len(RECORDS),
+            num_reqs_padded,
+        )
     state.block_table_device[:num_reqs_padded].copy_(state.block_table_cpu[:num_reqs_padded], non_blocking=True)
     state.seq_lens_device_buf[:num_reqs_padded].copy_(seq_lens_cpu, non_blocking=True)
     return RunnerViews(
