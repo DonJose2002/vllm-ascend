@@ -129,6 +129,11 @@ def reset_module():
     skc._CHECKED.clear()
     skc._DISABLED_REASON = None
     skc.ENABLED = True
+    # B1.5 isolation: this file tests the stride path; the shared module state
+    # may carry SELECTOR="dwvote" from test_kv_compact_voting.py (same
+    # sys.modules instance when pytest runs both files in one process).
+    skc.SELECTOR = "stride"
+    skc.PENDING_VOTES.clear()
 
 
 # ---------------------------------------------------------------------------

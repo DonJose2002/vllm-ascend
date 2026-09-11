@@ -179,9 +179,28 @@ def test_hook_fail_open_on_exception():
 
     attn.qkv_proj = BadQKV()
     hook = kcv._make_hook(0)
-    hook(attn, (positions, hidden), None)
+    # kwargs form: Qwen3DecoderLayer calls self.self_attn(positions=..., hidden_states=...)
+    hook(attn, (), {"positions": positions, "hidden_states": hidden}, None)
     assert kcv._HOOKS_FAILED
     assert skc.PENDING_VOTES["r1"].vote_steps == skc.VOTE_STEPS  # force-finalized
+
+
+def test_hook_kwargs_and_positional_forms():
+    runner, attn, positions, hidden = _make_voting_fixture()
+    kcv._RUNNER = runner
+    skc.PENDING_VOTES["r1"] = skc.PendingVote(request_id="r1", prompt_len=32, num_prompt_blocks=8)
+    hook = kcv._make_hook(0)
+    hook(attn, (), {"positions": positions, "hidden_states": hidden}, None)  # kwargs form
+    pv = skc.PENDING_VOTES["r1"]
+    assert pv.vote_steps == 1 and pv.votes_dev is not None
+    reset_all()
+    runner, attn, positions, hidden = _make_voting_fixture()
+    kcv._RUNNER = runner
+    skc.PENDING_VOTES["r1"] = skc.PendingVote(request_id="r1", prompt_len=32, num_prompt_blocks=8)
+    hook = kcv._make_hook(0)
+    hook(attn, (positions, hidden), {}, None)  # positional form
+    pv = skc.PENDING_VOTES["r1"]
+    assert pv.vote_steps == 1 and pv.votes_dev is not None
 
 
 # ---------------------------------------------------------------------------
@@ -268,6 +287,8 @@ def test_runner_wiring_assertions():
     assert "first vote recorded" in kcv_src
     assert "raw forward start" in kcv_src and "raw forward end OK" in kcv_src
     assert "hook entered" in kcv_src
+    assert "with_kwargs=True" in kcv_src  # Qwen3 self_attn is called with keyword args
+    assert "original_code_object" in kcv_src  # inner-model compile mix-in descent
     base = (_HERE / "run_baseline_npu.sh").read_text()
     assert "VLLM_ASCEND_KV_COMPACT_SELECTOR:-dwvote" in base
     assert "VLLM_ASCEND_KV_COMPACT_VOTE_STEPS:-8" in base
@@ -299,6 +320,46 @@ def test_raw_model_forward_bypasses_call():
     out = kcv.raw_model_forward(runner, input_ids=1, positions=2)
     assert out == "raw-ok"
     assert inner.called == [{"input_ids": 1, "positions": 2}]
+
+
+class _FakeInnerCompiledModel:
+    """Inner model carrying the compile mix-in marker (original_code_object)."""
+
+    def __init__(self):
+        self.called = []
+
+    def original_code_object(self):
+        return None
+
+    def forward(self, **kwargs):
+        self.called.append(kwargs)
+        return "inner-raw-ok"
+
+
+class _FakeOuterShell:
+    """ForCausalLM shell: plain python forward delegating to self.model."""
+
+    def __init__(self, inner):
+        self.model = inner
+        self.called = []
+
+    def forward(self, **kwargs):
+        self.called.append(kwargs)
+        return self.model.forward(**kwargs)
+
+
+def test_raw_model_forward_descends_to_compiled_inner():
+    # Run-9 root cause: the compile wrapper sits on the INNER model class
+    # (Qwen3Model), so the outer python forward immediately dispatches into
+    # the compiled artifact via self.model(...) __call__. raw_model_forward
+    # must call the inner model's .forward directly.
+    inner = _FakeInnerCompiledModel()
+    outer = _FakeOuterShell(inner)
+    runner = types.SimpleNamespace(model=_FakeWrapper(outer))
+    out = kcv.raw_model_forward(runner, input_ids=1, positions=2)
+    assert out == "inner-raw-ok"
+    assert inner.called == [{"input_ids": 1, "positions": 2}]
+    assert outer.called == []  # outer forward bypassed entirely
 
 
 def main():

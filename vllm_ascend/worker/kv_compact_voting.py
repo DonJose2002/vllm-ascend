@@ -59,25 +59,37 @@ def _resolve_model(runner):
 def raw_model_forward(runner, **model_inputs):
     """Call the model's ORIGINAL python forward for dwvote steps.
 
-    The runnable inside ACLGraphWrapper is a TorchCompileWithNoGuardsWrapper
-    mix-in (vllm support_torch_compile monkeypatches it into the model's
-    bases): its __call__ always dispatches to the compiled artifact (guards
-    dropped / bytecode dispatch), so neither CUDAGraphMode.NONE nor dynamo
-    stances (force_eager) ever reach a python-executing forward - b2smoke
-    run 6/7 evidence. Calling .forward directly bypasses __call__ entirely
-    and runs plain python, so the vote hooks actually fire.
+    Two dispatch layers must both be bypassed:
+    1. ``ACLGraphWrapper.__call__`` (graph capture/replay) - handled by
+       ``_resolve_model`` unwrapping to the runnable.
+    2. ``TorchCompileWithNoGuardsWrapper.__call__`` (compiled artifact
+       dispatch; guards dropped / bytecode direct-execution).
+
+    Run-9 lesson: for Qwen3 the compile decorator sits on the INNER model
+    class (``@support_torch_compile`` on ``Qwen3Model``, not on
+    ``Qwen3ForCausalLM``): the outer ``forward`` is plain python but its body
+    immediately calls ``self.model(...)`` -> inner ``__call__`` -> compiled
+    artifact, so module hooks never fired even though our "raw" call executed
+    (62ms eager-backend step, numerics perfect, zero hooks). Descend one
+    level: the inner model's ``.forward`` attribute is untouched python (its
+    ``__code__`` is only swapped inside the wrapper's own dispatch context).
+    ``original_code_object`` is the wrapper mix-in's marker method.
     """
     global _RAW_FWD_LOGGED
     model = _resolve_model(runner)
-    fwd = getattr(model, "forward", None)
+    target = model
+    inner = getattr(model, "model", None)
+    if inner is not None and hasattr(inner, "original_code_object"):
+        target = inner
+    fwd = getattr(target, "forward", None)
     if not callable(fwd):
-        raise RuntimeError(f"no python forward on {type(model).__name__}; dwvote cannot run")
+        raise RuntimeError(f"no python forward on {type(target).__name__}; dwvote cannot run")
     if not _RAW_FWD_LOGGED:
-        _log.warning("[kv-compact-voting] raw forward start (model=%s)", type(model).__name__)
+        _log.warning("[kv-compact-voting] raw forward start (model=%s)", type(target).__name__)
     out = fwd(**model_inputs)
     if not _RAW_FWD_LOGGED:
         _RAW_FWD_LOGGED = True
-        _log.warning("[kv-compact-voting] raw forward end OK")
+        _log.warning("[kv-compact-voting] raw forward end OK (model=%s)", type(target).__name__)
     return out
 
 
@@ -103,7 +115,10 @@ def maybe_install(runner) -> None:
         attn = getattr(layer, "self_attn", None)
         if attn is None:
             continue
-        _HOOKS.append(attn.register_forward_hook(_make_hook(idx)))
+        # with_kwargs=True: Qwen3DecoderLayer calls self.self_attn with
+        # KEYWORD args (positions=..., hidden_states=...); a positional-only
+        # hook would see an empty args tuple (run-9 follow-up landmine).
+        _HOOKS.append(attn.register_forward_hook(_make_hook(idx), with_kwargs=True))
     if not _HOOKS:
         _fail_open("no self_attn modules hooked")
         return
@@ -125,7 +140,7 @@ def _fail_open(reason: str) -> None:
 
 
 def _make_hook(layer_idx: int):
-    def _hook(module, args, output):
+    def _hook(module, args, kwargs, output):
         pend = skc.PENDING_VOTES
         # One-shot entry probe: splits "hooks never fired" (line absent) from
         # "fired but early-returned" (line present, first vote absent). Run-8
@@ -142,8 +157,12 @@ def _make_hook(layer_idx: int):
             )
         if not pend or _RUNNER is None or _HOOKS_FAILED:
             return
+        if args:
+            positions, hidden = args[0], args[1]
+        else:
+            positions, hidden = kwargs["positions"], kwargs["hidden_states"]
         try:
-            _vote_layer(_RUNNER, module, layer_idx, args[0], args[1], pend)
+            _vote_layer(_RUNNER, module, layer_idx, positions, hidden, pend)
         except Exception:
             _log.exception("[kv-compact-voting] vote hook failed at layer %d", layer_idx)
             _fail_open(f"hook exception at layer {layer_idx}")
