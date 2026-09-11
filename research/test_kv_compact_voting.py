@@ -85,6 +85,7 @@ def reset_all():
     kcv._HOOKS_FAILED = False
     kcv._FIRST_VOTE_LOGGED = False
     kcv._RAW_FWD_LOGGED = False
+    kcv._HOOK_ENTERED_LOGGED = False
 
 
 try:
@@ -266,6 +267,7 @@ def test_runner_wiring_assertions():
     kcv_src = (_HERE.parent / "vllm_ascend" / "worker" / "kv_compact_voting.py").read_text()
     assert "first vote recorded" in kcv_src
     assert "raw forward start" in kcv_src and "raw forward end OK" in kcv_src
+    assert "hook entered" in kcv_src
     base = (_HERE / "run_baseline_npu.sh").read_text()
     assert "VLLM_ASCEND_KV_COMPACT_SELECTOR:-dwvote" in base
     assert "VLLM_ASCEND_KV_COMPACT_VOTE_STEPS:-8" in base

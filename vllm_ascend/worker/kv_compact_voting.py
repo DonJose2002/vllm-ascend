@@ -44,6 +44,7 @@ _HOOKS: list = []
 _HOOKS_FAILED = False
 _FIRST_VOTE_LOGGED = False
 _RAW_FWD_LOGGED = False
+_HOOK_ENTERED_LOGGED = False
 
 
 def _resolve_model(runner):
@@ -126,6 +127,19 @@ def _fail_open(reason: str) -> None:
 def _make_hook(layer_idx: int):
     def _hook(module, args, output):
         pend = skc.PENDING_VOTES
+        # One-shot entry probe: splits "hooks never fired" (line absent) from
+        # "fired but early-returned" (line present, first vote absent). Run-8
+        # forensics: neither raw-forward nor first-vote lines appeared.
+        global _HOOK_ENTERED_LOGGED
+        if not _HOOK_ENTERED_LOGGED:
+            _HOOK_ENTERED_LOGGED = True
+            _log.warning(
+                "[kv-compact-voting] hook entered (layer=%d pend=%d runner_set=%s failed=%s)",
+                layer_idx,
+                len(pend),
+                _RUNNER is not None,
+                _HOOKS_FAILED,
+            )
         if not pend or _RUNNER is None or _HOOKS_FAILED:
             return
         try:
