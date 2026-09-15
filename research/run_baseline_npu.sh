@@ -378,6 +378,13 @@ if [ "$SEED_PROFILE" != "generic" ]; then
   NOTE="$NOTE; seed_profile=$SEED_PROFILE"
 fi
 
+# Optional free-form tag suffix (B3: the dwvote/stride selector arms share
+# MODE=compact; without per-arm tags their JSON/log/NIAH artifacts would
+# clobber each other in the shared OUTDIR).
+if [ -n "${TAG_SUFFIX:-}" ]; then
+  TAG="$TAG$TAG_SUFFIX"
+fi
+
 # --- Phase 1.5 tax probe: optional torch-profiler serve + one-shot window ---
 # PROFILER and PROFILE_ONLY must be set TOGETHER: a profiled serve never runs
 # the bench matrix (profiler tax would pollute measurements - hygiene by

@@ -5,7 +5,7 @@
 # and prints a paste-ready digest (per-JSON TSV + NIAH curve + ITL delta table
 # + mutual-exclusion 3-way compare) at the end.
 #
-# Usage:  bash research/run_phase2.sh smoke|cline|b2smoke|digest [start_port]
+# Usage:  bash research/run_phase2.sh smoke|cline|b2smoke|b3|b3digest|digest [start_port]
 #   smoke : single 16K/c1 topk4096 eager cell (first-run validation only -
 #           already PASSED 2026-09-01 on NPU2; kept for re-runs on new hosts)
 #   cline : the full eager matrix, 6 serves (~1 evening):
@@ -29,6 +29,20 @@
 #                async-scheduling tax for free.
 #           If run 1 dies during capture/replay, triage in eager (hint printed
 #           at the end); eager green + graph red = bet lost, report the logs.
+#   b3    : B-line FULL matrix, GRAPH mode, 3 serves (~1-2 h), record-grade:
+#             1. compact+dwvote 16K/32K x 1/16 + NIAH (the candidate)
+#             2. compact+stride 16K/32K x 1/16 + NIAH (selector lower bound:
+#                mechanism identical, quality contrast = keep-rate expectation)
+#             3. dense 16K/32K x 1/16 + NIAH, prefix-cache OFF + async OFF
+#                (same-caliber anchor, NO_ASYNC=1)
+#           Readout per cell: dwvote net gain = bandwidth saved (itl50 delta
+#           vs dense) MINUS the D-step eager voting-window tax (visible in
+#           itl99); stride arm separates "mechanism" from "selector quality".
+#           RECORD-GRADE GUARD: refuses to run on a sync-patched dist (its
+#           dist-info version stays stale by design) - clean full reinstall
+#           first:  rm -rf build/temp.* && MAX_JOBS=16 pip install . \
+#             --no-build-isolation    (escape for dry-runs: B3_SKIP_DIST_GUARD=1)
+#   b3digest: analysis only over experiments/out/phase2-b3 (no card).
 #   digest: analysis only (no serves, no card) over JSONs under experiments/out/phase2
 #
 # WHY EAGER EVERYWHERE (cline only): the first graph-mode smoke crashed with an
@@ -55,6 +69,7 @@ PORT="${2:-8130}"
 # directory (phase2-b2) or it would clobber the cline eager JSONs.
 case "$BATCH" in
   b2smoke) OUTROOT_DEFAULT="experiments/out/phase2-b2" ;;
+  b3|b3digest) OUTROOT_DEFAULT="experiments/out/phase2-b3" ;;
   *)       OUTROOT_DEFAULT="experiments/out/phase2" ;;
 esac
 OUTROOT="${OUTROOT:-$OUTROOT_DEFAULT}"
@@ -142,6 +157,35 @@ drain_card() {
 }
 
 banner() { printf '\n===== %s =====\n' "$*" | tee -a "$MASTER"; }
+
+b3_dist_guard() {
+  # B3 is the record-grade matrix: data must come from a clean full install.
+  # sync_py_to_dist.sh deliberately leaves dist-info version metadata stale,
+  # so a version/HEAD match is proof of a real reinstall. importlib.metadata
+  # reads site-packages dist-info, immune to the CWD shadowing trap.
+  if [ "${B3_SKIP_DIST_GUARD:-0}" = "1" ]; then
+    echo "B3 GUARD: skipped by B3_SKIP_DIST_GUARD=1 (dry-run only)" | tee -a "$MASTER"
+    return 0
+  fi
+  local dist_ver head_sha
+  dist_ver=$(python3 -c "from importlib.metadata import version; print(version('vllm_ascend'))" 2>/dev/null || echo unknown)
+  head_sha=$(git rev-parse --short=9 HEAD 2>/dev/null || echo unknown)
+  if [ "$dist_ver" = "unknown" ] || [ "$head_sha" = "unknown" ]; then
+    echo "B3 GUARD-FAIL: cannot establish dist/HEAD identity (dist='$dist_ver' HEAD='$head_sha')." | tee -a "$MASTER"
+    echo "  (escape hatch for dry-runs: B3_SKIP_DIST_GUARD=1)" | tee -a "$MASTER"
+    exit 1
+  fi
+  case "$dist_ver" in
+    *"$head_sha"*)
+      echo "B3 GUARD: dist $dist_ver matches HEAD $head_sha (clean full install)" | tee -a "$MASTER" ;;
+    *)
+      echo "B3 GUARD-FAIL: dist version '$dist_ver' does not embed HEAD '$head_sha'." | tee -a "$MASTER"
+      echo "  Record-grade data needs a clean full reinstall first:" | tee -a "$MASTER"
+      echo "    rm -rf build/temp.* && MAX_JOBS=16 pip install . --no-build-isolation" | tee -a "$MASTER"
+      echo "  (escape hatch for dry-runs: B3_SKIP_DIST_GUARD=1)" | tee -a "$MASTER"
+      exit 1 ;;
+  esac
+}
 
 # run <mode> <tiers> <concs> [env=val ...] - one eager run_baseline_npu.sh call.
 # EXTRA_SERVE_ARGS always starts with --enforce-eager (mode-wide decision,
@@ -290,6 +334,54 @@ PYEOF
   } 2>&1 | tee -a "$MASTER"
 }
 
+digest_b3() {
+  banner "DIGEST (phase2 b3, graph mode, record-grade matrix) $(date +%H:%M:%S)"
+  {
+    echo "--- per-file TSV ---"
+    ls "$BENCH"-*.json >/dev/null 2>&1 && \
+      python3 research/bench_baseline.py summary "$BENCH"-*.json
+    echo
+    echo "--- NIAH curve (dense vs dwvote vs stride) ---"
+    local niah_files=()
+    local t
+    for t in dense compact-dwvote compact-stride; do
+      [ -f "$NIAHJSON-npu-bf16-$t.json" ] && niah_files+=("$NIAHJSON-npu-bf16-$t.json")
+    done
+    if [ "${#niah_files[@]}" -ge 1 ]; then
+      python3 research/needle_eval.py curve "${niah_files[@]}" 2>&1
+    else
+      echo "no NIAH jsons yet"
+    fi
+    echo
+    echo "--- B3 three-way: net gain = bandwidth saved (itl50 vs dense) MINUS eager voting-window tax (itl99) ---"
+    python3 - "$BENCH" <<'PYEOF'
+import json, sys, os
+prefix = sys.argv[1]
+def cells(tag):
+    p = f"{prefix}-{tag}.json"
+    if not os.path.exists(p):
+        return None
+    return {(c["tier"], c["conc"]): c for c in json.load(open(p))["cells"]}
+dn, dw, st = (cells("npu-bf16-dense"), cells("npu-bf16-compact-dwvote"),
+              cells("npu-bf16-compact-stride"))
+if not any((dn, dw, st)):
+    print("no b3 jsons yet"); raise SystemExit
+keys = sorted({k for m in (dn, dw, st) if m for k in m})
+print("tier\tconc\tarm\titl50\titl99\touts\titl50_saved_vs_dense\tratio")
+for key in keys:
+    ref = dn.get(key).get("itl_ms_p50") if dn and dn.get(key) else None
+    for name, m in (("dense", dn), ("dwvote", dw), ("stride", st)):
+        c = m.get(key) if m else None
+        if not c:
+            continue
+        itl, p99 = c.get("itl_ms_p50"), c.get("itl_ms_p99")
+        outs = c.get("aggregate_out_tok_per_s")
+        delta = f"{round(ref - itl, 1)}\t{round(ref / itl, 3)}" if (itl and ref and name != "dense") else "-\t-"
+        print(f"{key[0]}\t{key[1]}\t{name}\t{itl}\t{p99}\t{outs}\t{delta}")
+PYEOF
+  } 2>&1 | tee -a "$MASTER"
+}
+
 case "$BATCH" in
   smoke)
     pin_npus
@@ -325,13 +417,32 @@ case "$BATCH" in
     echo "  EXTRA_SERVE_ARGS='--enforce-eager' NPUS=\$NPUS bash research/run_baseline_npu.sh compact 8141" | tee -a "$MASTER"
     echo "  eager green + graph red = bet lost (paste serve log tail); eager red = deeper bug." | tee -a "$MASTER"
     ;;
+  b3)
+    pin_npus
+    b3_dist_guard
+    # Arm 1: dwvote - the candidate. Per-arm TAG_SUFFIX keeps artifacts apart
+    # (both compact arms share MODE=compact -> same base TAG; the suffix is
+    # the only JSON/log/NIAH separator inside the shared OUTROOT).
+    run_graph compact 16384,32768 1,16 NIAH=1 TAG_SUFFIX=-dwvote
+    # Arm 2: stride - selector lower bound. Same mechanism, blind selector:
+    # separates "the release/view machinery works" from "the votes matter"
+    # (NIAH expectation = keep-rate, B2 measured 0.20).
+    run_graph compact 16384,32768 1,16 NIAH=1 VLLM_ASCEND_KV_COMPACT_SELECTOR=stride TAG_SUFFIX=-stride
+    # Arm 3: dense anchor, same caliber (prefix caching OFF + async OFF, both
+    # match the compact serves) + NIAH reference grid.
+    EXTRA_SERVE_ARGS="--no-enable-prefix-caching"
+    run_graph dense 16384,32768 1,16 NO_ASYNC=1 NIAH=1
+    unset EXTRA_SERVE_ARGS
+    ;;
+  b3digest)
+    ;;
   digest)
     ;;
-  *) echo "unknown BATCH '$BATCH' (smoke|cline|b2smoke|digest)"; exit 1 ;;
+  *) echo "unknown BATCH '$BATCH' (smoke|cline|b2smoke|b3|b3digest|digest)"; exit 1 ;;
 esac
 
-if [ "$BATCH" = "b2smoke" ]; then
-  digest_b2
-else
-  digest
-fi
+case "$BATCH" in
+  b2smoke)    digest_b2 ;;
+  b3|b3digest) digest_b3 ;;
+  *)          digest ;;
+esac

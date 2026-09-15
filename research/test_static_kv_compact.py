@@ -417,6 +417,31 @@ def test_b2_script_wiring():
     assert "digest_b2" in drv
 
 
+def test_b3_script_wiring():
+    base = (REPO_ROOT / "research" / "run_baseline_npu.sh").read_text()
+    # free-form tag suffix: the two selector arms share MODE=compact and would
+    # clobber each other's JSON/log/NIAH artifacts in the shared OUTROOT
+    assert 'TAG="$TAG$TAG_SUFFIX"' in base
+    drv = (REPO_ROOT / "research" / "run_phase2.sh").read_text()
+    assert "b3digest" in drv.split("Usage:")[1]
+    # OUTROOT isolation (the dense arm reuses the cline/b2smoke dense TAG)
+    assert 'OUTROOT_DEFAULT="experiments/out/phase2-b3"' in drv
+    # three graph-mode arms with NIAH: dwvote / stride / same-caliber dense
+    assert "run_graph compact 16384,32768 1,16 NIAH=1 TAG_SUFFIX=-dwvote" in drv
+    assert "VLLM_ASCEND_KV_COMPACT_SELECTOR=stride TAG_SUFFIX=-stride" in drv
+    assert "run_graph dense 16384,32768 1,16 NO_ASYNC=1 NIAH=1" in drv
+    # record-grade guard: sync-patched dists carry stale version metadata
+    # (sync_py_to_dist.sh by design) - version/HEAD match = proof of a clean
+    # full reinstall; unknown/unknown must NOT pass
+    assert "b3_dist_guard" in drv
+    assert "B3_SKIP_DIST_GUARD" in drv
+    assert 'if [ "$dist_ver" = "unknown" ] || [ "$head_sha" = "unknown" ]' in drv
+    assert "MAX_JOBS=16 pip install . --no-build-isolation" in drv
+    # digest: three-way table surfaces the eager-window tax column (itl99)
+    assert "digest_b3" in drv
+    assert "itl_ms_p99" in drv
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     failed = 0
