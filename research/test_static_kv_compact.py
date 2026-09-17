@@ -432,10 +432,13 @@ def test_b3_script_wiring():
     assert "run_graph dense 16384,32768 1,16 NO_ASYNC=1 NIAH=1" in drv
     # record-grade guard: sync-patched dists carry stale version metadata
     # (sync_py_to_dist.sh by design) - version/HEAD match = proof of a clean
-    # full reinstall; unknown/unknown must NOT pass
+    # full reinstall; unknown/unknown must NOT pass; the metadata read must be
+    # from a NEUTRAL cwd (run-11 false pass: workspace egg-info shadowed the
+    # real site-packages dist-info)
     assert "b3_dist_guard" in drv
     assert "B3_SKIP_DIST_GUARD" in drv
     assert 'if [ "$dist_ver" = "unknown" ] || [ "$head_sha" = "unknown" ]' in drv
+    assert 'cd "$(mktemp -d)"' in drv
     assert "MAX_JOBS=16 pip install . --no-build-isolation" in drv
     # digest: three-way table surfaces the eager-window tax column (itl99)
     assert "digest_b3" in drv

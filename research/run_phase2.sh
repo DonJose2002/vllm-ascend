@@ -168,7 +168,11 @@ b3_dist_guard() {
     return 0
   fi
   local dist_ver head_sha
-  dist_ver=$(python3 -c "from importlib.metadata import version; print(version('vllm_ascend'))" 2>/dev/null || echo unknown)
+  # NEUTRAL CWD is mandatory: from the repo root, sys.path[0]='' makes
+  # importlib.metadata hit the workspace's freshly-regenerated egg-info (the
+  # build writes it even when the install step never lands) - the run-11
+  # false pass (guard dev117 vs PREFLIGHT dev102) came from exactly this.
+  dist_ver=$(cd "$(mktemp -d)" && python3 -c "from importlib.metadata import version; print(version('vllm_ascend'))" 2>/dev/null || echo unknown)
   head_sha=$(git rev-parse --short=9 HEAD 2>/dev/null || echo unknown)
   if [ "$dist_ver" = "unknown" ] || [ "$head_sha" = "unknown" ]; then
     echo "B3 GUARD-FAIL: cannot establish dist/HEAD identity (dist='$dist_ver' HEAD='$head_sha')." | tee -a "$MASTER"
