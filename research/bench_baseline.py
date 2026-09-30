@@ -379,6 +379,13 @@ def cmd_run(args):
     # Never print the key itself; only whether auth is armed.
     api_key = args.api_key or os.environ.get("BENCH_API_KEY", "") or os.environ.get("API_KEY", "")
     print(f"auth: {'Bearer armed' if api_key else 'none (no --api-key/env)'}")
+    # Preflight: one tiny request must succeed before burning the matrix
+    # (missing auth / wrong model name / dead server would otherwise yield
+    # a full matrix of ok=0 noise).
+    probe = stream_one(args.base_url, args.model, "Hello.", 8, args.timeout, api_key)
+    if not probe.ok:
+        print(f"FATAL: preflight probe failed: {probe.err}")
+        sys.exit(2)
     results: list[dict] = []
     lock = threading.Lock()  # serialize cells; results list append is GIL-safe
 
