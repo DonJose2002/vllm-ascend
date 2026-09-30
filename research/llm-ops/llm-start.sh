@@ -111,6 +111,31 @@ if [ -n "${REASONING_PARSER:-}" ]; then
 fi
 [ -n "$TOOL_ARGS" ] && say "agent tooling flags: $TOOL_ARGS"
 
+# Optional speculative decoding (manual §6.2; requires the
+# deploy/v0.25.1rc1-fixes stack in the container). Quoting: the serve command
+# is a double-quoted bash -c payload, so a variable carrying CLEAN JSON (real
+# double quotes) must be embedded via single quotes at the container layer -
+# do NOT backslash-escape the JSON (backslashes arriving via variable
+# expansion survive as literal characters; only literal \" in script source
+# is processed by the host layer). JSON must not contain single quotes.
+SPEC_ARG=""
+if [ -n "${SPECULATIVE_CONFIG:-}" ]; then
+  case "$SPECULATIVE_CONFIG" in
+    *"'"*) say "SPECULATIVE_CONFIG must not contain single quotes"; exit 1 ;;
+  esac
+  SPEC_ARG="--speculative_config '$SPECULATIVE_CONFIG'"
+  say "speculative decoding: $SPECULATIVE_CONFIG"
+fi
+
+# Optional capture-size cap (EE1023: spec decode ~doubles the graph count;
+# K+1-aligned tables pad less). Values stay clean (real quotes), see above.
+COMPILE_CFG='{"cudagraph_mode":"FULL"}'
+if [ -n "${CUDAGRAPH_SIZES:-}" ]; then
+  sizes_bracketed="[$(echo "$CUDAGRAPH_SIZES" | tr -d ' ')]"
+  COMPILE_CFG="{\"cudagraph_mode\":\"FULL\",\"cudagraph_capture_sizes\":$sizes_bracketed}"
+  say "cudagraph capture sizes: $sizes_bracketed"
+fi
+
 $DOCKER exec -d \
   -e ASCEND_RT_VISIBLE_DEVICES="$PICK" \
   -e PYTORCH_NPU_ALLOC_CONF=max_split_size_mb:256 \
@@ -120,8 +145,9 @@ $DOCKER exec -d \
       --tensor-parallel-size $TP \
       --max-model-len $MAX_MODEL_LEN \
       --gpu-memory-utilization $GPU_MEM_UTIL \
-      --compilation-config '{\"cudagraph_mode\":\"FULL\"}' \
+      --compilation-config '$COMPILE_CFG' \
       $TOOL_ARGS \
+      $SPEC_ARG \
       --api-key '$API_KEY' --port $PORT \
       > $LOG 2>&1"
 
