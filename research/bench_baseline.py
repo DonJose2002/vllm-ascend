@@ -19,7 +19,9 @@ Usage:
   python3 bench_baseline.py run --base-url http://127.0.0.1:8001 \
       --model qwen3-8b-awq --tag gpu-awq-dense --out results_gpu.json \
       [--tiers 4096,16384] [--concs 1,4,16] [--num-prompts 8] \
-      [--seed-profile generic|repetitive] [--save-ts]
+      [--seed-profile generic|repetitive] [--save-ts] [--api-key KEY]
+  # auth: --api-key, or env BENCH_API_KEY / API_KEY (e.g. sourced from
+  # llm-ops.secret); no header is sent when unset (unsecured servers).
   python3 bench_baseline.py table results_gpu.json [results_npu.json ...]
   python3 bench_baseline.py summary results.json ...
   # Phase 1 analysis:
@@ -35,6 +37,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures as cf
 import json
+import os
 import re
 import statistics
 import sys
@@ -134,7 +137,11 @@ class ReqResult:
         self.saw_done = False
 
 
-def stream_one(base_url: str, model: str, prompt: str, max_tokens: int, timeout: float) -> ReqResult:
+def _auth_headers(api_key: str) -> dict:
+    return {"Authorization": f"Bearer {api_key}"} if api_key else {}
+
+
+def stream_one(base_url: str, model: str, prompt: str, max_tokens: int, timeout: float, api_key: str = "") -> ReqResult:
     res = ReqResult()
     payload = json.dumps(
         {
@@ -149,7 +156,7 @@ def stream_one(base_url: str, model: str, prompt: str, max_tokens: int, timeout:
     req = urllib.request.Request(
         base_url.rstrip("/") + "/v1/chat/completions",
         data=payload,
-        headers={"Content-Type": "application/json"},
+        headers={"Content-Type": "application/json", **_auth_headers(api_key)},
     )
     t_send = time.monotonic()
     try:
@@ -229,14 +236,15 @@ def pct(values: list[float], q: float) -> float:
     return sv[idx] * 1000.0  # report in ms
 
 
-def http_get(url: str, timeout: float = 30.0) -> str:
-    with urllib.request.urlopen(url, timeout=timeout) as resp:
+def http_get(url: str, timeout: float = 30.0, api_key: str = "") -> str:
+    req = urllib.request.Request(url, headers=_auth_headers(api_key))
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
         return resp.read().decode()
 
 
-def snapshot_spec_metrics(base_url: str) -> dict:
+def snapshot_spec_metrics(base_url: str, api_key: str = "") -> dict:
     try:
-        text = http_get(base_url.rstrip("/") + "/metrics")
+        text = http_get(base_url.rstrip("/") + "/metrics", api_key=api_key)
     except Exception:  # noqa: BLE001
         return {}
     out: dict[str, float] = {}
@@ -263,22 +271,25 @@ def snapshot_spec_metrics(base_url: str) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def run_cell(base_url, model, tier, conc, num_prompts, max_tokens, timeout, tag, results, profile="generic", save_ts=False):
+def run_cell(
+    base_url, model, tier, conc, num_prompts, max_tokens, timeout, tag, results,
+    profile="generic", save_ts=False, api_key="",
+):
     questions = SEED_PROFILES[profile]["questions"]
     prompts = [
         synthesize_prompt(int(tier * CHARS_PER_TOKEN), questions[i % len(questions)])
         for i in range(num_prompts)
     ]
     # Warmup single short request (compile/cudagraph warm paths), not measured.
-    stream_one(base_url, model, "Hello.", 8, timeout=timeout)
+    stream_one(base_url, model, "Hello.", 8, timeout=timeout, api_key=api_key)
 
-    m0 = snapshot_spec_metrics(base_url)
+    m0 = snapshot_spec_metrics(base_url, api_key=api_key)
     t0 = time.monotonic()
     with cf.ThreadPoolExecutor(max_workers=conc) as ex:
-        futs = [ex.submit(stream_one, base_url, model, p, max_tokens, timeout) for p in prompts]
+        futs = [ex.submit(stream_one, base_url, model, p, max_tokens, timeout, api_key) for p in prompts]
         outs = [f.result() for f in futs]
     wall = time.monotonic() - t0
-    m1 = snapshot_spec_metrics(base_url)
+    m1 = snapshot_spec_metrics(base_url, api_key=api_key)
 
     ok = [o for o in outs if o.ok]
     failed = [o for o in outs if not o.ok]
@@ -365,6 +376,9 @@ def run_cell(base_url, model, tier, conc, num_prompts, max_tokens, timeout, tag,
 def cmd_run(args):
     tiers = [int(x) for x in args.tiers.split(",")]
     concs = [int(x) for x in args.concs.split(",")]
+    # Never print the key itself; only whether auth is armed.
+    api_key = args.api_key or os.environ.get("BENCH_API_KEY", "") or os.environ.get("API_KEY", "")
+    print(f"auth: {'Bearer armed' if api_key else 'none (no --api-key/env)'}")
     results: list[dict] = []
     lock = threading.Lock()  # serialize cells; results list append is GIL-safe
 
@@ -383,6 +397,7 @@ def cmd_run(args):
                     results,
                     profile=args.seed_profile,
                     save_ts=args.save_ts,
+                    api_key=api_key,
                 )
 
     doc = {
@@ -391,6 +406,7 @@ def cmd_run(args):
         "model": args.model,
         "tag": args.tag,
         "seed_profile": args.seed_profile,
+        "auth": bool(api_key),
         "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "note": args.note,
         "cells": results,
@@ -675,6 +691,9 @@ def main():
                    help="question set: generic (summarize etc) or repetitive (verbatim recall, ngram-friendly)")
     r.add_argument("--save-ts", action="store_true",
                    help="store per-request token timestamps for R(t) analysis (`rt`)")
+    r.add_argument("--api-key", default="",
+                   help="Bearer token for servers started with --api-key; "
+                        "falls back to env BENCH_API_KEY then API_KEY; never logged")
     r.set_defaults(func=cmd_run)
 
     t = sub.add_parser("table", help="print results as a table")
