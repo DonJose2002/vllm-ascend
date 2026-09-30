@@ -4,7 +4,8 @@
 Standalone test script; does not modify any vllm/vllm-ascend code.
 
 Measures, against an OpenAI-compatible server (streaming):
-  - TTFT percentiles, ITL percentiles (from token arrival timestamps)
+  - TTFT percentiles, ITL percentiles (from token arrival timestamps;
+    reasoning_content deltas count as tokens for --reasoning-parser servers)
   - output throughput per request, aggregate request throughput
   - optional speculative-decoding accept length via the burst-gap method
     (port of bench_sd.py; no /metrics dependency, but counters are snapshotted
@@ -183,8 +184,12 @@ def stream_one(base_url: str, model: str, prompt: str, max_tokens: int, timeout:
                         res.completion_tokens = u.get("completion_tokens", 0)
                     for ch in obj.get("choices", []):
                         delta = ch.get("delta", {}) or {}
-                        content = delta.get("content")
-                        if content:
+                        # Reasoning models (--reasoning-parser): thinking tokens
+                        # arrive in reasoning_content, not content. Both are
+                        # decode steps and must be timestamped, otherwise TTFT
+                        # silently includes the entire thinking phase and the
+                        # burst-gap step estimator sees bogus clusters.
+                        if delta.get("content") or delta.get("reasoning_content"):
                             now = time.monotonic()
                             if res.ttft is None:
                                 res.ttft = now - t_send
