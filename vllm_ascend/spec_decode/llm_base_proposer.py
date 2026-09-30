@@ -1693,6 +1693,28 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
 
         return common_attn_metadata, attn_metadata
 
+
+    def _backup_h2d_fence(self):
+        """Dedicated fence event for the backup_next_token_ids pinned page
+        (deploy fix for the #14922 use-after-rewrite race): synchronize()
+        before the host rewrite, record() after the async copy. The copy
+        itself stays non_blocking; only the source-page reuse is fenced.
+        blocking=True = host sleep-wait instead of busy-polling (upstream
+        synchronize_input_prep idiom, avoids driver-lock spin under TP
+        contention)."""
+        evt = getattr(self, "_backup_h2d_fence_obj", None)
+        if evt is None:
+            mod = getattr(torch, "npu", None)
+            cls = getattr(mod, "Event", None) if mod is not None else None
+            if cls is None:
+                cls = torch.cuda.Event
+            try:
+                evt = cls(blocking=True)
+            except TypeError:
+                evt = cls()
+            self._backup_h2d_fence_obj = evt
+        return evt
+
     def prepare_next_token_ids_padded(
         self,
         sampled_token_ids: torch.Tensor,
@@ -1715,10 +1737,19 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         # Precompute get_token_id for when there is no valid next token
         num_reqs = gpu_input_batch.num_reqs
         seq_lens_list = (gpu_input_batch.num_tokens_no_spec[:num_reqs] - 1).tolist()
+        # Deploy fix (#14922 use-after-rewrite): the pinned np page above is
+        # rewritten every step while the previous step's non_blocking H2D copy
+        # may still be in flight (the ~2048-deep submission ring lets the host
+        # run far ahead); a late copy then delivers the REWRITTEN value (a -1
+        # sentinel on request-boundary steps) to the where() below, and
+        # gather(-1) faults aivec. Fence the source reuse with a dedicated
+        # event: synchronize() before the rewrite, record() after the copy.
+        self._backup_h2d_fence().synchronize()
         self.backup_next_token_ids.np[:num_reqs] = np.array(
             [requests[gpu_input_batch.req_ids[i]].get_token_id(seq_lens_list[i]) for i in range(num_reqs)]
         )
         self.backup_next_token_ids.copy_to_gpu(num_reqs)
+        self._backup_h2d_fence().record()
 
         # Mask out the sampled tokens indices that should not be sampled.
         discard_sampled_tokens_req_indices = discard_request_indices[:num_discarded_requests]
